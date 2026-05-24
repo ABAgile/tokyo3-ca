@@ -38,6 +38,29 @@ const (
 	StreamMaxAge = 400 * 24 * time.Hour
 )
 
+// Action names for [Entry.Action]. Dotted lowercase, suffix is one of
+// .signed (successful issuance) or .denied (policy rejection after
+// auth succeeded). Auth failures (401) are deliberately not audited —
+// they happen before a caller identity is established, so attributing
+// them is impossible.
+const (
+	ActionSSHUserCertSigned = "ssh.user_cert.signed"
+	ActionSSHHostCertSigned = "ssh.host_cert.signed"
+	ActionSSHUserCertDenied = "ssh.user_cert.denied"
+	ActionSSHHostCertDenied = "ssh.host_cert.denied"
+)
+
+// Caller-identity prefix scheme used in [Entry.Caller]:
+//
+//	oidc:<email>       OIDC bearer-token path; email when present, sub otherwise.
+//	mtls:<name>        mTLS client-cert path; principal Name when set, SAN otherwise.
+//	anonymous          Body-groups fallback (no auth wired; tests / pre-prod only).
+const (
+	CallerPrefixOIDC = "oidc:"
+	CallerPrefixMTLS = "mtls:"
+	CallerAnonymous  = "anonymous"
+)
+
 // Sink is the typed JSON-encoding journal sink used to publish Entries.
 // Construct with journal.NewJSONSink[Entry](innerSink); the alias is an
 // ergonomic shortcut, not a distinct type.

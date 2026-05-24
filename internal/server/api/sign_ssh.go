@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/binary"
 	"encoding/json"
@@ -8,13 +9,17 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"net"
 	"net/http"
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"golang.org/x/crypto/ssh"
 
+	"github.com/abagile/tokyo3-ca/internal/audit"
 	"github.com/abagile/tokyo3-ca/internal/server/mtls"
+	"github.com/abagile/tokyo3-ca/internal/server/oidc"
 	"github.com/abagile/tokyo3-ca/internal/server/policy"
 	"github.com/abagile/tokyo3-ca/internal/server/sshengine"
 )
@@ -114,9 +119,10 @@ func (s *Server) handleSignUserCert(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Resolve the caller's groups — from a verified OIDC token when
-	// OIDC is configured, otherwise from the request body as-is.
-	groups, ok := s.authenticate(w, r, req.Groups)
+	// Resolve the caller's identity — from a verified OIDC token when
+	// OIDC is configured, an mTLS client cert when MTLSStore is
+	// configured, or the request body's groups otherwise (test mode).
+	caller, ok := s.authenticate(w, r, req.Groups)
 	if !ok {
 		return
 	}
@@ -127,17 +133,22 @@ func (s *Server) handleSignUserCert(w http.ResponseWriter, r *http.Request) {
 	principals := req.Principals
 	extensions := req.Extensions
 	if s.policy != nil {
-		if len(groups) == 0 {
+		if len(caller.Groups) == 0 {
 			writeError(w, http.StatusBadRequest, "groups is required when policy is active")
 			return
 		}
-		decision, err := s.policy.EvaluateUserCert(groups, policy.UserCertRequest{
+		decision, err := s.policy.EvaluateUserCert(caller.Groups, policy.UserCertRequest{
 			RequestedPrincipals: req.Principals,
 			RequestedTTL:        ttl,
 			EndpointMaxTTL:      maxUserCertTTL,
 		})
 		if err != nil {
 			if errors.Is(err, policy.ErrNoRole) || errors.Is(err, policy.ErrEmptyDecision) {
+				s.emitAudit(r.Context(), audit.ActionSSHUserCertDenied, "user:"+req.KeyID, caller.Caller, 0, r, map[string]any{
+					"requested_principals": req.Principals,
+					"groups":               caller.Groups,
+					"reason":               err.Error(),
+				})
 				writeError(w, http.StatusForbidden, err.Error())
 				return
 			}
@@ -176,6 +187,12 @@ func (s *Server) handleSignUserCert(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.emitAudit(r.Context(), audit.ActionSSHUserCertSigned, "user:"+cert.KeyId, caller.Caller, cert.Serial, r, map[string]any{
+		"principals":   cert.ValidPrincipals,
+		"ttl_seconds":  int(ttl.Seconds()),
+		"valid_before": time.Unix(int64(cert.ValidBefore), 0).UTC(),
+	})
+
 	writeJSON(w, http.StatusOK, signResponse{
 		Certificate: strings.TrimRight(string(ssh.MarshalAuthorizedKey(cert)), "\n"),
 		Serial:      cert.Serial,
@@ -205,24 +222,29 @@ func (s *Server) handleSignHostCert(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	groups, ok := s.authenticate(w, r, req.Groups)
+	caller, ok := s.authenticate(w, r, req.Groups)
 	if !ok {
 		return
 	}
 
 	principals := req.Principals
 	if s.policy != nil {
-		if len(groups) == 0 {
+		if len(caller.Groups) == 0 {
 			writeError(w, http.StatusBadRequest, "groups is required when policy is active")
 			return
 		}
-		decision, err := s.policy.EvaluateHostCert(groups, policy.HostCertRequest{
+		decision, err := s.policy.EvaluateHostCert(caller.Groups, policy.HostCertRequest{
 			RequestedPrincipals: req.Principals,
 			RequestedTTL:        ttl,
 			EndpointMaxTTL:      maxHostCertTTL,
 		})
 		if err != nil {
 			if errors.Is(err, policy.ErrNoRole) || errors.Is(err, policy.ErrEmptyDecision) {
+				s.emitAudit(r.Context(), audit.ActionSSHHostCertDenied, "host:"+req.KeyID, caller.Caller, 0, r, map[string]any{
+					"requested_principals": req.Principals,
+					"groups":               caller.Groups,
+					"reason":               err.Error(),
+				})
 				writeError(w, http.StatusForbidden, err.Error())
 				return
 			}
@@ -254,6 +276,12 @@ func (s *Server) handleSignHostCert(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
+	s.emitAudit(r.Context(), audit.ActionSSHHostCertSigned, "host:"+cert.KeyId, caller.Caller, cert.Serial, r, map[string]any{
+		"principals":   cert.ValidPrincipals,
+		"ttl_seconds":  int(ttl.Seconds()),
+		"valid_before": time.Unix(int64(cert.ValidBefore), 0).UTC(),
+	})
 
 	writeJSON(w, http.StatusOK, signResponse{
 		Certificate: strings.TrimRight(string(ssh.MarshalAuthorizedKey(cert)), "\n"),
@@ -343,8 +371,15 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, errorResponse{Error: msg})
 }
 
-// authenticate resolves the caller's groups for policy enforcement.
-// Precedence when either auth path is configured:
+// callerIdentity is the resolved caller for a single authenticated
+// request. Groups drive policy; Caller drives audit attribution.
+type callerIdentity struct {
+	Groups []string
+	Caller string // audit-format identity, e.g. "oidc:alice@example.com" or "mtls:ssh-proxyd-prod"
+}
+
+// authenticate resolves the caller's identity for policy enforcement
+// and audit. Precedence when either auth path is configured:
 //
 //  1. OIDC bearer (Authorization: Bearer …) wins when both
 //     OIDCVerifier is wired and the header is present. An invalid
@@ -357,15 +392,13 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 //
 // When neither path is configured (OIDCVerifier and MTLSStore both
 // nil), bodyGroups is used as-is — the pre-auth-wiring fallback for
-// integration tests.
+// integration tests. The Caller is set to [audit.CallerAnonymous].
 //
 // On auth failure, the HTTP error has been written to w and the
-// second return is false. On success the resolved groups are
-// returned (possibly empty — the caller's policy check applies the
-// "groups required" rule when needed).
-func (s *Server) authenticate(w http.ResponseWriter, r *http.Request, bodyGroups []string) ([]string, bool) {
+// second return is false.
+func (s *Server) authenticate(w http.ResponseWriter, r *http.Request, bodyGroups []string) (callerIdentity, bool) {
 	if s.oidc == nil && s.mtls == nil {
-		return bodyGroups, true
+		return callerIdentity{Groups: bodyGroups, Caller: audit.CallerAnonymous}, true
 	}
 
 	// OIDC bearer path: tried first when the header is present.
@@ -375,9 +408,9 @@ func (s *Server) authenticate(w http.ResponseWriter, r *http.Request, bodyGroups
 			if err != nil {
 				s.log.Debug("oidc verify failed", "err", err)
 				writeError(w, http.StatusUnauthorized, "invalid bearer token")
-				return nil, false
+				return callerIdentity{}, false
 			}
-			return claims.Groups, true
+			return callerIdentity{Groups: claims.Groups, Caller: oidcCallerString(claims)}, true
 		}
 	}
 
@@ -389,22 +422,97 @@ func (s *Server) authenticate(w http.ResponseWriter, r *http.Request, bodyGroups
 		if len(sans) > 0 {
 			p, err := s.mtls.Lookup(sans)
 			if err == nil {
-				return p.Groups, true
+				return callerIdentity{Groups: p.Groups, Caller: mtlsCallerString(p)}, true
 			}
 			if errors.Is(err, mtls.ErrUnknownPrincipal) {
 				s.log.Debug("mtls unknown principal", "sans", sans)
 				writeError(w, http.StatusUnauthorized, "unknown cert principal")
-				return nil, false
+				return callerIdentity{}, false
 			}
 			s.log.Error("mtls lookup", "err", err)
 			writeError(w, http.StatusInternalServerError, "auth backend failure")
-			return nil, false
+			return callerIdentity{}, false
 		}
 	}
 
 	// Neither path produced credentials.
 	writeError(w, http.StatusUnauthorized, "authentication required (bearer token or client cert)")
-	return nil, false
+	return callerIdentity{}, false
+}
+
+// oidcCallerString returns the audit-format identity for an OIDC
+// caller — email when present (most human-readable), otherwise sub.
+func oidcCallerString(c *oidc.Claims) string {
+	if c == nil {
+		return audit.CallerPrefixOIDC + "unknown"
+	}
+	if c.Email != "" {
+		return audit.CallerPrefixOIDC + c.Email
+	}
+	return audit.CallerPrefixOIDC + c.Subject
+}
+
+// mtlsCallerString returns the audit-format identity for an mTLS
+// caller — workload Name when configured, MatchedSAN otherwise.
+func mtlsCallerString(p *mtls.Principal) string {
+	if p == nil {
+		return audit.CallerPrefixMTLS + "unknown"
+	}
+	if p.Name != "" {
+		return audit.CallerPrefixMTLS + p.Name
+	}
+	return audit.CallerPrefixMTLS + p.MatchedSAN
+}
+
+// emitAudit publishes a single audit Entry. Errors are logged but
+// never fail the underlying API request — audit is observational
+// and a transient broker hiccup must not break credential issuance.
+func (s *Server) emitAudit(ctx context.Context, action, subject, caller string, serial uint64, r *http.Request, metadata map[string]any) {
+	var md string
+	if len(metadata) > 0 {
+		b, err := json.Marshal(metadata)
+		if err != nil {
+			s.log.Warn("audit metadata marshal failed", "action", action, "err", err)
+		} else {
+			md = string(b)
+		}
+	}
+	entry := audit.Entry{
+		ID:         uuid.NewString(),
+		Action:     action,
+		Subject:    subject,
+		Caller:     caller,
+		Serial:     serial,
+		IP:         clientIP(r),
+		UserAgent:  r.Header.Get("User-Agent"),
+		Metadata:   md,
+		OccurredAt: time.Now().UTC(),
+	}
+	if err := s.audit.Append(ctx, entry); err != nil {
+		s.log.Warn("audit append failed", "action", action, "err", err)
+	}
+}
+
+// clientIP returns the caller's IP for audit attribution. Strips the
+// port from r.RemoteAddr; honors X-Forwarded-For when the request
+// arrives through a trusted reverse proxy (the first IP in the
+// header chain is the original client).
+//
+// We don't have an explicit trusted-proxy allowlist, so
+// X-Forwarded-For is consulted only when present — operators running
+// behind an L7 proxy will see the right IP without configuration.
+// A stricter "trusted proxies" check belongs in a later hardening
+// slice.
+func clientIP(r *http.Request) string {
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		first, _, _ := strings.Cut(xff, ",")
+		return strings.TrimSpace(first)
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
 }
 
 // extractBearerToken pulls the raw token out of the Authorization
