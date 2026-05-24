@@ -15,6 +15,7 @@ import (
 	"golang.org/x/crypto/ssh"
 
 	"github.com/abagile/tokyo3-ca/internal/audit"
+	"github.com/abagile/tokyo3-ca/internal/server/mtls"
 	"github.com/abagile/tokyo3-ca/internal/server/oidc"
 	"github.com/abagile/tokyo3-ca/internal/server/policy"
 	"github.com/abagile/tokyo3-ca/internal/server/signer"
@@ -26,7 +27,8 @@ type Server struct {
 	log      *slog.Logger
 	caSigner signer.Signer
 	policy   *policy.Engine     // Role-table enforcer; nil = permissive (pre-auth wiring).
-	oidc     oidc.TokenVerifier // Bearer-token verifier; nil = no OIDC auth (body-groups fallback).
+	oidc     oidc.TokenVerifier // Bearer-token verifier; nil = no OIDC auth.
+	mtls     mtls.Store         // Cert-principal registry; nil = no mTLS auth.
 	audit    audit.Sink         // JetStream publisher; NoopSink when CERTD_NATS_URL is unset.
 	auditSrc journal.Source     // JetStream reader for the portal audit page; NoopSource when CERTD_NATS_URL is unset.
 	version  string             // build-time version string, surfaced in /healthz; empty allowed.
@@ -47,11 +49,21 @@ type Config struct {
 	// integration tests can exercise the cert engines directly.
 	Policy *policy.Engine
 	// OIDCVerifier validates inbound Authorization: Bearer tokens
-	// against authd. When set, sign endpoints require a valid token
-	// and derive the caller's groups from its claims (the request
-	// body's groups field is ignored). When nil, body groups are
-	// used (pre-OIDC behavior — for tests and pre-prod).
+	// against authd. When set, sign endpoints accept a valid token
+	// and derive the caller's groups from its claims. When nil, the
+	// bearer-token path is closed.
 	OIDCVerifier oidc.TokenVerifier
+	// MTLSStore maps the SANs presented on the inbound TLS client
+	// cert to a workload identity + group claims. When set, sign
+	// endpoints accept a verified client cert as an alternative to
+	// the bearer-token path. When nil, the mTLS auth path is closed.
+	//
+	// When both OIDCVerifier and MTLSStore are configured, the
+	// bearer-token path wins if an Authorization header is present.
+	// Workloads that authenticate via mTLS simply omit the header.
+	// When neither is configured, the request body's groups field
+	// is used directly (pre-auth-wiring fallback for tests).
+	MTLSStore mtls.Store
 	// Audit is the audit-event sink. When nil, [audit.NoopSink] is
 	// used (events are discarded silently).
 	Audit audit.Sink
@@ -85,6 +97,7 @@ func New(cfg Config) (*Server, error) {
 		caSigner: cfg.CASigner,
 		policy:   cfg.Policy,
 		oidc:     cfg.OIDCVerifier,
+		mtls:     cfg.MTLSStore,
 		audit:    auditSink,
 		auditSrc: auditSrc,
 		version:  cfg.Version,
@@ -111,6 +124,7 @@ type healthzResponse struct {
 	AuditActive  bool   `json:"audit_active"`
 	PolicyActive bool   `json:"policy_active"`
 	OIDCActive   bool   `json:"oidc_active"`
+	MTLSActive   bool   `json:"mtls_active"`
 }
 
 func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
@@ -123,6 +137,7 @@ func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 		AuditActive:  s.audit != audit.NoopSink,
 		PolicyActive: s.policy != nil,
 		OIDCActive:   s.oidc != nil,
+		MTLSActive:   s.mtls != nil,
 	}
 	_ = json.NewEncoder(w).Encode(body)
 }

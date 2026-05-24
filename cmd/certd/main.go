@@ -52,11 +52,32 @@
 //	                        minted for certd (the OIDC client_id authd
 //	                        registers for this service). Required when
 //	                        CERTD_OIDC_ISSUER is set.
+//
+//	CERTD_MTLS_PRINCIPALS_FILE  Path to a JSON file mapping cert SANs
+//	                        (SPIFFE URI or email) to workload identities
+//	                        + group claims. When set, sign endpoints
+//	                        accept a verified client cert as an
+//	                        alternative to the OIDC bearer path. File
+//	                        shape:
+//
+//	                          [
+//	                            {"name":"ssh-proxyd-prod",
+//	                             "san":"spiffe://corp/svc/ssh-proxyd",
+//	                             "groups":["ssh-proxy-service"]},
+//	                            {"name":"ops-bot",
+//	                             "san":"ops@corp.com",
+//	                             "groups":["ops"]}
+//	                          ]
+//
+//	                        Unset disables the mTLS auth path. The
+//	                        admin portal will replace the file with a
+//	                        Postgres-backed registry in a later slice.
 package main
 
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -76,6 +97,7 @@ import (
 
 	"github.com/abagile/tokyo3-ca/internal/audit"
 	"github.com/abagile/tokyo3-ca/internal/server/api"
+	"github.com/abagile/tokyo3-ca/internal/server/mtls"
 	"github.com/abagile/tokyo3-ca/internal/server/oidc"
 	"github.com/abagile/tokyo3-ca/internal/server/signer"
 )
@@ -145,10 +167,16 @@ func runServe(ctx context.Context) error {
 		return fmt.Errorf("oidc verifier: %w", err)
 	}
 
+	mtlsStore, err := loadMTLSStore(log)
+	if err != nil {
+		return fmt.Errorf("mtls store: %w", err)
+	}
+
 	srv, err := api.New(api.Config{
 		Log:          log,
 		CASigner:     caSigner,
 		OIDCVerifier: oidcVerifier,
+		MTLSStore:    mtlsStore,
 		Audit:        auditSink,
 		AuditSource:  auditSrc,
 		Version:      Version,
@@ -306,6 +334,44 @@ func loadOIDCVerifier(ctx context.Context, log *slog.Logger) (oidc.TokenVerifier
 	}
 	log.Info("oidc verifier ready", "issuer", issuer, "audience", audience)
 	return v, nil
+}
+
+// loadMTLSStore returns the workload-identity registry parsed from
+// CERTD_MTLS_PRINCIPALS_FILE. Returns (nil, nil) when the env var is
+// unset, disabling the mTLS auth path. Future slice swaps the
+// file-backed implementation for a Postgres-backed Store managed by
+// the admin portal — same interface, no API-layer changes.
+func loadMTLSStore(log *slog.Logger) (mtls.Store, error) {
+	path := os.Getenv("CERTD_MTLS_PRINCIPALS_FILE")
+	if path == "" {
+		log.Warn("CERTD_MTLS_PRINCIPALS_FILE unset — mTLS caller auth disabled (not for production)")
+		return nil, nil
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", path, err)
+	}
+	var raw []struct {
+		Name   string   `json:"name"`
+		SAN    string   `json:"san"`
+		Groups []string `json:"groups"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return nil, fmt.Errorf("parse %s: %w", path, err)
+	}
+	principals := make([]mtls.Principal, 0, len(raw))
+	for _, r := range raw {
+		if r.SAN == "" {
+			return nil, fmt.Errorf("entry %q in %s has empty san", r.Name, path)
+		}
+		principals = append(principals, mtls.Principal{
+			Name:       r.Name,
+			MatchedSAN: r.SAN,
+			Groups:     r.Groups,
+		})
+	}
+	log.Info("mtls store ready", "principals", len(principals), "file", path)
+	return mtls.NewInMemoryStore(principals...), nil
 }
 
 // buildServerTLS builds the *tls.Config used for the inbound HTTPS

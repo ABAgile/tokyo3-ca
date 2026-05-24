@@ -14,6 +14,7 @@ import (
 
 	"golang.org/x/crypto/ssh"
 
+	"github.com/abagile/tokyo3-ca/internal/server/mtls"
 	"github.com/abagile/tokyo3-ca/internal/server/policy"
 	"github.com/abagile/tokyo3-ca/internal/server/sshengine"
 )
@@ -343,35 +344,67 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 }
 
 // authenticate resolves the caller's groups for policy enforcement.
-// Precedence:
+// Precedence when either auth path is configured:
 //
-//  1. If an OIDC verifier is wired, a valid Authorization: Bearer
-//     token is required; the verified claims' Groups list is used,
-//     and bodyGroups is ignored.
-//  2. If no OIDC verifier is wired, bodyGroups is used as-is
-//     (pre-auth-wiring fallback for tests and pre-prod). Phase 2.7
-//     will add an mTLS path here that runs in parallel with OIDC.
+//  1. OIDC bearer (Authorization: Bearer …) wins when both
+//     OIDCVerifier is wired and the header is present. An invalid
+//     token short-circuits with 401 — we don't silently fall through
+//     to mTLS because the caller explicitly attempted the OIDC path.
+//  2. mTLS client cert principal — used when OIDC isn't applicable
+//     (no verifier wired, or no bearer header presented) and a
+//     verified client cert SAN matches a registered principal.
+//  3. If both paths are wired and neither produced credentials, 401.
 //
-// On auth failure, an HTTP error has been written to w and the second
-// return is false. On success the resolved groups are returned (may
-// be empty when no OIDC and bodyGroups is empty — the caller's policy
-// check applies the "groups required" rule when needed).
+// When neither path is configured (OIDCVerifier and MTLSStore both
+// nil), bodyGroups is used as-is — the pre-auth-wiring fallback for
+// integration tests.
+//
+// On auth failure, the HTTP error has been written to w and the
+// second return is false. On success the resolved groups are
+// returned (possibly empty — the caller's policy check applies the
+// "groups required" rule when needed).
 func (s *Server) authenticate(w http.ResponseWriter, r *http.Request, bodyGroups []string) ([]string, bool) {
-	if s.oidc == nil {
+	if s.oidc == nil && s.mtls == nil {
 		return bodyGroups, true
 	}
-	raw, ok := extractBearerToken(r)
-	if !ok {
-		writeError(w, http.StatusUnauthorized, "missing or malformed Authorization: Bearer header")
-		return nil, false
+
+	// OIDC bearer path: tried first when the header is present.
+	if s.oidc != nil {
+		if raw, hasBearer := extractBearerToken(r); hasBearer {
+			claims, err := s.oidc.Verify(r.Context(), raw)
+			if err != nil {
+				s.log.Debug("oidc verify failed", "err", err)
+				writeError(w, http.StatusUnauthorized, "invalid bearer token")
+				return nil, false
+			}
+			return claims.Groups, true
+		}
 	}
-	claims, err := s.oidc.Verify(r.Context(), raw)
-	if err != nil {
-		s.log.Debug("oidc verify failed", "err", err)
-		writeError(w, http.StatusUnauthorized, "invalid bearer token")
-		return nil, false
+
+	// mTLS client-cert path: tried when no bearer was presented (or
+	// no OIDC verifier is wired) and a verified peer cert is on the
+	// request.
+	if s.mtls != nil {
+		sans := mtls.ExtractSANs(r)
+		if len(sans) > 0 {
+			p, err := s.mtls.Lookup(sans)
+			if err == nil {
+				return p.Groups, true
+			}
+			if errors.Is(err, mtls.ErrUnknownPrincipal) {
+				s.log.Debug("mtls unknown principal", "sans", sans)
+				writeError(w, http.StatusUnauthorized, "unknown cert principal")
+				return nil, false
+			}
+			s.log.Error("mtls lookup", "err", err)
+			writeError(w, http.StatusInternalServerError, "auth backend failure")
+			return nil, false
+		}
 	}
-	return claims.Groups, true
+
+	// Neither path produced credentials.
+	writeError(w, http.StatusUnauthorized, "authentication required (bearer token or client cert)")
+	return nil, false
 }
 
 // extractBearerToken pulls the raw token out of the Authorization

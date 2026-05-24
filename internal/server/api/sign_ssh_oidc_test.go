@@ -117,8 +117,8 @@ func TestOIDC_RejectsMissingAuthorization(t *testing.T) {
 	if rec.Code != http.StatusUnauthorized {
 		t.Errorf("status = %d, want 401; body=%s", rec.Code, rec.Body.String())
 	}
-	if msg := errorBody(t, rec); !strings.Contains(msg, "Authorization") {
-		t.Errorf("error = %q, want to mention Authorization", msg)
+	if msg := errorBody(t, rec); !strings.Contains(msg, "authentication") && !strings.Contains(msg, "bearer") {
+		t.Errorf("error = %q, want to mention 'authentication' or 'bearer'", msg)
 	}
 }
 
