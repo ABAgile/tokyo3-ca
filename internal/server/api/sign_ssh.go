@@ -7,12 +7,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"strings"
 	"time"
 
 	"golang.org/x/crypto/ssh"
 
+	"github.com/abagile/tokyo3-ca/internal/server/policy"
 	"github.com/abagile/tokyo3-ca/internal/server/sshengine"
 )
 
@@ -42,17 +44,26 @@ type signUserRequest struct {
 	// used for audit attribution. Required.
 	KeyID string `json:"key_id"`
 	// Principals are the Unix usernames the bearer may log in as.
-	// Required; at least one entry.
+	// Required; at least one entry. When policy is active, requested
+	// principals not authorized by any of the caller's roles are
+	// silently dropped; the full set being denied is a 403.
 	Principals []string `json:"principals"`
+	// Groups carry the caller's authenticated group membership for
+	// policy enforcement. Interim until later phases derive
+	// groups from a verified OIDC token / mTLS cert; treated as
+	// untrusted input currently and ignored unless [policy.Engine] is
+	// wired into the server. Required when policy is active.
+	Groups []string `json:"groups,omitempty"`
 	// Extensions are SSH cert extensions (e.g., permit-pty,
-	// permit-port-forwarding). Optional.
+	// permit-port-forwarding). Optional. Merged with role default
+	// extensions (request-level wins).
 	Extensions map[string]string `json:"extensions,omitempty"`
 	// CriticalOptions are strictly-enforced sshd options (e.g.,
 	// force-command, source-address). Optional.
 	CriticalOptions map[string]string `json:"critical_options,omitempty"`
 	// TTLSeconds is the requested validity window in seconds. When
 	// omitted or zero, defaultUserCertTTL is applied. Capped at
-	// maxUserCertTTL.
+	// maxUserCertTTL at the API edge; role policy may cap further.
 	TTLSeconds int64 `json:"ttl_seconds,omitempty"`
 }
 
@@ -60,6 +71,7 @@ type signHostRequest struct {
 	PublicKey  string   `json:"public_key"`
 	KeyID      string   `json:"key_id"`
 	Principals []string `json:"principals"`
+	Groups     []string `json:"groups,omitempty"`
 	TTLSeconds int64    `json:"ttl_seconds,omitempty"`
 }
 
@@ -101,6 +113,35 @@ func (s *Server) handleSignUserCert(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Apply role-table policy when configured. The decision narrows the
+	// requested principal set and may cap TTL further; role default
+	// extensions are merged in with request extensions winning on conflict.
+	principals := req.Principals
+	extensions := req.Extensions
+	if s.policy != nil {
+		if len(req.Groups) == 0 {
+			writeError(w, http.StatusBadRequest, "groups is required when policy is active")
+			return
+		}
+		decision, err := s.policy.EvaluateUserCert(req.Groups, policy.UserCertRequest{
+			RequestedPrincipals: req.Principals,
+			RequestedTTL:        ttl,
+			EndpointMaxTTL:      maxUserCertTTL,
+		})
+		if err != nil {
+			if errors.Is(err, policy.ErrNoRole) || errors.Is(err, policy.ErrEmptyDecision) {
+				writeError(w, http.StatusForbidden, err.Error())
+				return
+			}
+			s.log.Error("policy evaluate user cert", "err", err)
+			writeError(w, http.StatusInternalServerError, "policy evaluation failed")
+			return
+		}
+		principals = decision.Principals
+		ttl = decision.TTL
+		extensions = mergeExtensions(decision.Extensions, req.Extensions)
+	}
+
 	serial, err := generateSerial()
 	if err != nil {
 		s.log.Error("generate cert serial", "err", err)
@@ -112,8 +153,8 @@ func (s *Server) handleSignUserCert(w http.ResponseWriter, r *http.Request) {
 	cert, err := sshengine.SignUserCert(rand.Reader, s.caSigner, sshengine.UserCertParams{
 		PublicKey:       pub,
 		KeyID:           req.KeyID,
-		Principals:      req.Principals,
-		Extensions:      req.Extensions,
+		Principals:      principals,
+		Extensions:      extensions,
 		CriticalOptions: req.CriticalOptions,
 		ValidAfter:      now,
 		ValidBefore:     now.Add(ttl),
@@ -156,6 +197,30 @@ func (s *Server) handleSignHostCert(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	principals := req.Principals
+	if s.policy != nil {
+		if len(req.Groups) == 0 {
+			writeError(w, http.StatusBadRequest, "groups is required when policy is active")
+			return
+		}
+		decision, err := s.policy.EvaluateHostCert(req.Groups, policy.HostCertRequest{
+			RequestedPrincipals: req.Principals,
+			RequestedTTL:        ttl,
+			EndpointMaxTTL:      maxHostCertTTL,
+		})
+		if err != nil {
+			if errors.Is(err, policy.ErrNoRole) || errors.Is(err, policy.ErrEmptyDecision) {
+				writeError(w, http.StatusForbidden, err.Error())
+				return
+			}
+			s.log.Error("policy evaluate host cert", "err", err)
+			writeError(w, http.StatusInternalServerError, "policy evaluation failed")
+			return
+		}
+		principals = decision.Principals
+		ttl = decision.TTL
+	}
+
 	serial, err := generateSerial()
 	if err != nil {
 		s.log.Error("generate cert serial", "err", err)
@@ -167,7 +232,7 @@ func (s *Server) handleSignHostCert(w http.ResponseWriter, r *http.Request) {
 	cert, err := sshengine.SignHostCert(rand.Reader, s.caSigner, sshengine.HostCertParams{
 		PublicKey:   pub,
 		KeyID:       req.KeyID,
-		Principals:  req.Principals,
+		Principals:  principals,
 		ValidAfter:  now,
 		ValidBefore: now.Add(ttl),
 		Serial:      serial,
@@ -263,4 +328,19 @@ func writeJSON(w http.ResponseWriter, status int, body any) {
 
 func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, errorResponse{Error: msg})
+}
+
+// mergeExtensions returns a fresh map containing role defaults overlaid
+// with request-level extensions — the latter wins on key conflicts so
+// the caller can override a role-default permit-X with an explicit
+// deny (empty value still counts as "set" in SSH cert extension
+// semantics, so removal isn't expressible at this layer).
+func mergeExtensions(roleDefaults, requestExts map[string]string) map[string]string {
+	if len(roleDefaults) == 0 && len(requestExts) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(roleDefaults)+len(requestExts))
+	maps.Copy(out, roleDefaults)
+	maps.Copy(out, requestExts)
+	return out
 }

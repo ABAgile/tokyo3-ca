@@ -15,6 +15,7 @@ import (
 	"golang.org/x/crypto/ssh"
 
 	"github.com/abagile/tokyo3-ca/internal/audit"
+	"github.com/abagile/tokyo3-ca/internal/server/policy"
 	"github.com/abagile/tokyo3-ca/internal/server/signer"
 )
 
@@ -23,6 +24,7 @@ import (
 type Server struct {
 	log      *slog.Logger
 	caSigner signer.Signer
+	policy   *policy.Engine // Role-table enforcer; nil = permissive (pre-auth wiring).
 	audit    audit.Sink     // JetStream publisher; NoopSink when CERTD_NATS_URL is unset.
 	auditSrc journal.Source // JetStream reader for the portal audit page; NoopSource when CERTD_NATS_URL is unset.
 	version  string         // build-time version string, surfaced in /healthz; empty allowed.
@@ -36,6 +38,12 @@ type Config struct {
 	// CASigner is the CA signing primitive used by the issuance
 	// endpoints. Required.
 	CASigner signer.Signer
+	// Policy applies the role table to incoming sign requests. When
+	// nil, sign endpoints are permissive — anyone reaching them can
+	// sign anything within the endpoint TTL ceiling. Production builds
+	// must set this; pre-OIDC/mTLS phases of the MVP leave it nil so
+	// integration tests can exercise the cert engines directly.
+	Policy *policy.Engine
 	// Audit is the audit-event sink. When nil, [audit.NoopSink] is
 	// used (events are discarded silently).
 	Audit audit.Sink
@@ -67,6 +75,7 @@ func New(cfg Config) (*Server, error) {
 	return &Server{
 		log:      cfg.Log,
 		caSigner: cfg.CASigner,
+		policy:   cfg.Policy,
 		audit:    auditSink,
 		auditSrc: auditSrc,
 		version:  cfg.Version,
@@ -91,6 +100,7 @@ type healthzResponse struct {
 	CASignerInfo string `json:"ca_signer"`
 	CAPublicKey  string `json:"ca_public_key"`
 	AuditActive  bool   `json:"audit_active"`
+	PolicyActive bool   `json:"policy_active"`
 }
 
 func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
@@ -101,6 +111,7 @@ func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 		CASignerInfo: s.caSigner.Description(),
 		CAPublicKey:  caPublicKeyFingerprint(s.caSigner),
 		AuditActive:  s.audit != audit.NoopSink,
+		PolicyActive: s.policy != nil,
 	}
 	_ = json.NewEncoder(w).Encode(body)
 }
