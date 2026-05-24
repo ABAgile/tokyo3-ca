@@ -78,6 +78,8 @@ func New(cfg Config) (*Server, error) {
 func (s *Server) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
+	mux.HandleFunc("POST /api/v1/ssh/sign-user", s.handleSignUserCert)
+	mux.HandleFunc("POST /api/v1/ssh/sign-host", s.handleSignHostCert)
 	return mux
 }
 
