@@ -41,6 +41,17 @@
 //	                        CERTD_NATS_CERT is set.
 //	CERTD_NATS_CA           CA certificate PEM path for verifying the NATS
 //	                        server cert. Falls back to CERTD_WORKLOAD_CA.
+//
+//	CERTD_OIDC_ISSUER       authd public URL (e.g., https://auth.example.com).
+//	                        When set together with CERTD_OIDC_AUDIENCE,
+//	                        sign endpoints require a valid Authorization:
+//	                        Bearer token and derive the caller's groups
+//	                        from its claims. When unset, body groups are
+//	                        used (for tests and pre-prod).
+//	CERTD_OIDC_AUDIENCE     The `aud` claim authd embeds on every token
+//	                        minted for certd (the OIDC client_id authd
+//	                        registers for this service). Required when
+//	                        CERTD_OIDC_ISSUER is set.
 package main
 
 import (
@@ -65,6 +76,7 @@ import (
 
 	"github.com/abagile/tokyo3-ca/internal/audit"
 	"github.com/abagile/tokyo3-ca/internal/server/api"
+	"github.com/abagile/tokyo3-ca/internal/server/oidc"
 	"github.com/abagile/tokyo3-ca/internal/server/signer"
 )
 
@@ -128,12 +140,18 @@ func runServe(ctx context.Context) error {
 		return fmt.Errorf("server tls: %w", err)
 	}
 
+	oidcVerifier, err := loadOIDCVerifier(ctx, log)
+	if err != nil {
+		return fmt.Errorf("oidc verifier: %w", err)
+	}
+
 	srv, err := api.New(api.Config{
-		Log:         log,
-		CASigner:    caSigner,
-		Audit:       auditSink,
-		AuditSource: auditSrc,
-		Version:     Version,
+		Log:          log,
+		CASigner:     caSigner,
+		OIDCVerifier: oidcVerifier,
+		Audit:        auditSink,
+		AuditSource:  auditSrc,
+		Version:      Version,
 	})
 	if err != nil {
 		return fmt.Errorf("api server: %w", err)
@@ -266,6 +284,28 @@ func loadCASigner(log *slog.Logger) (signer.Signer, error) {
 	}
 	log.Warn("CERTD_CA_KEY_FILE not set — generating ephemeral CA key (not for production)")
 	return signer.NewEphemeralEd25519()
+}
+
+// loadOIDCVerifier returns a token verifier for inbound bearer tokens
+// when CERTD_OIDC_ISSUER + CERTD_OIDC_AUDIENCE are both set. Either
+// alone is an error (asymmetric config), and both unset returns nil
+// (no OIDC — sign endpoints fall back to body groups).
+func loadOIDCVerifier(ctx context.Context, log *slog.Logger) (oidc.TokenVerifier, error) {
+	issuer := os.Getenv("CERTD_OIDC_ISSUER")
+	audience := os.Getenv("CERTD_OIDC_AUDIENCE")
+	if issuer == "" && audience == "" {
+		log.Warn("CERTD_OIDC_ISSUER + CERTD_OIDC_AUDIENCE unset — token verification disabled; sign endpoints use body groups (not for production)")
+		return nil, nil
+	}
+	if issuer == "" || audience == "" {
+		return nil, fmt.Errorf("CERTD_OIDC_ISSUER and CERTD_OIDC_AUDIENCE must both be set or both unset")
+	}
+	v, err := oidc.NewHTTPVerifier(ctx, issuer, audience)
+	if err != nil {
+		return nil, err
+	}
+	log.Info("oidc verifier ready", "issuer", issuer, "audience", audience)
+	return v, nil
 }
 
 // buildServerTLS builds the *tls.Config used for the inbound HTTPS

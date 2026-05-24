@@ -15,6 +15,7 @@ import (
 	"golang.org/x/crypto/ssh"
 
 	"github.com/abagile/tokyo3-ca/internal/audit"
+	"github.com/abagile/tokyo3-ca/internal/server/oidc"
 	"github.com/abagile/tokyo3-ca/internal/server/policy"
 	"github.com/abagile/tokyo3-ca/internal/server/signer"
 )
@@ -24,10 +25,11 @@ import (
 type Server struct {
 	log      *slog.Logger
 	caSigner signer.Signer
-	policy   *policy.Engine // Role-table enforcer; nil = permissive (pre-auth wiring).
-	audit    audit.Sink     // JetStream publisher; NoopSink when CERTD_NATS_URL is unset.
-	auditSrc journal.Source // JetStream reader for the portal audit page; NoopSource when CERTD_NATS_URL is unset.
-	version  string         // build-time version string, surfaced in /healthz; empty allowed.
+	policy   *policy.Engine     // Role-table enforcer; nil = permissive (pre-auth wiring).
+	oidc     oidc.TokenVerifier // Bearer-token verifier; nil = no OIDC auth (body-groups fallback).
+	audit    audit.Sink         // JetStream publisher; NoopSink when CERTD_NATS_URL is unset.
+	auditSrc journal.Source     // JetStream reader for the portal audit page; NoopSource when CERTD_NATS_URL is unset.
+	version  string             // build-time version string, surfaced in /healthz; empty allowed.
 }
 
 // Config is the constructor argument for [New].
@@ -44,6 +46,12 @@ type Config struct {
 	// must set this; pre-OIDC/mTLS phases of the MVP leave it nil so
 	// integration tests can exercise the cert engines directly.
 	Policy *policy.Engine
+	// OIDCVerifier validates inbound Authorization: Bearer tokens
+	// against authd. When set, sign endpoints require a valid token
+	// and derive the caller's groups from its claims (the request
+	// body's groups field is ignored). When nil, body groups are
+	// used (pre-OIDC behavior — for tests and pre-prod).
+	OIDCVerifier oidc.TokenVerifier
 	// Audit is the audit-event sink. When nil, [audit.NoopSink] is
 	// used (events are discarded silently).
 	Audit audit.Sink
@@ -76,6 +84,7 @@ func New(cfg Config) (*Server, error) {
 		log:      cfg.Log,
 		caSigner: cfg.CASigner,
 		policy:   cfg.Policy,
+		oidc:     cfg.OIDCVerifier,
 		audit:    auditSink,
 		auditSrc: auditSrc,
 		version:  cfg.Version,
@@ -101,6 +110,7 @@ type healthzResponse struct {
 	CAPublicKey  string `json:"ca_public_key"`
 	AuditActive  bool   `json:"audit_active"`
 	PolicyActive bool   `json:"policy_active"`
+	OIDCActive   bool   `json:"oidc_active"`
 }
 
 func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
@@ -112,6 +122,7 @@ func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 		CAPublicKey:  caPublicKeyFingerprint(s.caSigner),
 		AuditActive:  s.audit != audit.NoopSink,
 		PolicyActive: s.policy != nil,
+		OIDCActive:   s.oidc != nil,
 	}
 	_ = json.NewEncoder(w).Encode(body)
 }

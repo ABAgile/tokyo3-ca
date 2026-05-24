@@ -113,17 +113,24 @@ func (s *Server) handleSignUserCert(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Resolve the caller's groups — from a verified OIDC token when
+	// OIDC is configured, otherwise from the request body as-is.
+	groups, ok := s.authenticate(w, r, req.Groups)
+	if !ok {
+		return
+	}
+
 	// Apply role-table policy when configured. The decision narrows the
 	// requested principal set and may cap TTL further; role default
 	// extensions are merged in with request extensions winning on conflict.
 	principals := req.Principals
 	extensions := req.Extensions
 	if s.policy != nil {
-		if len(req.Groups) == 0 {
+		if len(groups) == 0 {
 			writeError(w, http.StatusBadRequest, "groups is required when policy is active")
 			return
 		}
-		decision, err := s.policy.EvaluateUserCert(req.Groups, policy.UserCertRequest{
+		decision, err := s.policy.EvaluateUserCert(groups, policy.UserCertRequest{
 			RequestedPrincipals: req.Principals,
 			RequestedTTL:        ttl,
 			EndpointMaxTTL:      maxUserCertTTL,
@@ -197,13 +204,18 @@ func (s *Server) handleSignHostCert(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	groups, ok := s.authenticate(w, r, req.Groups)
+	if !ok {
+		return
+	}
+
 	principals := req.Principals
 	if s.policy != nil {
-		if len(req.Groups) == 0 {
+		if len(groups) == 0 {
 			writeError(w, http.StatusBadRequest, "groups is required when policy is active")
 			return
 		}
-		decision, err := s.policy.EvaluateHostCert(req.Groups, policy.HostCertRequest{
+		decision, err := s.policy.EvaluateHostCert(groups, policy.HostCertRequest{
 			RequestedPrincipals: req.Principals,
 			RequestedTTL:        ttl,
 			EndpointMaxTTL:      maxHostCertTTL,
@@ -328,6 +340,57 @@ func writeJSON(w http.ResponseWriter, status int, body any) {
 
 func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, errorResponse{Error: msg})
+}
+
+// authenticate resolves the caller's groups for policy enforcement.
+// Precedence:
+//
+//  1. If an OIDC verifier is wired, a valid Authorization: Bearer
+//     token is required; the verified claims' Groups list is used,
+//     and bodyGroups is ignored.
+//  2. If no OIDC verifier is wired, bodyGroups is used as-is
+//     (pre-auth-wiring fallback for tests and pre-prod). Phase 2.7
+//     will add an mTLS path here that runs in parallel with OIDC.
+//
+// On auth failure, an HTTP error has been written to w and the second
+// return is false. On success the resolved groups are returned (may
+// be empty when no OIDC and bodyGroups is empty — the caller's policy
+// check applies the "groups required" rule when needed).
+func (s *Server) authenticate(w http.ResponseWriter, r *http.Request, bodyGroups []string) ([]string, bool) {
+	if s.oidc == nil {
+		return bodyGroups, true
+	}
+	raw, ok := extractBearerToken(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "missing or malformed Authorization: Bearer header")
+		return nil, false
+	}
+	claims, err := s.oidc.Verify(r.Context(), raw)
+	if err != nil {
+		s.log.Debug("oidc verify failed", "err", err)
+		writeError(w, http.StatusUnauthorized, "invalid bearer token")
+		return nil, false
+	}
+	return claims.Groups, true
+}
+
+// extractBearerToken pulls the raw token out of the Authorization
+// header. Accepts only the canonical "Bearer <token>" form; mixed
+// case "bearer" is permitted per RFC 6750 section 2.1.
+func extractBearerToken(r *http.Request) (string, bool) {
+	h := r.Header.Get("Authorization")
+	if h == "" {
+		return "", false
+	}
+	parts := strings.SplitN(h, " ", 2)
+	if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") {
+		return "", false
+	}
+	tok := strings.TrimSpace(parts[1])
+	if tok == "" {
+		return "", false
+	}
+	return tok, true
 }
 
 // mergeExtensions returns a fresh map containing role defaults overlaid
