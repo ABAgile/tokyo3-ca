@@ -124,6 +124,115 @@ func (s *InMemoryStore) All() []Role {
 	return append([]Role(nil), s.all...)
 }
 
+// ByName returns the role registered under name. ok is false when no
+// role matches; the zero Role is returned in that case. Caller is
+// safe to mutate the returned value — it's a copy of the stored entry.
+func (s *InMemoryStore) ByName(name string) (Role, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, r := range s.all {
+		if r.Name == name {
+			return r, true
+		}
+	}
+	return Role{}, false
+}
+
+// ErrRoleExists is returned by [InMemoryStore.Add] when a role with
+// the same Name is already registered. Distinct from generic
+// validation errors so the admin layer can surface "name taken" in
+// a form-friendly way.
+var ErrRoleExists = errors.New("role with that name already exists")
+
+// ErrRoleNotFound is returned by [InMemoryStore.Replace] and
+// [InMemoryStore.Delete] when the target role is absent.
+var ErrRoleNotFound = errors.New("role not found")
+
+// Add inserts role. Returns [ErrRoleExists] when the name collides
+// with an existing entry. Name must be non-empty; the policy layer
+// requires it for lookup.
+func (s *InMemoryStore) Add(role Role) error {
+	if role.Name == "" {
+		return errors.New("role name is required")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, r := range s.all {
+		if r.Name == role.Name {
+			return ErrRoleExists
+		}
+	}
+	next := append(append([]Role(nil), s.all...), role)
+	s.replaceLocked(next)
+	return nil
+}
+
+// Replace swaps the role registered as oldName for newRole. oldName
+// and newRole.Name may differ — that's a rename. Returns
+// [ErrRoleNotFound] when oldName is absent and [ErrRoleExists] when
+// renaming would collide with another existing role.
+func (s *InMemoryStore) Replace(oldName string, newRole Role) error {
+	if newRole.Name == "" {
+		return errors.New("role name is required")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	idx := -1
+	for i, r := range s.all {
+		if r.Name == oldName {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return ErrRoleNotFound
+	}
+	if newRole.Name != oldName {
+		for i, r := range s.all {
+			if i != idx && r.Name == newRole.Name {
+				return ErrRoleExists
+			}
+		}
+	}
+	next := append([]Role(nil), s.all...)
+	next[idx] = newRole
+	s.replaceLocked(next)
+	return nil
+}
+
+// Delete removes the role registered as name. Returns
+// [ErrRoleNotFound] when the role is absent.
+func (s *InMemoryStore) Delete(name string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	idx := -1
+	for i, r := range s.all {
+		if r.Name == name {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return ErrRoleNotFound
+	}
+	next := append(append([]Role(nil), s.all[:idx]...), s.all[idx+1:]...)
+	s.replaceLocked(next)
+	return nil
+}
+
+// replaceLocked is the shared mutation primitive. Caller must hold
+// the write lock; rebuilds both the by-group index and the canonical
+// slice. Mirrors [replace] but skips the lock acquire so the higher-
+// level helpers can hold it across validation + commit.
+func (s *InMemoryStore) replaceLocked(roles []Role) {
+	idx := make(map[string][]Role, len(roles))
+	for _, r := range roles {
+		idx[r.GroupClaim] = append(idx[r.GroupClaim], r)
+	}
+	s.byGroup = idx
+	s.all = roles
+}
+
 // ── Engine ────────────────────────────────────────────────────────────────────
 
 // Engine applies role-table policy to incoming sign requests.

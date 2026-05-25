@@ -3,6 +3,7 @@ package portal_test
 import (
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -11,10 +12,37 @@ import (
 	"github.com/abagile/tokyo3-ca/internal/server/portal"
 )
 
-// stubRoleStore is the portal.RoleStore test double.
+// stubRoleStore is the read-only portal.RoleStore test double — used
+// to confirm the CRUD-write routes return 405 when the store is
+// read-only.
 type stubRoleStore struct{ roles []policy.Role }
 
 func (s *stubRoleStore) All() []policy.Role { return s.roles }
+
+// newClient returns an *http.Client that refuses to follow redirects.
+// The CRUD-write routes return 303 redirects on success; tests want
+// to assert on the Location header rather than the destination body.
+func newClient() *http.Client {
+	return &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+}
+
+func postForm(t *testing.T, url string, form url.Values) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost, url, strings.NewReader(form.Encode()))
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	resp, err := newClient().Do(req)
+	if err != nil {
+		t.Fatalf("POST %s: %v", url, err)
+	}
+	return resp
+}
 
 func newTestPortal(t *testing.T) *portal.Server {
 	t.Helper()
@@ -252,6 +280,257 @@ func TestPortal_New_DefaultsClockAndLogger(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("status = %d, want 200", resp.StatusCode)
+	}
+}
+
+func TestPortal_RoleNewForm_RendersEmpty(t *testing.T) {
+	store := policy.NewInMemoryStore()
+	p, _ := portal.New(portal.Config{Version: "v", RoleStore: store, Now: time.Now})
+	srv := httptest.NewServer(p.Routes())
+	defer srv.Close()
+
+	body := getBody(t, srv.URL+"/roles/new")
+	for _, want := range []string{
+		`<h1>New role</h1>`,
+		`name="name"`,
+		`name="group_claim"`,
+		`name="allowed_principals"`,
+		`Create role`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("body missing %q\n--- body ---\n%s", want, body)
+		}
+	}
+}
+
+func TestPortal_RoleCreate_AddsRoleAndRedirects(t *testing.T) {
+	store := policy.NewInMemoryStore()
+	p, _ := portal.New(portal.Config{Version: "v", RoleStore: store, Now: time.Now})
+	srv := httptest.NewServer(p.Routes())
+	defer srv.Close()
+
+	resp := postForm(t, srv.URL+"/roles/new", url.Values{
+		"name":               {"eng-prod"},
+		"group_claim":        {"eng"},
+		"allowed_principals": {"alice\nbob"},
+		"host_patterns":      {"*.prod.internal"},
+		"max_user_cert_ttl":  {"4h"},
+		"default_extensions": {"permit-pty\npermit-port-forwarding=yes"},
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("status = %d, want 303; body=%s", resp.StatusCode, readAll(t, resp))
+	}
+	if loc := resp.Header.Get("Location"); loc != "/roles/eng-prod" {
+		t.Errorf("Location = %q, want /roles/eng-prod", loc)
+	}
+
+	// Store now holds the role with parsed fields.
+	r, ok := store.ByName("eng-prod")
+	if !ok {
+		t.Fatal("role not added to store")
+	}
+	if len(r.AllowedPrincipals) != 2 || r.AllowedPrincipals[1] != "bob" {
+		t.Errorf("AllowedPrincipals = %v", r.AllowedPrincipals)
+	}
+	if r.MaxUserCertTTL != 4*time.Hour {
+		t.Errorf("MaxUserCertTTL = %v", r.MaxUserCertTTL)
+	}
+	if r.DefaultExtensions["permit-pty"] != "" || r.DefaultExtensions["permit-port-forwarding"] != "yes" {
+		t.Errorf("DefaultExtensions = %v", r.DefaultExtensions)
+	}
+}
+
+func TestPortal_RoleCreate_ValidationErrorRendersForm(t *testing.T) {
+	store := policy.NewInMemoryStore()
+	p, _ := portal.New(portal.Config{Version: "v", RoleStore: store, Now: time.Now})
+	srv := httptest.NewServer(p.Routes())
+	defer srv.Close()
+
+	// Missing required name field → 400 with the form re-rendered
+	// and the typed group_claim preserved.
+	resp := postForm(t, srv.URL+"/roles/new", url.Values{
+		"group_claim": {"eng"},
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", resp.StatusCode)
+	}
+	body := readAll(t, resp)
+	if !strings.Contains(body, "name is required") {
+		t.Errorf("body missing error banner:\n%s", body)
+	}
+	if !strings.Contains(body, `value="eng"`) {
+		t.Errorf("body should preserve typed group_claim:\n%s", body)
+	}
+	if len(store.All()) != 0 {
+		t.Errorf("nothing should have been added to the store")
+	}
+}
+
+func TestPortal_RoleCreate_DuplicateName_400(t *testing.T) {
+	store := policy.NewInMemoryStore(policy.Role{Name: "eng", GroupClaim: "eng"})
+	p, _ := portal.New(portal.Config{Version: "v", RoleStore: store, Now: time.Now})
+	srv := httptest.NewServer(p.Routes())
+	defer srv.Close()
+
+	resp := postForm(t, srv.URL+"/roles/new", url.Values{
+		"name":        {"eng"},
+		"group_claim": {"eng"},
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", resp.StatusCode)
+	}
+	if body := readAll(t, resp); !strings.Contains(body, "already exists") {
+		t.Errorf("body missing ErrRoleExists message:\n%s", body)
+	}
+}
+
+func TestPortal_RoleEditForm_PreFillsFromStore(t *testing.T) {
+	store := policy.NewInMemoryStore(policy.Role{
+		Name:              "eng",
+		GroupClaim:        "eng",
+		AllowedPrincipals: []string{"alice"},
+		MaxUserCertTTL:    4 * time.Hour,
+		DefaultExtensions: map[string]string{"permit-pty": ""},
+	})
+	p, _ := portal.New(portal.Config{Version: "v", RoleStore: store, Now: time.Now})
+	srv := httptest.NewServer(p.Routes())
+	defer srv.Close()
+
+	body := getBody(t, srv.URL+"/roles/eng/edit")
+	for _, want := range []string{
+		`<h1>Edit role: eng</h1>`,
+		`value="eng"`,
+		`>alice<`,
+		`value="4h0m0s"`,
+		`>permit-pty<`,
+		`Save changes`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("body missing %q\n--- body ---\n%s", want, body)
+		}
+	}
+}
+
+func TestPortal_RoleUpdate_SavesAndRedirects(t *testing.T) {
+	store := policy.NewInMemoryStore(policy.Role{Name: "eng", GroupClaim: "eng"})
+	p, _ := portal.New(portal.Config{Version: "v", RoleStore: store, Now: time.Now})
+	srv := httptest.NewServer(p.Routes())
+	defer srv.Close()
+
+	resp := postForm(t, srv.URL+"/roles/eng/edit", url.Values{
+		"name":               {"eng"},
+		"group_claim":        {"eng"},
+		"allowed_principals": {"alice\nbob"},
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("status = %d, want 303", resp.StatusCode)
+	}
+	r, _ := store.ByName("eng")
+	if len(r.AllowedPrincipals) != 2 {
+		t.Errorf("AllowedPrincipals = %v", r.AllowedPrincipals)
+	}
+}
+
+func TestPortal_RoleUpdate_AllowsRename(t *testing.T) {
+	store := policy.NewInMemoryStore(policy.Role{Name: "eng", GroupClaim: "eng"})
+	p, _ := portal.New(portal.Config{Version: "v", RoleStore: store, Now: time.Now})
+	srv := httptest.NewServer(p.Routes())
+	defer srv.Close()
+
+	resp := postForm(t, srv.URL+"/roles/eng/edit", url.Values{
+		"name":        {"engineering"},
+		"group_claim": {"eng"},
+	})
+	defer resp.Body.Close()
+	if loc := resp.Header.Get("Location"); loc != "/roles/engineering" {
+		t.Errorf("Location = %q, want /roles/engineering", loc)
+	}
+	if _, ok := store.ByName("eng"); ok {
+		t.Error("old name still present")
+	}
+	if _, ok := store.ByName("engineering"); !ok {
+		t.Error("renamed role missing")
+	}
+}
+
+func TestPortal_RoleDelete_RemovesAndRedirects(t *testing.T) {
+	store := policy.NewInMemoryStore(
+		policy.Role{Name: "eng", GroupClaim: "eng"},
+		policy.Role{Name: "sre", GroupClaim: "sre"},
+	)
+	p, _ := portal.New(portal.Config{Version: "v", RoleStore: store, Now: time.Now})
+	srv := httptest.NewServer(p.Routes())
+	defer srv.Close()
+
+	resp := postForm(t, srv.URL+"/roles/eng/delete", url.Values{})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("status = %d, want 303", resp.StatusCode)
+	}
+	if loc := resp.Header.Get("Location"); loc != "/roles" {
+		t.Errorf("Location = %q, want /roles", loc)
+	}
+	if _, ok := store.ByName("eng"); ok {
+		t.Error("eng still present after delete")
+	}
+}
+
+func TestPortal_RoleCRUD_ReadOnlyStoreReturns405(t *testing.T) {
+	// Stub store implements RoleStore but not MutableRoleStore.
+	store := &stubRoleStore{roles: []policy.Role{{Name: "eng", GroupClaim: "eng"}}}
+	p, _ := portal.New(portal.Config{Version: "v", RoleStore: store, Now: time.Now})
+	srv := httptest.NewServer(p.Routes())
+	defer srv.Close()
+
+	for _, tc := range []struct {
+		method, path string
+	}{
+		{http.MethodGet, "/roles/new"},
+		{http.MethodPost, "/roles/new"},
+		{http.MethodGet, "/roles/eng/edit"},
+		{http.MethodPost, "/roles/eng/edit"},
+		{http.MethodPost, "/roles/eng/delete"},
+	} {
+		t.Run(tc.method+" "+tc.path, func(t *testing.T) {
+			req, _ := http.NewRequest(tc.method, srv.URL+tc.path, nil)
+			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			resp, err := newClient().Do(req)
+			if err != nil {
+				t.Fatalf("do: %v", err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusMethodNotAllowed {
+				t.Errorf("status = %d, want 405", resp.StatusCode)
+			}
+		})
+	}
+}
+
+func TestPortal_RoleUpdate_InvalidTTL_PreservesInputs(t *testing.T) {
+	store := policy.NewInMemoryStore(policy.Role{Name: "eng", GroupClaim: "eng"})
+	p, _ := portal.New(portal.Config{Version: "v", RoleStore: store, Now: time.Now})
+	srv := httptest.NewServer(p.Routes())
+	defer srv.Close()
+
+	resp := postForm(t, srv.URL+"/roles/eng/edit", url.Values{
+		"name":              {"eng"},
+		"group_claim":       {"eng"},
+		"max_user_cert_ttl": {"not-a-duration"},
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", resp.StatusCode)
+	}
+	body := readAll(t, resp)
+	if !strings.Contains(body, "max_user_cert_ttl") {
+		t.Errorf("body should name the bad field:\n%s", body)
+	}
+	if !strings.Contains(body, `value="not-a-duration"`) {
+		t.Errorf("body should preserve invalid input:\n%s", body)
 	}
 }
 

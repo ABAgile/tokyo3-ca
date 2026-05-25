@@ -489,3 +489,119 @@ func TestNewEngine_NilStorePanics(t *testing.T) {
 	}()
 	_ = policy.NewEngine(nil)
 }
+
+func TestInMemoryStore_ByName(t *testing.T) {
+	s := policy.NewInMemoryStore(
+		policy.Role{Name: "eng", GroupClaim: "eng"},
+		policy.Role{Name: "sre", GroupClaim: "sre"},
+	)
+	r, ok := s.ByName("sre")
+	if !ok {
+		t.Fatal("ByName(sre) missing")
+	}
+	if r.GroupClaim != "sre" {
+		t.Errorf("GroupClaim = %q", r.GroupClaim)
+	}
+	if _, ok := s.ByName("ghost"); ok {
+		t.Error("ByName(ghost) should be false")
+	}
+}
+
+func TestInMemoryStore_Add_AppendsRole(t *testing.T) {
+	s := policy.NewInMemoryStore()
+	if err := s.Add(policy.Role{Name: "eng", GroupClaim: "eng", AllowedPrincipals: []string{"alice"}}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	if len(s.All()) != 1 {
+		t.Errorf("All len = %d, want 1", len(s.All()))
+	}
+	// RolesForGroups returns the new role for its claim.
+	if got := s.RolesForGroups([]string{"eng"}); len(got) != 1 || got[0].Name != "eng" {
+		t.Errorf("RolesForGroups = %v", got)
+	}
+}
+
+func TestInMemoryStore_Add_RejectsDuplicateName(t *testing.T) {
+	s := policy.NewInMemoryStore(policy.Role{Name: "eng", GroupClaim: "eng"})
+	err := s.Add(policy.Role{Name: "eng", GroupClaim: "ops"})
+	if !errors.Is(err, policy.ErrRoleExists) {
+		t.Errorf("err = %v, want ErrRoleExists", err)
+	}
+}
+
+func TestInMemoryStore_Add_RejectsEmptyName(t *testing.T) {
+	s := policy.NewInMemoryStore()
+	if err := s.Add(policy.Role{GroupClaim: "eng"}); err == nil {
+		t.Error("expected error for empty name")
+	}
+}
+
+func TestInMemoryStore_Replace_UpdatesInPlace(t *testing.T) {
+	s := policy.NewInMemoryStore(
+		policy.Role{Name: "eng", GroupClaim: "eng", AllowedPrincipals: []string{"alice"}},
+	)
+	updated := policy.Role{Name: "eng", GroupClaim: "eng", AllowedPrincipals: []string{"alice", "bob"}}
+	if err := s.Replace("eng", updated); err != nil {
+		t.Fatalf("Replace: %v", err)
+	}
+	r, _ := s.ByName("eng")
+	if len(r.AllowedPrincipals) != 2 || r.AllowedPrincipals[1] != "bob" {
+		t.Errorf("AllowedPrincipals = %v", r.AllowedPrincipals)
+	}
+}
+
+func TestInMemoryStore_Replace_AllowsRename(t *testing.T) {
+	s := policy.NewInMemoryStore(policy.Role{Name: "eng", GroupClaim: "eng"})
+	if err := s.Replace("eng", policy.Role{Name: "engineering", GroupClaim: "eng"}); err != nil {
+		t.Fatalf("Replace rename: %v", err)
+	}
+	if _, ok := s.ByName("eng"); ok {
+		t.Error("old name still present after rename")
+	}
+	if _, ok := s.ByName("engineering"); !ok {
+		t.Error("new name absent after rename")
+	}
+}
+
+func TestInMemoryStore_Replace_RejectsRenameOverExistingName(t *testing.T) {
+	s := policy.NewInMemoryStore(
+		policy.Role{Name: "eng", GroupClaim: "eng"},
+		policy.Role{Name: "sre", GroupClaim: "sre"},
+	)
+	err := s.Replace("eng", policy.Role{Name: "sre", GroupClaim: "eng"})
+	if !errors.Is(err, policy.ErrRoleExists) {
+		t.Errorf("err = %v, want ErrRoleExists", err)
+	}
+}
+
+func TestInMemoryStore_Replace_MissingNameErrors(t *testing.T) {
+	s := policy.NewInMemoryStore()
+	err := s.Replace("ghost", policy.Role{Name: "ghost", GroupClaim: "x"})
+	if !errors.Is(err, policy.ErrRoleNotFound) {
+		t.Errorf("err = %v, want ErrRoleNotFound", err)
+	}
+}
+
+func TestInMemoryStore_Delete_RemovesRole(t *testing.T) {
+	s := policy.NewInMemoryStore(
+		policy.Role{Name: "eng", GroupClaim: "eng"},
+		policy.Role{Name: "sre", GroupClaim: "sre"},
+	)
+	if err := s.Delete("eng"); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if len(s.All()) != 1 {
+		t.Errorf("All len = %d, want 1", len(s.All()))
+	}
+	if _, ok := s.ByName("eng"); ok {
+		t.Error("eng still present after Delete")
+	}
+}
+
+func TestInMemoryStore_Delete_MissingNameErrors(t *testing.T) {
+	s := policy.NewInMemoryStore()
+	err := s.Delete("ghost")
+	if !errors.Is(err, policy.ErrRoleNotFound) {
+		t.Errorf("err = %v, want ErrRoleNotFound", err)
+	}
+}
