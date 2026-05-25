@@ -28,6 +28,15 @@ make build         # → bin/certd + bin/cert-agentd
 make check         # gofmt + test + staticcheck + gopls + govulncheck
 ```
 
+Benchmarks for the per-request hot paths (policy evaluation,
+revocation lookup, signer round-trip):
+
+```sh
+go test -bench=. -benchmem -run=^$ ./internal/server/policy/...
+go test -bench=. -benchmem -run=^$ ./internal/server/krl/...
+go test -bench=. -benchmem -run=^$ ./internal/server/signer/...
+```
+
 ## Layout
 
 ```
