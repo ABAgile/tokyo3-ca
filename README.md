@@ -94,15 +94,20 @@ internal/
   surface the policy reason inline; everything else shows the raw
   metadata blob in a collapsed `<details>` block.
 
-- **Session list (live).** Set `CERTD_SSH_AUDIT_URL` (or rely on the
+- **Session list + replay.** Set `CERTD_SSH_AUDIT_URL` (or rely on the
   `CERTD_NATS_URL` fallback) and certd subscribes to ssh-proxyd's
   `ssh_audit` stream, decoding each `recording.completed` event into a
   bounded in-memory ring. `/portal/sessions` renders the recent
   sessions (newest first) with user, target, remote login, duration,
-  and the cast file path. The asciinema-player embed is a follow-up
-  slice — for now operators see the metadata + on-disk path. The ring
-  caps at `DefaultMaxSessions` (200) so the page stays responsive
-  even after weeks of activity.
+  and the cast file path; clicking a session ID opens
+  `/portal/sessions/{id}` with an asciinema-player embed (loaded from
+  the asciinema-player CDN) wired to `/portal/sessions/{id}/cast`.
+  The replay endpoint streams the raw cast through a `LocalCastStore`
+  rooted at `CERTD_CAST_DIR` — paths outside that root are refused
+  with 403, sealing off the file-system attack surface a hostile
+  `recording.completed` payload would otherwise open. The ring caps
+  at `DefaultMaxSessions` (200); older sessions age out and have to
+  be queried directly from JetStream.
 
 - **Host registry viewer.** Set `CERTD_MTLS_PRINCIPALS_FILE` and the
   portal's `/portal/hosts` page lists every registered workload mTLS

@@ -84,6 +84,16 @@
 //	                        admin portal will replace the file with a
 //	                        Postgres-backed registry in a later slice.
 //
+//	CERTD_CAST_DIR          Directory containing the asciinema cast
+//	                        files referenced by recording.completed
+//	                        events (typically the same path
+//	                        ssh-proxyd writes to, mounted into the
+//	                        certd container). Required for the
+//	                        portal's session-replay embed and the
+//	                        /sessions/{id}/cast endpoint; unset
+//	                        leaves the player hidden. Paths outside
+//	                        this directory are rejected with 403.
+//
 //	CERTD_SSH_AUDIT_URL     NATS URL for the ssh_audit stream
 //	                        ssh-proxyd publishes recording.completed
 //	                        events to. When set, certd subscribes,
@@ -263,6 +273,11 @@ func runServe(ctx context.Context) error {
 		auditStore = auditTracker
 	}
 
+	castStore, err := loadCastStore(log)
+	if err != nil {
+		return fmt.Errorf("cast store: %w", err)
+	}
+
 	portalSrv, err := portal.New(portal.Config{
 		Version:      Version,
 		Log:          log,
@@ -270,6 +285,7 @@ func runServe(ctx context.Context) error {
 		HostStore:    hostStore,
 		SessionStore: sessionStore,
 		AuditStore:   auditStore,
+		CastStore:    castStore,
 	})
 	if err != nil {
 		return fmt.Errorf("portal: %w", err)
@@ -664,6 +680,29 @@ func openAuditSource(log *slog.Logger) (journal.Source, error) {
 		Subject:    audit.Subject,
 		TLS:        tlsCfg,
 	})
+}
+
+// loadCastStore wires the asciinema cast directory the portal's
+// session-detail page replays from. When CERTD_CAST_DIR is unset,
+// returns (nil, nil) so the page hides its player and the
+// /sessions/{id}/cast endpoint returns 503.
+//
+// Typical production setup: the proxy writes casts to a directory
+// that's mounted into certd at the same absolute path (NFS export,
+// shared volume, etc.). The path the proxy embeds in
+// recording.completed events must resolve under CERTD_CAST_DIR.
+func loadCastStore(log *slog.Logger) (portal.CastStore, error) {
+	dir := os.Getenv("CERTD_CAST_DIR")
+	if dir == "" {
+		log.Warn("CERTD_CAST_DIR unset — /portal/sessions/{id}/cast disabled (player embed hidden)")
+		return nil, nil
+	}
+	store, err := portal.NewLocalCastStore(dir)
+	if err != nil {
+		return nil, err
+	}
+	log.Info("portal cast store configured", "root", store.Root())
+	return store, nil
 }
 
 // openSSHAuditSource attaches to ssh-proxyd's ssh_audit stream and

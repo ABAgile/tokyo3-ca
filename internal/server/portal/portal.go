@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"html/template"
+	"io"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -104,6 +105,11 @@ type Config struct {
 	// stream the operator wires up — certd's own + ssh-proxyd's).
 	// When nil, /audit returns 503.
 	AuditStore AuditStore
+
+	// CastStore opens the asciinema cast files referenced by
+	// /portal/sessions/{id}/cast. When nil, the cast endpoint
+	// returns 503 and the session-detail page hides its embed.
+	CastStore CastStore
 }
 
 // New parses the portal templates and returns a ready [Server].
@@ -154,6 +160,8 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /roles/{name}/delete", s.handleRoleDelete)
 	mux.HandleFunc("GET /hosts", s.handleHostsIndex)
 	mux.HandleFunc("GET /sessions", s.handleSessionsIndex)
+	mux.HandleFunc("GET /sessions/{id}", s.handleSessionDetail)
+	mux.HandleFunc("GET /sessions/{id}/cast", s.handleSessionCast)
 	mux.HandleFunc("GET /audit", s.handleAuditIndex)
 	return mux
 }
@@ -438,6 +446,100 @@ func (s *Server) handleSessionsIndex(w http.ResponseWriter, _ *http.Request) {
 	})
 }
 
+// sessionDetailData is the model for the single-session page.
+type sessionDetailData struct {
+	Version    string
+	RenderedAt time.Time
+	ID         string
+	Session    Session
+	Found      bool
+	// CastAvailable indicates whether a CastStore is wired AND the
+	// session has a RecordingPath. Drives the player embed.
+	CastAvailable bool
+}
+
+func (s *Server) handleSessionDetail(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.SessionStore == nil {
+		http.Error(w, "session store not configured", http.StatusServiceUnavailable)
+		return
+	}
+	id := r.PathValue("id")
+	data := sessionDetailData{
+		Version:    s.cfg.Version,
+		RenderedAt: s.cfg.Now(),
+		ID:         id,
+	}
+	for _, sess := range s.cfg.SessionStore.Sessions() {
+		if sess.SessionID == id {
+			data.Session = sess
+			data.Found = true
+			data.CastAvailable = s.cfg.CastStore != nil && sess.RecordingPath != ""
+			break
+		}
+	}
+	if !data.Found {
+		w.WriteHeader(http.StatusNotFound)
+	}
+	s.render(w, "session_detail", data)
+}
+
+// handleSessionCast streams the raw cast bytes for {id}. The session
+// is resolved through SessionStore; the CastStore is asked to open
+// the file at the session's RecordingPath (the store enforces the
+// path-root guard). Content-Type is "text/plain" since the cast
+// format is asciinema's NDJSON — letting browsers preview it
+// directly is fine and aligns with what asciinema-player loads.
+func (s *Server) handleSessionCast(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.SessionStore == nil {
+		http.Error(w, "session store not configured", http.StatusServiceUnavailable)
+		return
+	}
+	if s.cfg.CastStore == nil {
+		http.Error(w, "cast store not configured", http.StatusServiceUnavailable)
+		return
+	}
+	id := r.PathValue("id")
+	var sess Session
+	var found bool
+	for _, candidate := range s.cfg.SessionStore.Sessions() {
+		if candidate.SessionID == id {
+			sess = candidate
+			found = true
+			break
+		}
+	}
+	if !found {
+		http.Error(w, "session not found", http.StatusNotFound)
+		return
+	}
+	if sess.RecordingPath == "" {
+		http.Error(w, "session has no recording", http.StatusNotFound)
+		return
+	}
+	rc, size, err := s.cfg.CastStore.Open(sess.RecordingPath)
+	if err != nil {
+		switch {
+		case errors.Is(err, ErrCastNotFound):
+			http.Error(w, "cast file not found", http.StatusNotFound)
+		case errors.Is(err, ErrCastOutsideRoot):
+			s.cfg.Log.Warn("portal: cast path outside configured root — refusing to serve",
+				"session_id", id, "path", sess.RecordingPath)
+			http.Error(w, "cast outside allowed root", http.StatusForbidden)
+		default:
+			s.cfg.Log.Error("portal: open cast", "session_id", id, "err", err)
+			http.Error(w, "cast open failed", http.StatusInternalServerError)
+		}
+		return
+	}
+	defer rc.Close()
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	if size > 0 {
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", size))
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	_, _ = io.Copy(w, rc)
+}
+
 // auditIndexData is the model for the audit list page.
 type auditIndexData struct {
 	Version    string
@@ -667,13 +769,14 @@ func parsePages() (map[string]*template.Template, error) {
 		},
 	}
 	pages := map[string]string{
-		"index":       indexTemplate,
-		"roles":       rolesTemplate,
-		"role_detail": roleDetailTemplate,
-		"role_form":   roleFormTemplate,
-		"hosts":       hostsTemplate,
-		"sessions":    sessionsTemplate,
-		"audit":       auditTemplate,
+		"index":          indexTemplate,
+		"roles":          rolesTemplate,
+		"role_detail":    roleDetailTemplate,
+		"role_form":      roleFormTemplate,
+		"hosts":          hostsTemplate,
+		"sessions":       sessionsTemplate,
+		"session_detail": sessionDetailTemplate,
+		"audit":          auditTemplate,
 	}
 	out := make(map[string]*template.Template, len(pages))
 	for name, body := range pages {
@@ -918,13 +1021,53 @@ RecordingPath column points at the cast file on the proxy's disk.</p>
   <td>{{if .RemoteUser}}<code>{{.RemoteUser}}</code>{{else}}<em>-</em>{{end}}</td>
   <td>{{fmtDuration .Duration}}</td>
   <td>{{if .RecordingPath}}<code>{{.RecordingPath}}</code>{{else}}<em>-</em>{{end}}</td>
-  <td><code>{{.SessionID}}</code></td>
+  <td><a href="/sessions/{{.SessionID}}"><code>{{.SessionID}}</code></a></td>
 </tr>
 {{end}}
 </tbody>
 </table>
 {{else}}
 <p><em>No recorded sessions yet. Hold tight — recording.completed events arrive when ssh-proxyd finishes a PTY session.</em></p>
+{{end}}
+{{end}}`
+
+const sessionDetailTemplate = `{{define "page"}}{{template "base" .}}{{end}}
+{{define "title"}}session · {{.ID}}{{end}}
+{{define "body"}}
+<p><a href="/sessions">&larr; sessions</a></p>
+{{if not .Found}}
+<h1>Not found</h1>
+<p>No session with ID <code>{{.ID}}</code> is in the recent buffer.
+Older sessions may have aged out of the in-memory ring; query
+JetStream directly to find them.</p>
+{{else}}
+<h1>Session <code>{{.Session.SessionID}}</code></h1>
+<table>
+<tbody>
+<tr><th>Completed at</th><td>{{fmtTime .Session.CompletedAt}}</td></tr>
+<tr><th>Duration</th><td>{{fmtDuration .Session.Duration}}</td></tr>
+<tr><th>User</th><td>{{if .Session.User}}<code>{{.Session.User}}</code>{{else}}<em>-</em>{{end}}</td></tr>
+<tr><th>Target</th><td>{{if .Session.Target}}<code>{{.Session.Target}}</code>{{else}}<em>-</em>{{end}}</td></tr>
+<tr><th>Remote user</th><td>{{if .Session.RemoteUser}}<code>{{.Session.RemoteUser}}</code>{{else}}<em>-</em>{{end}}</td></tr>
+<tr><th>Principals</th><td>{{if .Session.Principals}}<code>{{.Session.Principals}}</code>{{else}}<em>-</em>{{end}}</td></tr>
+<tr><th>Client IP</th><td>{{if .Session.ClientIP}}<code>{{.Session.ClientIP}}</code>{{else}}<em>-</em>{{end}}</td></tr>
+<tr><th>Recording path</th><td>{{if .Session.RecordingPath}}<code>{{.Session.RecordingPath}}</code>{{else}}<em>-</em>{{end}}</td></tr>
+</tbody>
+</table>
+{{if .CastAvailable}}
+<h2>Replay</h2>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/asciinema-player@3.10.0/dist/bundle/asciinema-player.css">
+<div id="asciinema-player"></div>
+<script src="https://cdn.jsdelivr.net/npm/asciinema-player@3.10.0/dist/bundle/asciinema-player.min.js"></script>
+<script>
+AsciinemaPlayer.create('/sessions/{{.Session.SessionID}}/cast',
+  document.getElementById('asciinema-player'),
+  {fit: 'width', terminalLineHeight: 1.2});
+</script>
+<p><a href="/sessions/{{.Session.SessionID}}/cast">Download raw cast</a></p>
+{{else}}
+<p><em>No replay available — </em>{{if not .Session.RecordingPath}}the session was not PTY-recorded.{{else}}cast store is not configured on this certd.{{end}}</p>
+{{end}}
 {{end}}
 {{end}}`
 
