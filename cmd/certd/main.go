@@ -83,6 +83,18 @@
 //	                        Unset disables the mTLS auth path. The
 //	                        admin portal will replace the file with a
 //	                        Postgres-backed registry in a later slice.
+//
+//	CERTD_ROLES_FILE        Path to a JSON file holding the role
+//	                        table — top-level array of role objects
+//	                        matching the [policy.Role] shape (Name,
+//	                        GroupClaim, AllowedPrincipals,
+//	                        HostPatterns, SPIFFEPatterns, MaxFooCertTTL,
+//	                        DefaultExtensions). When set, role-table
+//	                        policy is applied to every sign request
+//	                        and the portal's /roles page renders the
+//	                        configured roles. Unset leaves certd in
+//	                        permissive mode (existing dev behavior)
+//	                        and the portal page returns 503.
 package main
 
 import (
@@ -113,6 +125,7 @@ import (
 	"github.com/abagile/tokyo3-ca/internal/server/api"
 	"github.com/abagile/tokyo3-ca/internal/server/mtls"
 	"github.com/abagile/tokyo3-ca/internal/server/oidc"
+	"github.com/abagile/tokyo3-ca/internal/server/policy"
 	"github.com/abagile/tokyo3-ca/internal/server/portal"
 	"github.com/abagile/tokyo3-ca/internal/server/signer"
 	"github.com/abagile/tokyo3-ca/internal/server/x509engine"
@@ -193,9 +206,15 @@ func runServe(ctx context.Context) error {
 		return fmt.Errorf("x509 issuer cert: %w", err)
 	}
 
+	roleStore, policyEngine, err := loadRoleStore(log)
+	if err != nil {
+		return fmt.Errorf("role store: %w", err)
+	}
+
 	portalSrv, err := portal.New(portal.Config{
-		Version: Version,
-		Log:     log,
+		Version:   Version,
+		Log:       log,
+		RoleStore: roleStore,
 	})
 	if err != nil {
 		return fmt.Errorf("portal: %w", err)
@@ -205,6 +224,7 @@ func runServe(ctx context.Context) error {
 		Log:            log,
 		CASigner:       caSigner,
 		X509IssuerCert: x509IssuerCert,
+		Policy:         policyEngine,
 		OIDCVerifier:   oidcVerifier,
 		MTLSStore:      mtlsStore,
 		Audit:          auditSink,
@@ -405,6 +425,36 @@ func loadOrGenerateX509Issuer(log *slog.Logger, caSigner signer.Signer) (*x509.C
 // unset, disabling the mTLS auth path. Future slice swaps the
 // file-backed implementation for a Postgres-backed Store managed by
 // the admin portal — same interface, no API-layer changes.
+// loadRoleStore reads CERTD_ROLES_FILE (JSON-encoded []policy.Role)
+// and returns a populated [policy.InMemoryStore] alongside a
+// [*policy.Engine] for the API server. When the env var is unset,
+// both returns are nil — certd operates permissively (existing dev
+// behavior preserved) and the portal's roles page returns 503.
+//
+// The file format is a top-level JSON array; each element matches
+// the [policy.Role] struct shape. TTLs are JSON-encoded durations
+// (e.g., "4h", "30d"-equivalent in nanoseconds; the Go
+// json/encoding library renders time.Duration as int64).
+func loadRoleStore(log *slog.Logger) (*policy.InMemoryStore, *policy.Engine, error) {
+	path := os.Getenv("CERTD_ROLES_FILE")
+	if path == "" {
+		log.Warn("CERTD_ROLES_FILE unset — role table empty; sign endpoints are permissive and the portal roles page returns 503")
+		return nil, nil, nil
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, nil, fmt.Errorf("read %s: %w", path, err)
+	}
+	var roles []policy.Role
+	if err := json.Unmarshal(data, &roles); err != nil {
+		return nil, nil, fmt.Errorf("decode %s: %w", path, err)
+	}
+	store := policy.NewInMemoryStore(roles...)
+	engine := policy.NewEngine(store)
+	log.Info("role store loaded", "path", path, "role_count", len(roles))
+	return store, engine, nil
+}
+
 func loadMTLSStore(log *slog.Logger) (mtls.Store, error) {
 	path := os.Getenv("CERTD_MTLS_PRINCIPALS_FILE")
 	if path == "" {

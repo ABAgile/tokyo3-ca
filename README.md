@@ -81,7 +81,16 @@ internal/
   slices fill in each page. No client-side framework — pages render
   fully on the server and submit via standard form posts. The portal
   is optional: omitting `api.Config.Portal` leaves `/portal/*` routes
-  unmounted (404).
+  unmounted (404). Per-page template sets keep page-specific
+  `{{define "title"}}`/`{{define "body"}}` blocks from clobbering each
+  other.
+- **Role table viewer.** Set `CERTD_ROLES_FILE` to a JSON file of
+  [`policy.Role`] objects and certd loads it as an in-memory
+  policy store. The portal's `/portal/roles` page lists every role
+  with its group claim, principals, and host patterns;
+  `/portal/roles/{name}` shows the full detail (SPIFFE patterns, TTL
+  caps, default extensions). Read-only for this slice — CRUD writes
+  land in a follow-up.
 
 ## License
 
