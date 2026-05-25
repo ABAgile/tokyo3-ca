@@ -125,6 +125,54 @@ func TestRoutes_Revocations_503WhenKRLNotConfigured(t *testing.T) {
 	}
 }
 
+func TestRoutes_KRLSpec_RendersSpecFormat(t *testing.T) {
+	caSig, _ := signer.NewEphemeralEd25519()
+	store := krl.NewInMemoryStore()
+	_ = store.Revoke(krl.Revocation{Serial: 7})
+	_ = store.Revoke(krl.Revocation{KeyID: "user:alice@example.com", Reason: "left"})
+
+	srv := mustNewServer(t, api.Config{
+		Log:      silentLogger(),
+		CASigner: caSig,
+		KRL:      store,
+	})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/ssh/krl.spec", nil)
+	srv.Routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/plain") {
+		t.Errorf("Content-Type = %q, want text/plain", ct)
+	}
+	body := rec.Body.String()
+	for _, want := range []string{
+		"# certd KRL spec",
+		"serial: 7",
+		"id: user:alice@example.com",
+		"# reason: left",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("body missing %q\n--- body ---\n%s", want, body)
+		}
+	}
+}
+
+func TestRoutes_KRLSpec_503WhenKRLNotConfigured(t *testing.T) {
+	caSig, _ := signer.NewEphemeralEd25519()
+	srv := mustNewServer(t, api.Config{
+		Log:      silentLogger(),
+		CASigner: caSig,
+	})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/ssh/krl.spec", nil)
+	srv.Routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503", rec.Code)
+	}
+}
+
 func TestRoutes_Revoke_EmitsAuditEvent(t *testing.T) {
 	caSig, _ := signer.NewEphemeralEd25519()
 	cap := &captureSink{}

@@ -13,7 +13,9 @@ package krl
 
 import (
 	"errors"
+	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -135,6 +137,96 @@ func (s *InMemoryStore) Snapshot() Snapshot {
 		return out[i].Revoked.Before(out[j].Revoked)
 	})
 	return Snapshot{CapturedAt: time.Now().UTC(), Entries: out}
+}
+
+// MarshalSpec renders the current revocation set as an
+// ssh-keygen(1)-compatible KRL spec file. Operators feed the output
+// through `ssh-keygen -k -f /etc/ssh/revoked_keys -s ca.pub` to
+// produce the binary KRL sshd's RevokedKeys directive consumes —
+// gives non-proxy sshd a path to honour the revocations without
+// certd having to implement the OpenSSH binary KRL format itself.
+//
+// Spec format (one directive per line):
+//
+//	# certd KRL spec
+//	# generated 2026-05-26T12:00:00Z
+//	serial: 42
+//	serial: 99
+//	id: user:alice@example.com
+//
+// Lines are ordered: a header banner, then `serial:` lines (sorted
+// ascending), then `id:` lines (sorted alphabetically). Deterministic
+// output so re-running ssh-keygen against the same snapshot
+// produces a byte-identical KRL — critical for distribution
+// systems that hash the file to decide whether to push.
+//
+// Reason / Revoker fields are emitted as comments adjacent to each
+// directive so the spec stays self-documenting; ssh-keygen ignores
+// them.
+func (s *InMemoryStore) MarshalSpec() string {
+	snap := s.Snapshot()
+	// Partition serials + key_ids and sort each independently. The
+	// snapshot is already deduped + sorted by Revoked time, but
+	// the spec output wants groups + intra-group ordering for
+	// stable diffs.
+	type serialEntry struct {
+		serial uint64
+		annot  string
+	}
+	type keyIDEntry struct {
+		keyID string
+		annot string
+	}
+	var serials []serialEntry
+	var keyIDs []keyIDEntry
+	for _, e := range snap.Entries {
+		annot := annotation(e)
+		if e.Serial != 0 {
+			serials = append(serials, serialEntry{e.Serial, annot})
+		}
+		if e.KeyID != "" {
+			keyIDs = append(keyIDs, keyIDEntry{e.KeyID, annot})
+		}
+	}
+	sort.Slice(serials, func(i, j int) bool { return serials[i].serial < serials[j].serial })
+	sort.Slice(keyIDs, func(i, j int) bool { return keyIDs[i].keyID < keyIDs[j].keyID })
+
+	var b strings.Builder
+	b.WriteString("# certd KRL spec\n")
+	fmt.Fprintf(&b, "# generated %s\n", snap.CapturedAt.UTC().Format(time.RFC3339))
+	if len(serials) == 0 && len(keyIDs) == 0 {
+		b.WriteString("# (empty — no revocations recorded)\n")
+		return b.String()
+	}
+	for _, s := range serials {
+		if s.annot != "" {
+			fmt.Fprintf(&b, "# %s\n", s.annot)
+		}
+		fmt.Fprintf(&b, "serial: %d\n", s.serial)
+	}
+	for _, k := range keyIDs {
+		if k.annot != "" {
+			fmt.Fprintf(&b, "# %s\n", k.annot)
+		}
+		fmt.Fprintf(&b, "id: %s\n", k.keyID)
+	}
+	return b.String()
+}
+
+// annotation builds a short reason+revoker line for the spec
+// comments. Empty when neither is populated.
+func annotation(r Revocation) string {
+	if r.Reason == "" && r.Revoker == "" {
+		return ""
+	}
+	parts := make([]string, 0, 2)
+	if r.Reason != "" {
+		parts = append(parts, "reason: "+strings.ReplaceAll(r.Reason, "\n", " "))
+	}
+	if r.Revoker != "" {
+		parts = append(parts, "revoker: "+r.Revoker)
+	}
+	return strings.Join(parts, " | ")
 }
 
 // IsRevoked satisfies [Store].

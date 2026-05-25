@@ -97,7 +97,11 @@ internal/
   paths the sign endpoints use); the entry persists in
   `krl.InMemoryStore` until certd restarts. `GET /api/v1/ssh/revocations`
   returns the snapshot as JSON; ssh-proxyd polls it to populate its
-  `IsRevoked` callback. Revoke calls emit `ssh.cert.revoked` audit
+  `IsRevoked` callback. `GET /api/v1/ssh/krl.spec` returns the same
+  set in `ssh-keygen -k` KRL spec format — operators on non-proxy
+  sshd boxes pipe it through `ssh-keygen -k -f /etc/ssh/revoked_keys
+  -s ca.pub` to produce the binary KRL the `RevokedKeys` directive
+  consumes. Revoke calls emit `ssh.cert.revoked` audit
   events so the portal audit tail surfaces them. Re-revoking an entry
   is idempotent and overwrites the Reason/Revoker annotation. The
   portal page at `/portal/revocations` lists the current set and

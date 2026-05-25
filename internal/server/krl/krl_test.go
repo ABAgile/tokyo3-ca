@@ -3,6 +3,7 @@ package krl_test
 import (
 	"errors"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -152,3 +153,92 @@ func sortedSlice(xs []uint64) []uint64 {
 }
 
 var _ = sortedSlice // keep helper compiled even if a future test stops using it
+
+func TestInMemoryStore_MarshalSpec_EmptyHasHeaderAndMarker(t *testing.T) {
+	s := krl.NewInMemoryStore()
+	got := s.MarshalSpec()
+	if !strings.Contains(got, "# certd KRL spec") {
+		t.Errorf("missing header banner:\n%s", got)
+	}
+	if !strings.Contains(got, "# generated ") {
+		t.Errorf("missing generated-at line:\n%s", got)
+	}
+	if !strings.Contains(got, "# (empty") {
+		t.Errorf("empty marker missing:\n%s", got)
+	}
+	if strings.Contains(got, "serial:") || strings.Contains(got, "id:") {
+		t.Errorf("empty store should produce no directives:\n%s", got)
+	}
+}
+
+func TestInMemoryStore_MarshalSpec_RendersSerialsAndKeyIDs(t *testing.T) {
+	s := krl.NewInMemoryStore()
+	_ = s.Revoke(krl.Revocation{Serial: 99, Reason: "compromised", Revoker: "portal"})
+	_ = s.Revoke(krl.Revocation{Serial: 7})
+	_ = s.Revoke(krl.Revocation{KeyID: "user:eve@example.com", Revoker: "ops"})
+	_ = s.Revoke(krl.Revocation{KeyID: "user:alice@example.com"})
+
+	spec := s.MarshalSpec()
+	for _, want := range []string{
+		"serial: 7",
+		"serial: 99",
+		"id: user:alice@example.com",
+		"id: user:eve@example.com",
+		"# reason: compromised | revoker: portal",
+		"# revoker: ops",
+	} {
+		if !strings.Contains(spec, want) {
+			t.Errorf("spec missing %q\n--- spec ---\n%s", want, spec)
+		}
+	}
+
+	// Serials are ascending, key_ids alphabetical, serials before
+	// key_ids.
+	s7 := strings.Index(spec, "serial: 7")
+	s99 := strings.Index(spec, "serial: 99")
+	idA := strings.Index(spec, "id: user:alice@example.com")
+	idE := strings.Index(spec, "id: user:eve@example.com")
+	if !(s7 < s99 && s99 < idA && idA < idE) {
+		t.Errorf("ordering not [serial:7 < serial:99 < id:alice < id:eve]; offsets %d %d %d %d\n%s", s7, s99, idA, idE, spec)
+	}
+}
+
+func TestInMemoryStore_MarshalSpec_DeterministicAcrossCalls(t *testing.T) {
+	// Re-rendering the same snapshot must produce byte-identical
+	// output modulo the embedded timestamp. Strip the # generated
+	// line for the comparison.
+	s := krl.NewInMemoryStore()
+	_ = s.Revoke(krl.Revocation{Serial: 1})
+	_ = s.Revoke(krl.Revocation{KeyID: "k"})
+
+	strip := func(raw string) string {
+		var b strings.Builder
+		for _, line := range strings.Split(raw, "\n") {
+			if strings.HasPrefix(line, "# generated ") {
+				continue
+			}
+			b.WriteString(line)
+			b.WriteByte('\n')
+		}
+		return b.String()
+	}
+	a := strip(s.MarshalSpec())
+	b := strip(s.MarshalSpec())
+	if a != b {
+		t.Errorf("MarshalSpec not deterministic across calls:\nA=%q\nB=%q", a, b)
+	}
+}
+
+func TestInMemoryStore_MarshalSpec_StripsNewlinesFromReason(t *testing.T) {
+	// A multiline reason would break the spec by leaking onto a
+	// directive line — verify newlines collapse to spaces.
+	s := krl.NewInMemoryStore()
+	_ = s.Revoke(krl.Revocation{Serial: 1, Reason: "first\nsecond"})
+	spec := s.MarshalSpec()
+	if strings.Contains(spec, "first\nsecond") {
+		t.Errorf("reason newlines not stripped:\n%s", spec)
+	}
+	if !strings.Contains(spec, "first second") {
+		t.Errorf("expected 'first second' after newline collapse:\n%s", spec)
+	}
+}

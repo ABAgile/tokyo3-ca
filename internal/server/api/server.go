@@ -142,6 +142,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /api/v1/x509/sign-workload", s.handleSignX509WorkloadCert)
 	mux.HandleFunc("POST /api/v1/ssh/revoke", s.handleRevoke)
 	mux.HandleFunc("GET /api/v1/ssh/revocations", s.handleRevocations)
+	mux.HandleFunc("GET /api/v1/ssh/krl.spec", s.handleRevocationsSpec)
 	if s.portal != nil {
 		mux.Handle("/portal/", http.StripPrefix("/portal", s.portal.Routes()))
 	}
