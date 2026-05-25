@@ -21,9 +21,18 @@ import (
 	"strings"
 	"time"
 
+	"github.com/abagile/tokyo3-ca/internal/server/krl"
 	"github.com/abagile/tokyo3-ca/internal/server/mtls"
 	"github.com/abagile/tokyo3-ca/internal/server/policy"
 )
+
+// RevocationStore is the subset of [krl.Store] the revocations page
+// needs. Defined here (and not as an alias) so tests can stub the
+// source without a full krl.InMemoryStore.
+type RevocationStore interface {
+	Revoke(r krl.Revocation) error
+	Snapshot() krl.Snapshot
+}
 
 // HostStore is the subset of [mtls.Store] the hosts page needs.
 // Defined here (and not as an alias) so tests can stub the source
@@ -110,6 +119,12 @@ type Config struct {
 	// /portal/sessions/{id}/cast. When nil, the cast endpoint
 	// returns 503 and the session-detail page hides its embed.
 	CastStore CastStore
+
+	// RevocationStore powers the /portal/revocations page and the
+	// revoke form. When nil, the page returns 503. Same store
+	// instance should back the API's KRL field — the portal mutates
+	// in place, and the API endpoint reads from the same data.
+	RevocationStore RevocationStore
 }
 
 // New parses the portal templates and returns a ready [Server].
@@ -163,6 +178,8 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /sessions/{id}", s.handleSessionDetail)
 	mux.HandleFunc("GET /sessions/{id}/cast", s.handleSessionCast)
 	mux.HandleFunc("GET /audit", s.handleAuditIndex)
+	mux.HandleFunc("GET /revocations", s.handleRevocationsIndex)
+	mux.HandleFunc("POST /revocations", s.handleRevocationsCreate)
 	return mux
 }
 
@@ -205,6 +222,7 @@ func (s *Server) landingPages() []pageEntry {
 		{Name: "Hosts", Path: "/hosts", Description: "Registered workload mTLS principals (SPIFFE / email SANs → group claims)", Status: status(s.cfg.HostStore != nil)},
 		{Name: "Sessions", Path: "/sessions", Description: "Recent recording.completed events from ssh-proxyd", Status: status(s.cfg.SessionStore != nil)},
 		{Name: "Audit", Path: "/audit", Description: "Live audit-event viewer (NATS JetStream tail)", Status: status(s.cfg.AuditStore != nil)},
+		{Name: "Revocations", Path: "/revocations", Description: "Revoked SSH certs (ssh-proxyd polls this set to refuse handshakes)", Status: status(s.cfg.RevocationStore != nil)},
 	}
 }
 
@@ -540,6 +558,104 @@ func (s *Server) handleSessionCast(w http.ResponseWriter, r *http.Request) {
 	_, _ = io.Copy(w, rc)
 }
 
+// revocationsIndexData is the model for the revocations list +
+// create form. Error is non-empty when a POST validation failed.
+// FormSerial / FormKeyID / FormReason preserve the user's typed
+// input on validation failure (just like the role form does).
+type revocationsIndexData struct {
+	Version    string
+	RenderedAt time.Time
+	Entries    []krl.Revocation
+	Error      string
+	FormSerial string
+	FormKeyID  string
+	FormReason string
+}
+
+func (s *Server) handleRevocationsIndex(w http.ResponseWriter, _ *http.Request) {
+	if s.cfg.RevocationStore == nil {
+		http.Error(w, "revocation store not configured", http.StatusServiceUnavailable)
+		return
+	}
+	s.render(w, "revocations", revocationsIndexData{
+		Version:    s.cfg.Version,
+		RenderedAt: s.cfg.Now(),
+		Entries:    s.cfg.RevocationStore.Snapshot().Entries,
+	})
+}
+
+func (s *Server) handleRevocationsCreate(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.RevocationStore == nil {
+		http.Error(w, "revocation store not configured", http.StatusServiceUnavailable)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "parse form: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	rawSerial := strings.TrimSpace(r.PostForm.Get("serial"))
+	keyID := strings.TrimSpace(r.PostForm.Get("key_id"))
+	reason := strings.TrimSpace(r.PostForm.Get("reason"))
+
+	var serial uint64
+	if rawSerial != "" {
+		n, err := parseUint64(rawSerial)
+		if err != nil {
+			s.renderRevocationError(w, "serial "+rawSerial+" is not a valid unsigned integer",
+				rawSerial, keyID, reason)
+			return
+		}
+		serial = n
+	}
+	if serial == 0 && keyID == "" {
+		s.renderRevocationError(w, "serial or key_id is required",
+			rawSerial, keyID, reason)
+		return
+	}
+	if err := s.cfg.RevocationStore.Revoke(krl.Revocation{
+		Serial:  serial,
+		KeyID:   keyID,
+		Reason:  reason,
+		Revoker: "portal",
+	}); err != nil {
+		s.renderRevocationError(w, err.Error(), rawSerial, keyID, reason)
+		return
+	}
+	s.cfg.Log.Info("portal: cert revoked", "serial", serial, "key_id", keyID, "reason", reason)
+	http.Redirect(w, r, "/revocations", http.StatusSeeOther)
+}
+
+func (s *Server) renderRevocationError(w http.ResponseWriter, msg, serial, keyID, reason string) {
+	w.WriteHeader(http.StatusBadRequest)
+	s.render(w, "revocations", revocationsIndexData{
+		Version:    s.cfg.Version,
+		RenderedAt: s.cfg.Now(),
+		Entries:    s.cfg.RevocationStore.Snapshot().Entries,
+		Error:      msg,
+		FormSerial: serial,
+		FormKeyID:  keyID,
+		FormReason: reason,
+	})
+}
+
+// parseUint64 is the local strconv.ParseUint analog used by the
+// revoke form. Keeps the import surface tight (the renderer file
+// avoids strconv otherwise).
+func parseUint64(s string) (uint64, error) {
+	var out uint64
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return 0, fmt.Errorf("non-digit %q", c)
+		}
+		next := out*10 + uint64(c-'0')
+		if next < out { // overflow
+			return 0, fmt.Errorf("overflow")
+		}
+		out = next
+	}
+	return out, nil
+}
+
 // auditIndexData is the model for the audit list page.
 type auditIndexData struct {
 	Version    string
@@ -777,6 +893,7 @@ func parsePages() (map[string]*template.Template, error) {
 		"sessions":       sessionsTemplate,
 		"session_detail": sessionDetailTemplate,
 		"audit":          auditTemplate,
+		"revocations":    revocationsTemplate,
 	}
 	out := make(map[string]*template.Template, len(pages))
 	for name, body := range pages {
@@ -1109,5 +1226,60 @@ deeper, query JetStream directly.</p>
 </table>
 {{else}}
 <p><em>No audit events yet. Events appear here once the wired streams start emitting.</em></p>
+{{end}}
+{{end}}`
+
+const revocationsTemplate = `{{define "page"}}{{template "base" .}}{{end}}
+{{define "title"}}revocations{{end}}
+{{define "body"}}
+<p><a href="/">&larr; home</a></p>
+<h1>Revocations</h1>
+<p>Revoked SSH certs. ssh-proxyd polls this set every
+<code>CERTD_REVOCATIONS_POLL_SECONDS</code> (default 30s) and refuses
+any matching cert at handshake. Either Serial or Key ID is enough;
+provide both when you have them so the revocation matches regardless
+of which field a consumer keys on.</p>
+
+<h2>Revoke a cert</h2>
+{{if .Error}}<div class="error">{{.Error}}</div>{{end}}
+<form method="post" action="/revocations">
+  <label>Serial (decimal; leave blank if revoking by Key ID only)
+    <input type="text" name="serial" value="{{.FormSerial}}" autocomplete="off">
+  </label>
+  <label>Key ID (e.g., <code>user:alice@example.com</code>; blank if revoking by serial)
+    <input type="text" name="key_id" value="{{.FormKeyID}}" autocomplete="off">
+  </label>
+  <label>Reason (audit annotation)
+    <input type="text" name="reason" value="{{.FormReason}}" autocomplete="off">
+  </label>
+  <p><button type="submit">Revoke</button></p>
+</form>
+
+<h2>Current revocations ({{len .Entries}})</h2>
+{{if .Entries}}
+<table>
+<thead>
+<tr>
+  <th>Revoked at</th>
+  <th>Serial</th>
+  <th>Key ID</th>
+  <th>Reason</th>
+  <th>Revoker</th>
+</tr>
+</thead>
+<tbody>
+{{range .Entries}}
+<tr>
+  <td>{{fmtTime .Revoked}}</td>
+  <td>{{if .Serial}}<code>{{.Serial}}</code>{{else}}<em>-</em>{{end}}</td>
+  <td>{{if .KeyID}}<code>{{.KeyID}}</code>{{else}}<em>-</em>{{end}}</td>
+  <td>{{if .Reason}}{{.Reason}}{{else}}<em>-</em>{{end}}</td>
+  <td>{{if .Revoker}}<code>{{.Revoker}}</code>{{else}}<em>-</em>{{end}}</td>
+</tr>
+{{end}}
+</tbody>
+</table>
+{{else}}
+<p><em>No revocations recorded.</em></p>
 {{end}}
 {{end}}`

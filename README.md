@@ -88,11 +88,13 @@ internal/
   revoked by serial or KeyID (authenticated via the same OIDC/mTLS
   paths the sign endpoints use); the entry persists in
   `krl.InMemoryStore` until certd restarts. `GET /api/v1/ssh/revocations`
-  returns the snapshot as JSON for consumers (ssh-proxyd polls this
-  to populate its `IsRevoked` callback in a follow-up slice).
-  Revoke calls emit `ssh.cert.revoked` audit events so the portal
-  audit tail surfaces them. Re-revoking an entry is idempotent and
-  overwrites the Reason/Revoker annotation.
+  returns the snapshot as JSON; ssh-proxyd polls it to populate its
+  `IsRevoked` callback. Revoke calls emit `ssh.cert.revoked` audit
+  events so the portal audit tail surfaces them. Re-revoking an entry
+  is idempotent and overwrites the Reason/Revoker annotation. The
+  portal page at `/portal/revocations` lists the current set and
+  exposes a form to revoke certs interactively (rendered Revoker
+  field is `"portal"`).
 
 - **Audit viewer (live, multi-stream).** `portal.AuditTracker`
   subscribes to N audit streams concurrently and normalizes each

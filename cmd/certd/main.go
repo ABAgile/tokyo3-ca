@@ -283,13 +283,14 @@ func runServe(ctx context.Context) error {
 	log.Info("revocation store ready (in-memory)")
 
 	portalSrv, err := portal.New(portal.Config{
-		Version:      Version,
-		Log:          log,
-		RoleStore:    roleStore,
-		HostStore:    hostStore,
-		SessionStore: sessionStore,
-		AuditStore:   auditStore,
-		CastStore:    castStore,
+		Version:         Version,
+		Log:             log,
+		RoleStore:       roleStore,
+		HostStore:       hostStore,
+		SessionStore:    sessionStore,
+		AuditStore:      auditStore,
+		CastStore:       castStore,
+		RevocationStore: krlStore,
 	})
 	if err != nil {
 		return fmt.Errorf("portal: %w", err)
