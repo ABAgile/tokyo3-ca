@@ -20,14 +20,14 @@ import (
 // stubUserSigner is the [renew.UserSigner] test double.
 type stubUserSigner struct {
 	mu     sync.Mutex
-	calls  int32
+	calls  atomic.Int32
 	gotReq client.SignUserRequest
 	respFn func(client.SignUserRequest) (*client.SignUserResponse, error)
 }
 
 func (s *stubUserSigner) SignUserCert(_ context.Context, req client.SignUserRequest) (*client.SignUserResponse, error) {
 	s.mu.Lock()
-	atomic.AddInt32(&s.calls, 1)
+	s.calls.Add(1)
 	s.gotReq = req
 	fn := s.respFn
 	s.mu.Unlock()
@@ -269,7 +269,7 @@ func TestUserCertRenewer_Run_LoopsAndRenews(t *testing.T) {
 	defer cancel()
 	_ = r.Run(ctx)
 
-	if got := atomic.LoadInt32(&signer.calls); got < 2 {
+	if got := signer.calls.Load(); got < 2 {
 		t.Errorf("calls = %d, want at least 2 (initial + at least one renew)", got)
 	}
 }

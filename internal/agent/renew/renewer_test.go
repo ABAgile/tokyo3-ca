@@ -21,14 +21,14 @@ import (
 // stubSigner is the [renew.Signer] test double.
 type stubSigner struct {
 	mu     sync.Mutex
-	calls  int32
+	calls  atomic.Int32
 	gotReq client.SignWorkloadRequest
 	respFn func(client.SignWorkloadRequest) (*client.SignWorkloadResponse, error)
 }
 
 func (s *stubSigner) SignWorkloadCert(_ context.Context, req client.SignWorkloadRequest) (*client.SignWorkloadResponse, error) {
 	s.mu.Lock()
-	atomic.AddInt32(&s.calls, 1)
+	s.calls.Add(1)
 	s.gotReq = req
 	fn := s.respFn
 	s.mu.Unlock()
@@ -309,17 +309,17 @@ func TestRenewer_Run_LoopsAndRenews(t *testing.T) {
 	defer cancel()
 	_ = r.Run(ctx)
 
-	if got := atomic.LoadInt32(&signer.calls); got < 2 {
+	if got := signer.calls.Load(); got < 2 {
 		t.Errorf("calls = %d, want at least 2 (initial sign + at least one renew)", got)
 	}
 }
 
 func TestRenewer_Run_RetryOnFailureThenSucceed(t *testing.T) {
 	dir := t.TempDir()
-	var calls int32
+	var calls atomic.Int32
 	signer := &stubSigner{
 		respFn: func(_ client.SignWorkloadRequest) (*client.SignWorkloadResponse, error) {
-			if atomic.AddInt32(&calls, 1) == 1 {
+			if calls.Add(1) == 1 {
 				return nil, errors.New("transient certd outage")
 			}
 			now := time.Now().UTC()
@@ -343,7 +343,7 @@ func TestRenewer_Run_RetryOnFailureThenSucceed(t *testing.T) {
 	defer cancel()
 	_ = r.Run(ctx)
 
-	if got := atomic.LoadInt32(&calls); got < 2 {
+	if got := calls.Load(); got < 2 {
 		t.Errorf("calls = %d, want ≥ 2 (failure + retry)", got)
 	}
 	body, err := os.ReadFile(certPath)

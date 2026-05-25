@@ -68,8 +68,7 @@ func TestSessionTracker_IngestsRecordingCompleted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewSessionTracker: %v", err)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	go func() { _ = tracker.Run(ctx) }()
 
 	when := time.Date(2026, 5, 26, 13, 0, 0, 0, time.UTC)
@@ -111,8 +110,7 @@ func TestSessionTracker_IngestsRecordingCompleted(t *testing.T) {
 func TestSessionTracker_IgnoresOtherActions(t *testing.T) {
 	src := newMockSource()
 	tracker, _ := portal.NewSessionTracker(portal.SessionTrackerConfig{Source: src})
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	go func() { _ = tracker.Run(ctx) }()
 
 	pushEntry(t, src, "ssh.session.opened", "sess-1", "user:x", "host:22", "alice", "", 0, time.Now())
@@ -126,11 +124,10 @@ func TestSessionTracker_IgnoresOtherActions(t *testing.T) {
 func TestSessionTracker_BoundedByMaxSessions(t *testing.T) {
 	src := newMockSource()
 	tracker, _ := portal.NewSessionTracker(portal.SessionTrackerConfig{Source: src, MaxSessions: 3})
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	go func() { _ = tracker.Run(ctx) }()
 
-	for i := 0; i < 6; i++ {
+	for i := range 6 {
 		pushEntry(t, src, "ssh.recording.completed",
 			"sess-"+itoa(i), "u", "h:22", "alice", "/cast", 1, time.Now())
 	}
@@ -155,8 +152,7 @@ func TestSessionTracker_BoundedByMaxSessions(t *testing.T) {
 func TestSessionTracker_SilentlyDropsMalformedPayloads(t *testing.T) {
 	src := newMockSource()
 	tracker, _ := portal.NewSessionTracker(portal.SessionTrackerConfig{Source: src})
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	go func() { _ = tracker.Run(ctx) }()
 
 	src.out <- journal.Msg{Seq: 1, Time: time.Now(), Data: []byte("{not json")}

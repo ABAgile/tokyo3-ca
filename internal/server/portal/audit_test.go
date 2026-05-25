@@ -1,7 +1,6 @@
 package portal_test
 
 import (
-	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -81,8 +80,7 @@ func TestAuditTracker_IngestsCertdAndSshProxyShapes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewAuditTracker: %v", err)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	go func() { _ = tracker.Run(ctx) }()
 
 	now := time.Date(2026, 5, 26, 14, 0, 0, 0, time.UTC)
@@ -130,8 +128,7 @@ func TestAuditTracker_SortsNewestFirst(t *testing.T) {
 	tracker, _ := portal.NewAuditTracker(portal.AuditTrackerConfig{
 		Sources: []portal.AuditSource{{Source: src, Label: "certd"}},
 	})
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	go func() { _ = tracker.Run(ctx) }()
 
 	// Push out-of-order timestamps; the tracker should sort them.
@@ -161,12 +158,11 @@ func TestAuditTracker_BoundedByMaxEvents(t *testing.T) {
 		Sources:   []portal.AuditSource{{Source: src, Label: "certd"}},
 		MaxEvents: 3,
 	})
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	go func() { _ = tracker.Run(ctx) }()
 
 	base := time.Date(2026, 5, 26, 14, 0, 0, 0, time.UTC)
-	for i := 0; i < 6; i++ {
+	for i := range 6 {
 		pushCertdEvent(t, src, "ssh.user_cert.signed", "alice", "s", "ip", base.Add(time.Duration(i)*time.Second))
 	}
 	deadline := time.Now().Add(2 * time.Second)
@@ -186,8 +182,7 @@ func TestAuditTracker_SkipsMalformedAndIncompleteEvents(t *testing.T) {
 	tracker, _ := portal.NewAuditTracker(portal.AuditTrackerConfig{
 		Sources: []portal.AuditSource{{Source: src, Label: "certd"}},
 	})
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	go func() { _ = tracker.Run(ctx) }()
 
 	// 1. Garbage JSON.

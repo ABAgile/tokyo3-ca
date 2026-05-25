@@ -20,8 +20,7 @@ func BenchmarkInMemorySigner_Sign(b *testing.B) {
 	}
 	msg := []byte("certd benchmark message — represents the wire-format cert bytes signed in production")
 	b.ReportAllocs()
-	b.ResetTimer()
-	for range b.N {
+	for b.Loop() {
 		if _, err := s.Sign(rand.Reader, msg, crypto.Hash(0)); err != nil {
 			b.Fatalf("Sign: %v", err)
 		}
@@ -50,8 +49,7 @@ func BenchmarkRemoteSigner_Sign(b *testing.B) {
 	}
 	msg := []byte("certd benchmark message — represents the wire-format cert bytes signed in production")
 	b.ReportAllocs()
-	b.ResetTimer()
-	for range b.N {
+	for b.Loop() {
 		if _, err := s.Sign(rand.Reader, msg, crypto.Hash(0)); err != nil {
 			b.Fatalf("Sign: %v", err)
 		}

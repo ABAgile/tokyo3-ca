@@ -54,8 +54,8 @@ func postForm(t *testing.T, postURL string, form url.Values) *http.Response {
 	// hit /roles/{name} (which now sets a CSRF cookie).
 	getURL := postURL
 	for _, suffix := range []string{"/edit", "/delete"} {
-		if strings.HasSuffix(getURL, suffix) {
-			getURL = strings.TrimSuffix(getURL, suffix)
+		if before, ok := strings.CutSuffix(getURL, suffix); ok {
+			getURL = before
 			break
 		}
 	}

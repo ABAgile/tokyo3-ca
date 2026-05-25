@@ -242,7 +242,7 @@ func buildUserCertRenewer(signer renew.UserSigner, spiffeURI string, log *slog.L
 	}
 
 	principals := make([]string, 0)
-	for _, p := range strings.Split(principalsRaw, ",") {
+	for p := range strings.SplitSeq(principalsRaw, ",") {
 		if p = strings.TrimSpace(p); p != "" {
 			principals = append(principals, p)
 		}

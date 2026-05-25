@@ -824,7 +824,7 @@ func splitLines(raw string) []string {
 		return nil
 	}
 	var out []string
-	for _, line := range strings.Split(raw, "\n") {
+	for line := range strings.SplitSeq(raw, "\n") {
 		if v := strings.TrimSpace(line); v != "" {
 			out = append(out, v)
 		}
@@ -840,7 +840,7 @@ func parseExtensions(raw string) (map[string]string, error) {
 		return nil, nil
 	}
 	out := make(map[string]string)
-	for _, line := range strings.Split(raw, "\n") {
+	for line := range strings.SplitSeq(raw, "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue

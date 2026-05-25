@@ -2,7 +2,7 @@ package krl_test
 
 import (
 	"errors"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -111,9 +111,7 @@ func TestInMemoryStore_Snapshot_ConcurrentRead(t *testing.T) {
 	// the test relies on Go's race detector to catch missing locks.
 	var wg sync.WaitGroup
 	for range 16 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			snap := s.Snapshot()
 			// Trivially-correct sanity check so we exercise the
 			// returned slice; the assertion that matters is the
@@ -121,7 +119,7 @@ func TestInMemoryStore_Snapshot_ConcurrentRead(t *testing.T) {
 			if len(snap.Entries) != 2 {
 				t.Errorf("concurrent Snapshot saw %d entries", len(snap.Entries))
 			}
-		}()
+		})
 	}
 	wg.Wait()
 }
@@ -148,7 +146,7 @@ func TestInMemoryStore_Revoke_AppendsTimestampWhenAbsent(t *testing.T) {
 // in a stable way without pulling in cmp/cmpopts.
 func sortedSlice(xs []uint64) []uint64 {
 	out := append([]uint64(nil), xs...)
-	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	slices.Sort(out)
 	return out
 }
 
@@ -213,7 +211,7 @@ func TestInMemoryStore_MarshalSpec_DeterministicAcrossCalls(t *testing.T) {
 
 	strip := func(raw string) string {
 		var b strings.Builder
-		for _, line := range strings.Split(raw, "\n") {
+		for line := range strings.SplitSeq(raw, "\n") {
 			if strings.HasPrefix(line, "# generated ") {
 				continue
 			}

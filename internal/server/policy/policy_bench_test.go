@@ -38,8 +38,7 @@ func BenchmarkEvaluateUserCert_SingleRole(b *testing.B) {
 	}
 	groups := []string{"eng"}
 	b.ReportAllocs()
-	b.ResetTimer()
-	for range b.N {
+	for b.Loop() {
 		if _, err := engine.EvaluateUserCert(groups, req); err != nil {
 			b.Fatalf("EvaluateUserCert: %v", err)
 		}
@@ -58,8 +57,7 @@ func BenchmarkEvaluateUserCert_MultiRole(b *testing.B) {
 	}
 	groups := []string{"eng", "sre", "ops"}
 	b.ReportAllocs()
-	b.ResetTimer()
-	for range b.N {
+	for b.Loop() {
 		if _, err := engine.EvaluateUserCert(groups, req); err != nil {
 			b.Fatalf("EvaluateUserCert: %v", err)
 		}
@@ -79,8 +77,7 @@ func BenchmarkEvaluateHostCert_PatternMatch(b *testing.B) {
 	}
 	groups := []string{"sre"}
 	b.ReportAllocs()
-	b.ResetTimer()
-	for range b.N {
+	for b.Loop() {
 		if _, err := engine.EvaluateHostCert(groups, req); err != nil {
 			b.Fatalf("EvaluateHostCert: %v", err)
 		}

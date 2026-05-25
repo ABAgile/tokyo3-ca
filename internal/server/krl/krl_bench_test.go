@@ -28,8 +28,7 @@ func loadedStore(n int) *krl.InMemoryStore {
 func BenchmarkIsRevoked_Hit(b *testing.B) {
 	s := loadedStore(10_000)
 	b.ReportAllocs()
-	b.ResetTimer()
-	for range b.N {
+	for b.Loop() {
 		_ = s.IsRevoked(5_000, "")
 	}
 }
@@ -39,8 +38,7 @@ func BenchmarkIsRevoked_Hit(b *testing.B) {
 func BenchmarkIsRevoked_Miss(b *testing.B) {
 	s := loadedStore(10_000)
 	b.ReportAllocs()
-	b.ResetTimer()
-	for range b.N {
+	for b.Loop() {
 		_ = s.IsRevoked(999_999, "user:nope")
 	}
 }
@@ -51,8 +49,7 @@ func BenchmarkIsRevoked_Miss(b *testing.B) {
 func BenchmarkSnapshot(b *testing.B) {
 	s := loadedStore(1_000)
 	b.ReportAllocs()
-	b.ResetTimer()
-	for range b.N {
+	for b.Loop() {
 		_ = s.Snapshot()
 	}
 }
@@ -63,8 +60,7 @@ func BenchmarkSnapshot(b *testing.B) {
 func BenchmarkMarshalSpec(b *testing.B) {
 	s := loadedStore(1_000)
 	b.ReportAllocs()
-	b.ResetTimer()
-	for range b.N {
+	for b.Loop() {
 		_ = s.MarshalSpec()
 	}
 }
