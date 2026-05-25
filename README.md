@@ -56,7 +56,15 @@ internal/
   engines but ships as a single binary. Vault is **not** involved in CA key
   custody.
 - **CA key custody**: in-memory signer for dev (file or env-injected key),
-  KMS-backed signer for production.
+  remote signer for production. `signer.NewRemoteSigner` adapts a
+  caller-supplied `RemoteSignFn` + cached public key into the
+  `Signer` interface — operators wire concrete AWS KMS / GCP KMS /
+  Vault Transit / HSM adapters at deployment without changing
+  certd's core. The abstraction handles ctx-bounded remote calls
+  (default 5s timeout) and surfaces remote errors verbatim wrapped
+  with a `remote sign:` prefix; existing SSH cert + X.509 cert
+  issuance paths work unchanged because the wrapper satisfies
+  `crypto.Signer`.
 - **Authorization**: `authd` issues OIDC tokens with a `groups` claim; certd's
   role table maps groups to allowed Unix principals + host patterns; the cert
   carries those as extensions; ssh-proxyd enforces what the cert says.
