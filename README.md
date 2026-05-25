@@ -158,6 +158,13 @@ internal/
   unset the portal is open and operators front it with oauth2-proxy
   or similar.
 
+## Security
+
+See [THREAT_MODEL.md](THREAT_MODEL.md) for the per-surface threat
+inventory + mitigations. Reviewers should walk the document's
+checklist when auditing changes that touch the HTTP API, the
+signer, audit emissions, or the portal.
+
 ## License
 
 See [LICENSE](LICENSE).
