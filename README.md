@@ -84,6 +84,16 @@ internal/
   unmounted (404). Per-page template sets keep page-specific
   `{{define "title"}}`/`{{define "body"}}` blocks from clobbering each
   other.
+- **Audit viewer (live, multi-stream).** `portal.AuditTracker`
+  subscribes to N audit streams concurrently and normalizes each
+  event into a common `AuditEvent` shape — both ssh-proxy's
+  `audit.Entry` (user/target/client_ip/session_id) and certd's
+  (caller/subject/ip) collapse onto the same actor/subject/ip
+  columns, with the source labeled per row. `/portal/audit` renders
+  newest-first across all sources (default cap 500). Denial events
+  surface the policy reason inline; everything else shows the raw
+  metadata blob in a collapsed `<details>` block.
+
 - **Session list (live).** Set `CERTD_SSH_AUDIT_URL` (or rely on the
   `CERTD_NATS_URL` fallback) and certd subscribes to ssh-proxyd's
   `ssh_audit` stream, decoding each `recording.completed` event into a

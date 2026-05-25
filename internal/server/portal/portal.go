@@ -99,6 +99,11 @@ type Config struct {
 	// events on the ssh_audit JetStream stream). When nil, /sessions
 	// returns 503.
 	SessionStore SessionStore
+
+	// AuditStore powers the /audit page (live tail of every audit
+	// stream the operator wires up — certd's own + ssh-proxyd's).
+	// When nil, /audit returns 503.
+	AuditStore AuditStore
 }
 
 // New parses the portal templates and returns a ready [Server].
@@ -149,6 +154,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /roles/{name}/delete", s.handleRoleDelete)
 	mux.HandleFunc("GET /hosts", s.handleHostsIndex)
 	mux.HandleFunc("GET /sessions", s.handleSessionsIndex)
+	mux.HandleFunc("GET /audit", s.handleAuditIndex)
 	return mux
 }
 
@@ -190,7 +196,7 @@ func (s *Server) landingPages() []pageEntry {
 		{Name: "Roles", Path: "/roles", Description: "Role-table viewer: group → principals + host patterns", Status: status(s.cfg.RoleStore != nil)},
 		{Name: "Hosts", Path: "/hosts", Description: "Registered workload mTLS principals (SPIFFE / email SANs → group claims)", Status: status(s.cfg.HostStore != nil)},
 		{Name: "Sessions", Path: "/sessions", Description: "Recent recording.completed events from ssh-proxyd", Status: status(s.cfg.SessionStore != nil)},
-		{Name: "Audit", Path: "/audit", Description: "Live audit-event viewer (NATS JetStream tail)", Status: "planned"},
+		{Name: "Audit", Path: "/audit", Description: "Live audit-event viewer (NATS JetStream tail)", Status: status(s.cfg.AuditStore != nil)},
 	}
 }
 
@@ -432,6 +438,25 @@ func (s *Server) handleSessionsIndex(w http.ResponseWriter, _ *http.Request) {
 	})
 }
 
+// auditIndexData is the model for the audit list page.
+type auditIndexData struct {
+	Version    string
+	RenderedAt time.Time
+	Events     []AuditEvent
+}
+
+func (s *Server) handleAuditIndex(w http.ResponseWriter, _ *http.Request) {
+	if s.cfg.AuditStore == nil {
+		http.Error(w, "audit store not configured", http.StatusServiceUnavailable)
+		return
+	}
+	s.render(w, "audit", auditIndexData{
+		Version:    s.cfg.Version,
+		RenderedAt: s.cfg.Now(),
+		Events:     s.cfg.AuditStore.Events(),
+	})
+}
+
 // renderFormError re-renders the form with the user's input intact
 // plus an error banner. Centralized so create/edit share the same
 // error UX.
@@ -648,6 +673,7 @@ func parsePages() (map[string]*template.Template, error) {
 		"role_form":   roleFormTemplate,
 		"hosts":       hostsTemplate,
 		"sessions":    sessionsTemplate,
+		"audit":       auditTemplate,
 	}
 	out := make(map[string]*template.Template, len(pages))
 	for name, body := range pages {
@@ -899,5 +925,46 @@ RecordingPath column points at the cast file on the proxy's disk.</p>
 </table>
 {{else}}
 <p><em>No recorded sessions yet. Hold tight — recording.completed events arrive when ssh-proxyd finishes a PTY session.</em></p>
+{{end}}
+{{end}}`
+
+const auditTemplate = `{{define "page"}}{{template "base" .}}{{end}}
+{{define "title"}}audit{{end}}
+{{define "body"}}
+<p><a href="/">&larr; home</a></p>
+<h1>Audit</h1>
+<p>Live tail of every audit stream wired into certd — certd's own
+cert issuance + ssh-proxyd's session lifecycle events. Newest first.
+The buffer caps at the tracker's MaxEvents (default 500); to dig
+deeper, query JetStream directly.</p>
+{{if .Events}}
+<table>
+<thead>
+<tr>
+  <th>Time</th>
+  <th>Source</th>
+  <th>Action</th>
+  <th>Actor</th>
+  <th>Subject</th>
+  <th>IP</th>
+  <th>Detail</th>
+</tr>
+</thead>
+<tbody>
+{{range .Events}}
+<tr>
+  <td>{{fmtTime .OccurredAt}}</td>
+  <td><code>{{.Source}}</code></td>
+  <td><code>{{.Action}}</code></td>
+  <td>{{if .Actor}}<code>{{.Actor}}</code>{{else}}<em>-</em>{{end}}</td>
+  <td>{{if .Subject}}<code>{{.Subject}}</code>{{else}}<em>-</em>{{end}}</td>
+  <td>{{if .IP}}<code>{{.IP}}</code>{{else}}<em>-</em>{{end}}</td>
+  <td>{{if .Reason}}<em>{{.Reason}}</em>{{else if .Detail}}<details><summary>view</summary><pre>{{.Detail}}</pre></details>{{else}}<em>-</em>{{end}}</td>
+</tr>
+{{end}}
+</tbody>
+</table>
+{{else}}
+<p><em>No audit events yet. Events appear here once the wired streams start emitting.</em></p>
 {{end}}
 {{end}}`

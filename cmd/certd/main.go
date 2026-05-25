@@ -230,11 +230,14 @@ func runServe(ctx context.Context) error {
 	}
 
 	// SessionTracker subscribes to ssh-proxyd's ssh_audit stream and
-	// powers the /sessions page. Independent NATS subscription so
-	// the streams stay decoupled — certd's own audit and ssh-proxyd's
-	// audit can live in different brokers or under different mTLS
-	// identities if needed.
-	sessionTracker, err := openSSHAuditTracker(log)
+	// powers the /sessions page. The same source feeds the
+	// /audit page's tracker alongside certd's own audit stream so
+	// operators see both streams in one viewer.
+	sshAuditSrcForSessions, err := openSSHAuditSource(log)
+	if err != nil {
+		return fmt.Errorf("ssh-audit source (sessions): %w", err)
+	}
+	sessionTracker, err := newSessionTracker(log, sshAuditSrcForSessions)
 	if err != nil {
 		return fmt.Errorf("session tracker: %w", err)
 	}
@@ -243,12 +246,30 @@ func runServe(ctx context.Context) error {
 		sessionStore = sessionTracker
 	}
 
+	// AuditTracker tails certd's own audit stream + (optionally)
+	// ssh-proxyd's. Both subscriptions are independent of the
+	// session tracker's so the audit page never blocks on
+	// recording.completed processing.
+	sshAuditSrcForAudit, err := openSSHAuditSource(log)
+	if err != nil {
+		return fmt.Errorf("ssh-audit source (audit): %w", err)
+	}
+	auditTracker, err := newAuditTracker(log, auditSrc, sshAuditSrcForAudit)
+	if err != nil {
+		return fmt.Errorf("audit tracker: %w", err)
+	}
+	var auditStore portal.AuditStore
+	if auditTracker != nil {
+		auditStore = auditTracker
+	}
+
 	portalSrv, err := portal.New(portal.Config{
 		Version:      Version,
 		Log:          log,
 		RoleStore:    roleStore,
 		HostStore:    hostStore,
 		SessionStore: sessionStore,
+		AuditStore:   auditStore,
 	})
 	if err != nil {
 		return fmt.Errorf("portal: %w", err)
@@ -284,6 +305,13 @@ func runServe(ctx context.Context) error {
 		go func() {
 			if err := sessionTracker.Run(rootCtx); err != nil && !errors.Is(err, context.Canceled) {
 				log.Warn("session tracker exited", "err", err)
+			}
+		}()
+	}
+	if auditTracker != nil {
+		go func() {
+			if err := auditTracker.Run(rootCtx); err != nil && !errors.Is(err, context.Canceled) {
+				log.Warn("audit tracker exited", "err", err)
 			}
 		}()
 	}
@@ -638,22 +666,18 @@ func openAuditSource(log *slog.Logger) (journal.Source, error) {
 	})
 }
 
-// openSSHAuditTracker subscribes to ssh-proxyd's ssh_audit stream
-// and returns a [portal.SessionTracker] ready for the portal's
-// /sessions page. When CERTD_SSH_AUDIT_URL is empty, returns nil so
-// the page renders 503 — operators only see sessions once the
-// subscription is configured.
-//
-// Stream + subject are fixed to match ssh-proxyd's audit package
-// constants ("ssh_audit" / "ssh.audit.events"). TLS material reuses
-// the certd NATS env vars by default and falls through to
-// SSH_AUDIT-specific overrides for split-broker deployments.
-func openSSHAuditTracker(log *slog.Logger) (*portal.SessionTracker, error) {
-	url := envFirst("CERTD_SSH_AUDIT_URL", "CERTD_NATS_URL")
+// openSSHAuditSource attaches to ssh-proxyd's ssh_audit stream and
+// returns the journal source. Returns (nil, nil) when no URL is
+// configured. Stream + subject are fixed to match ssh-proxyd's audit
+// package constants. TLS material reuses the certd NATS env vars by
+// default and falls through to SSH_AUDIT-specific overrides for
+// split-broker deployments.
+func openSSHAuditSource(log *slog.Logger) (journal.Source, error) {
 	if os.Getenv("CERTD_SSH_AUDIT_URL") == "" && os.Getenv("CERTD_NATS_URL") == "" {
-		log.Warn("CERTD_SSH_AUDIT_URL unset — /portal/sessions disabled")
+		log.Warn("CERTD_SSH_AUDIT_URL unset — /portal/sessions and ssh-proxy audit disabled")
 		return nil, nil
 	}
+	url := envFirst("CERTD_SSH_AUDIT_URL", "CERTD_NATS_URL")
 	tlsCfg, err := btls.FromFiles(
 		envFirst("CERTD_SSH_AUDIT_CERT", "CERTD_NATS_CERT"),
 		envFirst("CERTD_SSH_AUDIT_KEY", "CERTD_NATS_KEY"),
@@ -671,16 +695,48 @@ func openSSHAuditTracker(log *slog.Logger) (*portal.SessionTracker, error) {
 	if err != nil {
 		return nil, fmt.Errorf("ssh-audit source: %w", err)
 	}
-	tracker, err := portal.NewSessionTracker(portal.SessionTrackerConfig{
+	log.Info("ssh-audit source configured", "url", url)
+	return source, nil
+}
+
+// newSessionTracker wraps source in the portal session tracker. nil
+// source short-circuits to nil so callers don't need to nil-check.
+func newSessionTracker(log *slog.Logger, source journal.Source) (*portal.SessionTracker, error) {
+	if source == nil {
+		return nil, nil
+	}
+	return portal.NewSessionTracker(portal.SessionTrackerConfig{
 		Source:       source,
 		SubjectLabel: "ssh.audit.events",
 		Log:          log,
 	})
+}
+
+// newAuditTracker wires the portal audit tracker across whichever
+// audit sources the operator has provided. nil sources are skipped;
+// when none remain, the tracker is also nil so the page renders 503.
+func newAuditTracker(log *slog.Logger, certdSrc, sshSrc journal.Source) (*portal.AuditTracker, error) {
+	var sources []portal.AuditSource
+	// NoopSource has nothing useful to surface — only include real
+	// JetStream attachments.
+	if _, isNoop := certdSrc.(journal.NoopSource); certdSrc != nil && !isNoop {
+		sources = append(sources, portal.AuditSource{Source: certdSrc, Label: "certd"})
+	}
+	if sshSrc != nil {
+		sources = append(sources, portal.AuditSource{Source: sshSrc, Label: "ssh-proxy"})
+	}
+	if len(sources) == 0 {
+		log.Warn("no audit streams wired — /portal/audit disabled")
+		return nil, nil
+	}
+	tracker, err := portal.NewAuditTracker(portal.AuditTrackerConfig{
+		Sources: sources,
+		Log:     log,
+	})
 	if err != nil {
-		_ = source.Close()
 		return nil, err
 	}
-	log.Info("ssh-audit session tracker configured", "url", url)
+	log.Info("audit tracker configured", "sources", len(sources))
 	return tracker, nil
 }
 
