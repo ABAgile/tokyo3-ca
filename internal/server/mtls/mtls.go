@@ -42,6 +42,11 @@ type Store interface {
 	// Returns [ErrUnknownPrincipal] if no SAN matches; nil error
 	// implies a populated *Principal.
 	Lookup(sans []string) (*Principal, error)
+
+	// All returns a snapshot of every registered principal — used by
+	// the admin portal and by tests. Order is not specified; callers
+	// that need a stable view should sort the result.
+	All() []Principal
 }
 
 // ErrUnknownPrincipal signals that the caller's TLS cert presented
@@ -112,6 +117,21 @@ func (s *InMemoryStore) Lookup(sans []string) (*Principal, error) {
 		}
 	}
 	return nil, fmt.Errorf("%w: presented=%v", ErrUnknownPrincipal, sans)
+}
+
+// All satisfies [Store]. Returns a snapshot of every registered
+// principal with its MatchedSAN populated from the registry key.
+// Order is map-iteration order — callers that need stable output
+// (admin portal listings, tests) should sort the result themselves.
+func (s *InMemoryStore) All() []Principal {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]Principal, 0, len(s.bySAN))
+	for san, p := range s.bySAN {
+		p.MatchedSAN = san
+		out = append(out, p)
+	}
+	return out
 }
 
 // ExtractSANs reads the verified leaf certificate from r.TLS and

@@ -222,3 +222,38 @@ func TestInMemoryStore_IgnoresEntriesWithoutMatchedSAN(t *testing.T) {
 		t.Errorf("good entry not registered: %v", err)
 	}
 }
+
+func TestInMemoryStore_All_ReturnsEveryRegisteredPrincipal(t *testing.T) {
+	entries := []mtls.Principal{
+		{Name: "ssh-proxyd", MatchedSAN: "spiffe://corp/svc/ssh-proxyd", Groups: []string{"ssh-proxy-service"}},
+		{Name: "ops-bot", MatchedSAN: "ops@corp.com", Groups: []string{"ops"}},
+	}
+	store := mtls.NewInMemoryStore(entries...)
+
+	got := store.All()
+	if len(got) != 2 {
+		t.Fatalf("All() len = %d, want 2", len(got))
+	}
+	// Build a quick name → MatchedSAN map for assertion regardless of order.
+	bySAN := map[string]mtls.Principal{}
+	for _, p := range got {
+		bySAN[p.MatchedSAN] = p
+	}
+	for _, want := range entries {
+		got, ok := bySAN[want.MatchedSAN]
+		if !ok {
+			t.Errorf("All() missing entry %q", want.MatchedSAN)
+			continue
+		}
+		if got.Name != want.Name {
+			t.Errorf("Name = %q, want %q", got.Name, want.Name)
+		}
+	}
+}
+
+func TestInMemoryStore_All_EmptyStore(t *testing.T) {
+	store := mtls.NewInMemoryStore()
+	if got := store.All(); len(got) != 0 {
+		t.Errorf("All() = %v, want empty", got)
+	}
+}

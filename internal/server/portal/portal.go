@@ -20,8 +20,16 @@ import (
 	"strings"
 	"time"
 
+	"github.com/abagile/tokyo3-ca/internal/server/mtls"
 	"github.com/abagile/tokyo3-ca/internal/server/policy"
 )
+
+// HostStore is the subset of [mtls.Store] the hosts page needs.
+// Defined here (and not as an alias) so tests can stub the source
+// without seeding the full mTLS registry.
+type HostStore interface {
+	All() []mtls.Principal
+}
 
 // RoleStore is the subset of [policy.Store] the roles list/detail
 // pages need. Defined here (and not as an alias) so tests can stub
@@ -82,6 +90,10 @@ type Config struct {
 	// (/roles/new, /roles/{name}/edit, /roles/{name}/delete) are
 	// activated. Read-only stores leave those routes returning 405.
 	RoleStore RoleStore
+
+	// HostStore powers the /hosts page (registered workload mTLS
+	// principals). When nil, /hosts returns 503.
+	HostStore HostStore
 }
 
 // New parses the portal templates and returns a ready [Server].
@@ -130,6 +142,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /roles/{name}/edit", s.handleRoleEditForm)
 	mux.HandleFunc("POST /roles/{name}/edit", s.handleRoleUpdate)
 	mux.HandleFunc("POST /roles/{name}/delete", s.handleRoleDelete)
+	mux.HandleFunc("GET /hosts", s.handleHostsIndex)
 	return mux
 }
 
@@ -158,17 +171,18 @@ type pageEntry struct {
 	Status      string // "ready" or "planned"
 }
 
-// landingPages returns the dashboard's nav entries. The Roles page
-// flips to "ready" when RoleStore is wired; the others remain
-// placeholders until their slices land.
+// landingPages returns the dashboard's nav entries. Each page flips
+// to "ready" when its data source is wired; otherwise stays planned.
 func (s *Server) landingPages() []pageEntry {
-	roleStatus := "planned"
-	if s.cfg.RoleStore != nil {
-		roleStatus = "ready"
+	status := func(wired bool) string {
+		if wired {
+			return "ready"
+		}
+		return "planned"
 	}
 	return []pageEntry{
-		{Name: "Roles", Path: "/roles", Description: "Role-table viewer: group → principals + host patterns", Status: roleStatus},
-		{Name: "Hosts", Path: "/hosts", Description: "Host registry: registered tunnels and their certs", Status: "planned"},
+		{Name: "Roles", Path: "/roles", Description: "Role-table viewer: group → principals + host patterns", Status: status(s.cfg.RoleStore != nil)},
+		{Name: "Hosts", Path: "/hosts", Description: "Registered workload mTLS principals (SPIFFE / email SANs → group claims)", Status: status(s.cfg.HostStore != nil)},
 		{Name: "Sessions", Path: "/sessions", Description: "Session list + asciinema-player replay", Status: "planned"},
 		{Name: "Audit", Path: "/audit", Description: "Live audit-event viewer (NATS JetStream tail)", Status: "planned"},
 	}
@@ -363,6 +377,34 @@ func (s *Server) handleRoleDelete(w http.ResponseWriter, r *http.Request) {
 	}
 	s.cfg.Log.Info("portal: role deleted", "name", name)
 	http.Redirect(w, r, "/roles", http.StatusSeeOther)
+}
+
+// hostsIndexData is the model for the hosts page.
+type hostsIndexData struct {
+	Version    string
+	RenderedAt time.Time
+	Hosts      []mtls.Principal
+}
+
+func (s *Server) handleHostsIndex(w http.ResponseWriter, _ *http.Request) {
+	if s.cfg.HostStore == nil {
+		http.Error(w, "host store not configured", http.StatusServiceUnavailable)
+		return
+	}
+	hosts := s.cfg.HostStore.All()
+	// Sort by MatchedSAN for deterministic rendering — map iteration
+	// order in the in-memory store would otherwise churn the page on
+	// every refresh.
+	for i := 1; i < len(hosts); i++ {
+		for j := i; j > 0 && hosts[j-1].MatchedSAN > hosts[j].MatchedSAN; j-- {
+			hosts[j-1], hosts[j] = hosts[j], hosts[j-1]
+		}
+	}
+	s.render(w, "hosts", hostsIndexData{
+		Version:    s.cfg.Version,
+		RenderedAt: s.cfg.Now(),
+		Hosts:      hosts,
+	})
 }
 
 // renderFormError re-renders the form with the user's input intact
@@ -579,6 +621,7 @@ func parsePages() (map[string]*template.Template, error) {
 		"roles":       rolesTemplate,
 		"role_detail": roleDetailTemplate,
 		"role_form":   roleFormTemplate,
+		"hosts":       hostsTemplate,
 	}
 	out := make(map[string]*template.Template, len(pages))
 	for name, body := range pages {
@@ -756,4 +799,37 @@ const roleFormTemplate = `{{define "page"}}{{template "base" .}}{{end}}
   </label>
   <p><button type="submit">{{.Submit}}</button></p>
 </form>
+{{end}}`
+
+const hostsTemplate = `{{define "page"}}{{template "base" .}}{{end}}
+{{define "title"}}hosts{{end}}
+{{define "body"}}
+<p><a href="/">&larr; home</a></p>
+<h1>Hosts</h1>
+<p>Workload mTLS principals registered with certd. Each entry maps a
+TLS SAN (SPIFFE URI or email) to a workload identity + the group
+claims it inherits. Authentication-time lookups consult this set on
+every signing request that traverses the mTLS path.</p>
+{{if .Hosts}}
+<table>
+<thead>
+<tr>
+  <th>SAN</th>
+  <th>Name</th>
+  <th>Groups</th>
+</tr>
+</thead>
+<tbody>
+{{range .Hosts}}
+<tr>
+  <td><code>{{.MatchedSAN}}</code></td>
+  <td>{{.Name}}</td>
+  <td>{{if .Groups}}{{range $i, $g := .Groups}}{{if $i}}, {{end}}<code>{{$g}}</code>{{end}}{{else}}<em>none</em>{{end}}</td>
+</tr>
+{{end}}
+</tbody>
+</table>
+{{else}}
+<p><em>No hosts registered.</em></p>
+{{end}}
 {{end}}`

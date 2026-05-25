@@ -8,9 +8,15 @@ import (
 	"testing"
 	"time"
 
+	"github.com/abagile/tokyo3-ca/internal/server/mtls"
 	"github.com/abagile/tokyo3-ca/internal/server/policy"
 	"github.com/abagile/tokyo3-ca/internal/server/portal"
 )
+
+// stubHostStore is the portal.HostStore test double.
+type stubHostStore struct{ hosts []mtls.Principal }
+
+func (s *stubHostStore) All() []mtls.Principal { return s.hosts }
 
 // stubRoleStore is the read-only portal.RoleStore test double — used
 // to confirm the CRUD-write routes return 405 when the store is
@@ -507,6 +513,95 @@ func TestPortal_RoleCRUD_ReadOnlyStoreReturns405(t *testing.T) {
 				t.Errorf("status = %d, want 405", resp.StatusCode)
 			}
 		})
+	}
+}
+
+func TestPortal_Index_FlipsHostsToReadyWhenHostStoreWired(t *testing.T) {
+	p, err := portal.New(portal.Config{
+		Version:   "v",
+		Now:       func() time.Time { return time.Now() },
+		HostStore: &stubHostStore{},
+	})
+	if err != nil {
+		t.Fatalf("portal.New: %v", err)
+	}
+	srv := httptest.NewServer(p.Routes())
+	defer srv.Close()
+	body := getBody(t, srv.URL+"/")
+	if !strings.Contains(body, `<a href="/hosts">Hosts</a>`) {
+		t.Errorf("Hosts entry not clickable when HostStore is wired:\n%s", body)
+	}
+}
+
+func TestPortal_HostsIndex_ListsRegisteredPrincipals(t *testing.T) {
+	store := &stubHostStore{hosts: []mtls.Principal{
+		{Name: "ssh-proxyd", MatchedSAN: "spiffe://corp/svc/ssh-proxyd", Groups: []string{"ssh-proxy-service"}},
+		{Name: "ops-bot", MatchedSAN: "ops@corp.com", Groups: []string{"ops", "engineering"}},
+	}}
+	p, _ := portal.New(portal.Config{Version: "v", HostStore: store, Now: time.Now})
+	srv := httptest.NewServer(p.Routes())
+	defer srv.Close()
+
+	body := getBody(t, srv.URL+"/hosts")
+	for _, want := range []string{
+		`<h1>Hosts</h1>`,
+		`<code>spiffe://corp/svc/ssh-proxyd</code>`,
+		`<code>ops@corp.com</code>`,
+		`ssh-proxyd`,
+		`ops-bot`,
+		`<code>ssh-proxy-service</code>`,
+		`<code>ops</code>`,
+		`<code>engineering</code>`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("body missing %q\n--- body ---\n%s", want, body)
+		}
+	}
+}
+
+func TestPortal_HostsIndex_SortsBySAN(t *testing.T) {
+	// Intentionally insert in non-alphabetic order; the page must
+	// render them sorted by MatchedSAN so the output is stable
+	// across refreshes regardless of the underlying store's
+	// iteration order.
+	store := &stubHostStore{hosts: []mtls.Principal{
+		{Name: "z-svc", MatchedSAN: "spiffe://corp/zzz", Groups: []string{"z"}},
+		{Name: "a-svc", MatchedSAN: "spiffe://corp/aaa", Groups: []string{"a"}},
+		{Name: "m-svc", MatchedSAN: "spiffe://corp/mmm", Groups: []string{"m"}},
+	}}
+	p, _ := portal.New(portal.Config{Version: "v", HostStore: store, Now: time.Now})
+	srv := httptest.NewServer(p.Routes())
+	defer srv.Close()
+	body := getBody(t, srv.URL+"/hosts")
+	aIdx := strings.Index(body, "spiffe://corp/aaa")
+	mIdx := strings.Index(body, "spiffe://corp/mmm")
+	zIdx := strings.Index(body, "spiffe://corp/zzz")
+	if !(aIdx < mIdx && mIdx < zIdx) {
+		t.Errorf("hosts not sorted by SAN; idx a=%d m=%d z=%d", aIdx, mIdx, zIdx)
+	}
+}
+
+func TestPortal_HostsIndex_EmptyStore(t *testing.T) {
+	p, _ := portal.New(portal.Config{Version: "v", HostStore: &stubHostStore{}, Now: time.Now})
+	srv := httptest.NewServer(p.Routes())
+	defer srv.Close()
+	body := getBody(t, srv.URL+"/hosts")
+	if !strings.Contains(body, "<em>No hosts registered.</em>") {
+		t.Errorf("expected empty-state message:\n%s", body)
+	}
+}
+
+func TestPortal_HostsIndex_503WhenNoHostStore(t *testing.T) {
+	p := newTestPortal(t)
+	srv := httptest.NewServer(p.Routes())
+	defer srv.Close()
+	resp, err := http.Get(srv.URL + "/hosts")
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503", resp.StatusCode)
 	}
 }
 

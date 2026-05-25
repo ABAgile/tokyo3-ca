@@ -84,6 +84,13 @@ internal/
   unmounted (404). Per-page template sets keep page-specific
   `{{define "title"}}`/`{{define "body"}}` blocks from clobbering each
   other.
+- **Host registry viewer.** Set `CERTD_MTLS_PRINCIPALS_FILE` and the
+  portal's `/portal/hosts` page lists every registered workload mTLS
+  principal (SAN, name, group claims). Sorted by SAN for stable
+  output across refreshes. Read-only: principal management lives in
+  the JSON file for now, with the same restart-to-reload constraint
+  the role table has.
+
 - **Role table CRUD.** Set `CERTD_ROLES_FILE` to a JSON file of
   [`policy.Role`] objects and certd loads it as an in-memory
   policy store. The portal pages render the role list at

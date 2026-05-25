@@ -211,10 +211,19 @@ func runServe(ctx context.Context) error {
 		return fmt.Errorf("role store: %w", err)
 	}
 
+	// The mtls.Store satisfies portal.HostStore (its All() returns
+	// every registered principal). Passing it directly avoids
+	// constructing a separate per-portal copy of the registry.
+	var hostStore portal.HostStore
+	if mtlsStore != nil {
+		hostStore = mtlsStore
+	}
+
 	portalSrv, err := portal.New(portal.Config{
 		Version:   Version,
 		Log:       log,
 		RoleStore: roleStore,
+		HostStore: hostStore,
 	})
 	if err != nil {
 		return fmt.Errorf("portal: %w", err)
