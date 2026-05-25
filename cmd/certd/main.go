@@ -84,6 +84,18 @@
 //	                        admin portal will replace the file with a
 //	                        Postgres-backed registry in a later slice.
 //
+//	CERTD_PORTAL_USERNAME   When set together with CERTD_PORTAL_PASSWORD,
+//	                        every /portal/* request (except /healthz)
+//	                        must present matching HTTP Basic
+//	                        credentials. Unset leaves the portal open
+//	                        and operators are expected to front it
+//	                        with oauth2-proxy / mTLS / similar.
+//	CERTD_PORTAL_PASSWORD   The matching secret. Constant-time
+//	                        compared against the request's
+//	                        Authorization header.
+//	CERTD_PORTAL_REALM      Optional Basic-auth realm shown in the
+//	                        browser prompt. Default "certd portal".
+//
 //	CERTD_CAST_DIR          Directory containing the asciinema cast
 //	                        files referenced by recording.completed
 //	                        events (typically the same path
@@ -291,6 +303,11 @@ func runServe(ctx context.Context) error {
 		AuditStore:      auditStore,
 		CastStore:       castStore,
 		RevocationStore: krlStore,
+		BasicAuth: portal.BasicAuthConfig{
+			Username: os.Getenv("CERTD_PORTAL_USERNAME"),
+			Password: os.Getenv("CERTD_PORTAL_PASSWORD"),
+			Realm:    os.Getenv("CERTD_PORTAL_REALM"),
+		},
 	})
 	if err != nil {
 		return fmt.Errorf("portal: %w", err)

@@ -125,6 +125,13 @@ type Config struct {
 	// instance should back the API's KRL field — the portal mutates
 	// in place, and the API endpoint reads from the same data.
 	RevocationStore RevocationStore
+
+	// BasicAuth gates the portal behind HTTP Basic credentials. When
+	// Username + Password are both populated, every /portal/* request
+	// (except /healthz) must present matching Basic creds; otherwise
+	// the portal stays open and operators front it with their own
+	// identity-aware edge.
+	BasicAuth BasicAuthConfig
 }
 
 // New parses the portal templates and returns a ready [Server].
@@ -162,6 +169,9 @@ func (s *Server) render(w http.ResponseWriter, page string, data any) {
 
 // Routes returns the portal's handler tree. Mount under any prefix;
 // the routes use a relative path so the prefix is caller-chosen.
+// When [Config.BasicAuth] is enabled, every request except /healthz
+// must present matching Basic credentials — operators get a real
+// auth gate without standing up oauth2-proxy in front.
 func (s *Server) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{$}", s.handleIndex)
@@ -180,7 +190,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /audit", s.handleAuditIndex)
 	mux.HandleFunc("GET /revocations", s.handleRevocationsIndex)
 	mux.HandleFunc("POST /revocations", s.handleRevocationsCreate)
-	return mux
+	return requireBasicAuth(s.cfg.BasicAuth, mux)
 }
 
 // mutableStore narrows RoleStore to its mutation surface when the

@@ -147,10 +147,12 @@ internal/
   cookie (256 bits of entropy, `SameSite=Lax`, `Secure` over HTTPS)
   and the rendered form embeds the matching value as a hidden
   input. POST handlers reject any submission whose cookie + field
-  don't match (constant-time compare). The portal still needs an
-  authentication gate before production — front it with
-  oauth2-proxy or similar — but cross-site forgery against the
-  mutation surface is closed.
+  don't match (constant-time compare). An HTTP Basic auth gate
+  (constant-time compared) activates when `CERTD_PORTAL_USERNAME`
+  + `CERTD_PORTAL_PASSWORD` are both set; `/healthz` stays open so
+  watchdogs don't need the credential. When the basic-auth pair is
+  unset the portal is open and operators front it with oauth2-proxy
+  or similar.
 
 ## License
 
