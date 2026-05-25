@@ -44,10 +44,12 @@ const (
 // they happen before a caller identity is established, so attributing
 // them is impossible.
 const (
-	ActionSSHUserCertSigned = "ssh.user_cert.signed"
-	ActionSSHHostCertSigned = "ssh.host_cert.signed"
-	ActionSSHUserCertDenied = "ssh.user_cert.denied"
-	ActionSSHHostCertDenied = "ssh.host_cert.denied"
+	ActionSSHUserCertSigned      = "ssh.user_cert.signed"
+	ActionSSHHostCertSigned      = "ssh.host_cert.signed"
+	ActionSSHUserCertDenied      = "ssh.user_cert.denied"
+	ActionSSHHostCertDenied      = "ssh.host_cert.denied"
+	ActionX509WorkloadCertSigned = "x509.workload_cert.signed"
+	ActionX509WorkloadCertDenied = "x509.workload_cert.denied"
 )
 
 // Caller-identity prefix scheme used in [Entry.Caller]:

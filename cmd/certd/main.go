@@ -53,6 +53,17 @@
 //	                        registers for this service). Required when
 //	                        CERTD_OIDC_ISSUER is set.
 //
+//	CERTD_CA_X509_CERT_FILE  Path to a PEM-encoded CA certificate used
+//	                        as the issuer for X.509 / SPIFFE workload
+//	                        certs. When unset, certd generates a
+//	                        self-signed CA cert at startup using the
+//	                        configured CA signer — appropriate for dev;
+//	                        production should set this to a stable
+//	                        cert so consumers can pin trust.
+//	CERTD_CA_X509_CERT_CN   Subject CN used when self-signing the
+//	                        startup-generated CA cert. Default
+//	                        "tokyo3-ca".
+//
 //	CERTD_MTLS_PRINCIPALS_FILE  Path to a JSON file mapping cert SANs
 //	                        (SPIFFE URI or email) to workload identities
 //	                        + group claims. When set, sign endpoints
@@ -76,8 +87,11 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -100,6 +114,7 @@ import (
 	"github.com/abagile/tokyo3-ca/internal/server/mtls"
 	"github.com/abagile/tokyo3-ca/internal/server/oidc"
 	"github.com/abagile/tokyo3-ca/internal/server/signer"
+	"github.com/abagile/tokyo3-ca/internal/server/x509engine"
 )
 
 const appName = "certd"
@@ -172,14 +187,20 @@ func runServe(ctx context.Context) error {
 		return fmt.Errorf("mtls store: %w", err)
 	}
 
+	x509IssuerCert, err := loadOrGenerateX509Issuer(log, caSigner)
+	if err != nil {
+		return fmt.Errorf("x509 issuer cert: %w", err)
+	}
+
 	srv, err := api.New(api.Config{
-		Log:          log,
-		CASigner:     caSigner,
-		OIDCVerifier: oidcVerifier,
-		MTLSStore:    mtlsStore,
-		Audit:        auditSink,
-		AuditSource:  auditSrc,
-		Version:      Version,
+		Log:            log,
+		CASigner:       caSigner,
+		X509IssuerCert: x509IssuerCert,
+		OIDCVerifier:   oidcVerifier,
+		MTLSStore:      mtlsStore,
+		Audit:          auditSink,
+		AuditSource:    auditSrc,
+		Version:        Version,
 	})
 	if err != nil {
 		return fmt.Errorf("api server: %w", err)
@@ -334,6 +355,39 @@ func loadOIDCVerifier(ctx context.Context, log *slog.Logger) (oidc.TokenVerifier
 	}
 	log.Info("oidc verifier ready", "issuer", issuer, "audience", audience)
 	return v, nil
+}
+
+// loadOrGenerateX509Issuer returns the CA cert used as the issuer
+// for X.509 / SPIFFE workload issuance. When CERTD_CA_X509_CERT_FILE
+// is set, the cert is loaded from PEM at that path; otherwise certd
+// self-signs a fresh cert at startup using the existing CA signer.
+// The self-signed path is dev-only — production deployments should
+// pin trust to a stable, externally-issued cert.
+func loadOrGenerateX509Issuer(log *slog.Logger, caSigner signer.Signer) (*x509.Certificate, error) {
+	if path := os.Getenv("CERTD_CA_X509_CERT_FILE"); path != "" {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("read %s: %w", path, err)
+		}
+		block, _ := pem.Decode(data)
+		if block == nil || block.Type != "CERTIFICATE" {
+			return nil, fmt.Errorf("%s does not contain a CERTIFICATE PEM block", path)
+		}
+		cert, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			return nil, fmt.Errorf("parse %s: %w", path, err)
+		}
+		log.Info("x509 issuer ready", "source", "file", "path", path, "cn", cert.Subject.CommonName)
+		return cert, nil
+	}
+	cn := envOr("CERTD_CA_X509_CERT_CN", "tokyo3-ca")
+	cert, err := x509engine.NewSelfSignedCA(rand.Reader, caSigner, cn)
+	if err != nil {
+		return nil, err
+	}
+	log.Warn("CERTD_CA_X509_CERT_FILE unset — generated self-signed CA cert at startup (not for production)",
+		"cn", cn, "not_after", cert.NotAfter)
+	return cert, nil
 }
 
 // loadMTLSStore returns the workload-identity registry parsed from

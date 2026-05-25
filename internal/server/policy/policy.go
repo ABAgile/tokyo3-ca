@@ -39,12 +39,18 @@ import (
 // the *most permissive* cap across them (union semantics — more roles
 // give you more capability, not less).
 type Role struct {
-	Name              string            `json:"name"`
-	GroupClaim        string            `json:"group_claim"`
-	AllowedPrincipals []string          `json:"allowed_principals,omitempty"`
-	HostPatterns      []string          `json:"host_patterns,omitempty"`
+	Name              string   `json:"name"`
+	GroupClaim        string   `json:"group_claim"`
+	AllowedPrincipals []string `json:"allowed_principals,omitempty"`
+	HostPatterns      []string `json:"host_patterns,omitempty"`
+	// SPIFFEPatterns are path.Match-style globs the requested SPIFFE
+	// URI is matched against for X.509 workload-cert issuance. Same
+	// glob syntax as HostPatterns; the URI is matched as a single
+	// string ("spiffe://corp/svc/billing").
+	SPIFFEPatterns    []string          `json:"spiffe_patterns,omitempty"`
 	MaxUserCertTTL    time.Duration     `json:"max_user_cert_ttl,omitempty"`
 	MaxHostCertTTL    time.Duration     `json:"max_host_cert_ttl,omitempty"`
+	MaxX509CertTTL    time.Duration     `json:"max_x509_cert_ttl,omitempty"`
 	DefaultExtensions map[string]string `json:"default_extensions,omitempty"`
 }
 
@@ -266,12 +272,60 @@ func (e *Engine) EvaluateHostCert(groups []string, req HostCertRequest) (HostCer
 	return HostCertDecision{Principals: out, TTL: ttl}, nil
 }
 
+// X509CertRequest captures what the caller asked for, normalized for
+// the X.509 / SPIFFE issuance path.
+type X509CertRequest struct {
+	RequestedSPIFFEURI string
+	RequestedTTL       time.Duration
+	EndpointMaxTTL     time.Duration
+}
+
+// X509CertDecision is the authoritative output of [Engine.EvaluateX509Cert].
+type X509CertDecision struct {
+	SPIFFEURI string
+	TTL       time.Duration
+}
+
+// EvaluateX509Cert applies role policy for X.509 workload certs. The
+// requested SPIFFE URI is glob-matched (via path.Match) against the
+// union of SPIFFEPatterns across the caller's matching roles; a single
+// URI is requested per cert (workloads have one identity at a time),
+// so this returns the requested URI verbatim on approval or an error
+// on denial.
+func (e *Engine) EvaluateX509Cert(groups []string, req X509CertRequest) (X509CertDecision, error) {
+	roles := e.store.RolesForGroups(groups)
+	if len(roles) == 0 {
+		return X509CertDecision{}, fmt.Errorf("%w: groups=%v", ErrNoRole, groups)
+	}
+
+	var patterns []string
+	for _, r := range roles {
+		for _, p := range r.SPIFFEPatterns {
+			if _, err := path.Match(p, ""); err != nil {
+				return X509CertDecision{}, fmt.Errorf("role %q has invalid spiffe pattern %q: %w", r.Name, p, err)
+			}
+			patterns = append(patterns, p)
+		}
+	}
+
+	if !matchesAny(req.RequestedSPIFFEURI, patterns) {
+		return X509CertDecision{}, fmt.Errorf("%w: requested=%s patterns=%v",
+			ErrEmptyDecision, req.RequestedSPIFFEURI, patterns)
+	}
+
+	maxTTL := ttlCap(roles, req.EndpointMaxTTL, x509CapField)
+	ttl := min(req.RequestedTTL, maxTTL)
+
+	return X509CertDecision{SPIFFEURI: req.RequestedSPIFFEURI, TTL: ttl}, nil
+}
+
 // capField identifies which Role TTL ceiling [ttlCap] should consult.
 type capField int
 
 const (
 	userCapField capField = iota
 	hostCapField
+	x509CapField
 )
 
 // ttlCap returns the most-permissive per-role TTL ceiling across roles
@@ -286,6 +340,8 @@ func ttlCap(roles []Role, endpoint time.Duration, field capField) time.Duration 
 			eff = r.MaxUserCertTTL
 		case hostCapField:
 			eff = r.MaxHostCertTTL
+		case x509CapField:
+			eff = r.MaxX509CertTTL
 		}
 		if eff == 0 || eff > endpoint {
 			eff = endpoint

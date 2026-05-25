@@ -358,6 +358,129 @@ func TestEvaluateHostCert_InvalidPatternErrors(t *testing.T) {
 	}
 }
 
+// ── EvaluateX509Cert ──────────────────────────────────────────────────────────
+
+func TestEvaluateX509Cert_GlobMatch(t *testing.T) {
+	store := policy.NewInMemoryStore(policy.Role{
+		Name: "workloads", GroupClaim: "workload-issuer",
+		SPIFFEPatterns: []string{"spiffe://corp/svc/*"},
+		MaxX509CertTTL: 12 * time.Hour,
+	})
+	eng := policy.NewEngine(store)
+
+	decision, err := eng.EvaluateX509Cert([]string{"workload-issuer"}, policy.X509CertRequest{
+		RequestedSPIFFEURI: "spiffe://corp/svc/billing",
+		RequestedTTL:       2 * time.Hour,
+		EndpointMaxTTL:     24 * time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("EvaluateX509Cert: %v", err)
+	}
+	if decision.SPIFFEURI != "spiffe://corp/svc/billing" {
+		t.Errorf("SPIFFEURI = %q", decision.SPIFFEURI)
+	}
+	if decision.TTL != 2*time.Hour {
+		t.Errorf("TTL = %s, want 2h", decision.TTL)
+	}
+}
+
+func TestEvaluateX509Cert_PatternDoesNotMatch_403(t *testing.T) {
+	store := policy.NewInMemoryStore(policy.Role{
+		Name: "workloads", GroupClaim: "workload-issuer",
+		SPIFFEPatterns: []string{"spiffe://corp/svc/billing"},
+	})
+	eng := policy.NewEngine(store)
+
+	_, err := eng.EvaluateX509Cert([]string{"workload-issuer"}, policy.X509CertRequest{
+		RequestedSPIFFEURI: "spiffe://corp/svc/admin", // not matched
+		RequestedTTL:       time.Hour,
+		EndpointMaxTTL:     24 * time.Hour,
+	})
+	if !errors.Is(err, policy.ErrEmptyDecision) {
+		t.Errorf("err = %v, want ErrEmptyDecision", err)
+	}
+}
+
+func TestEvaluateX509Cert_NoRoleMatch(t *testing.T) {
+	store := policy.NewInMemoryStore(policy.Role{
+		Name: "workloads", GroupClaim: "workload-issuer",
+		SPIFFEPatterns: []string{"spiffe://corp/*"},
+	})
+	eng := policy.NewEngine(store)
+
+	_, err := eng.EvaluateX509Cert([]string{"unrelated"}, policy.X509CertRequest{
+		RequestedSPIFFEURI: "spiffe://corp/svc/anything",
+		RequestedTTL:       time.Hour,
+		EndpointMaxTTL:     24 * time.Hour,
+	})
+	if !errors.Is(err, policy.ErrNoRole) {
+		t.Errorf("err = %v, want ErrNoRole", err)
+	}
+}
+
+func TestEvaluateX509Cert_TTLCapped(t *testing.T) {
+	// path.Match's "*" does not span "/", so a single-segment pattern
+	// matches a single-segment path. Use spiffe://corp/svc/* to cover
+	// the two-segment "svc/billing" tail.
+	store := policy.NewInMemoryStore(policy.Role{
+		Name: "workloads", GroupClaim: "workload-issuer",
+		SPIFFEPatterns: []string{"spiffe://corp/svc/*"},
+		MaxX509CertTTL: 4 * time.Hour,
+	})
+	eng := policy.NewEngine(store)
+
+	decision, err := eng.EvaluateX509Cert([]string{"workload-issuer"}, policy.X509CertRequest{
+		RequestedSPIFFEURI: "spiffe://corp/svc/billing",
+		RequestedTTL:       24 * time.Hour, // over role cap
+		EndpointMaxTTL:     24 * time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("EvaluateX509Cert: %v", err)
+	}
+	if decision.TTL != 4*time.Hour {
+		t.Errorf("TTL = %s, want 4h (capped)", decision.TTL)
+	}
+}
+
+func TestEvaluateX509Cert_InvalidPatternErrors(t *testing.T) {
+	store := policy.NewInMemoryStore(policy.Role{
+		Name: "broken", GroupClaim: "broken",
+		SPIFFEPatterns: []string{"["}, // malformed
+	})
+	eng := policy.NewEngine(store)
+
+	_, err := eng.EvaluateX509Cert([]string{"broken"}, policy.X509CertRequest{
+		RequestedSPIFFEURI: "spiffe://corp/x",
+		RequestedTTL:       time.Hour,
+		EndpointMaxTTL:     24 * time.Hour,
+	})
+	if err == nil || !strings.Contains(err.Error(), "invalid spiffe pattern") {
+		t.Errorf("err = %v, want invalid spiffe pattern", err)
+	}
+}
+
+func TestEvaluateX509Cert_MultiRoleUnion(t *testing.T) {
+	store := policy.NewInMemoryStore(
+		policy.Role{Name: "a", GroupClaim: "a", SPIFFEPatterns: []string{"spiffe://corp/svc/*"}, MaxX509CertTTL: 1 * time.Hour},
+		policy.Role{Name: "b", GroupClaim: "b", SPIFFEPatterns: []string{"spiffe://other/*"}, MaxX509CertTTL: 6 * time.Hour},
+	)
+	eng := policy.NewEngine(store)
+
+	// Member of a+b can request from either trust domain; the TTL
+	// ceiling is the max of the two role caps.
+	decision, err := eng.EvaluateX509Cert([]string{"a", "b"}, policy.X509CertRequest{
+		RequestedSPIFFEURI: "spiffe://corp/svc/billing",
+		RequestedTTL:       12 * time.Hour,
+		EndpointMaxTTL:     24 * time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("EvaluateX509Cert: %v", err)
+	}
+	if decision.TTL != 6*time.Hour {
+		t.Errorf("TTL = %s, want 6h (max across roles)", decision.TTL)
+	}
+}
+
 func TestNewEngine_NilStorePanics(t *testing.T) {
 	defer func() {
 		if recover() == nil {

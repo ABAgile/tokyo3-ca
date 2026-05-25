@@ -6,6 +6,7 @@ package api
 
 import (
 	"crypto/ed25519"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -24,14 +25,15 @@ import (
 // Server holds all dependencies for the HTTP API. Pure value — safe to
 // share across goroutines once constructed.
 type Server struct {
-	log      *slog.Logger
-	caSigner signer.Signer
-	policy   *policy.Engine     // Role-table enforcer; nil = permissive (pre-auth wiring).
-	oidc     oidc.TokenVerifier // Bearer-token verifier; nil = no OIDC auth.
-	mtls     mtls.Store         // Cert-principal registry; nil = no mTLS auth.
-	audit    audit.Sink         // JetStream publisher; NoopSink when CERTD_NATS_URL is unset.
-	auditSrc journal.Source     // JetStream reader for the portal audit page; NoopSource when CERTD_NATS_URL is unset.
-	version  string             // build-time version string, surfaced in /healthz; empty allowed.
+	log            *slog.Logger
+	caSigner       signer.Signer
+	x509IssuerCert *x509.Certificate  // CA cert used as issuer for X.509 issuance; nil disables /x509/* routes.
+	policy         *policy.Engine     // Role-table enforcer; nil = permissive (pre-auth wiring).
+	oidc           oidc.TokenVerifier // Bearer-token verifier; nil = no OIDC auth.
+	mtls           mtls.Store         // Cert-principal registry; nil = no mTLS auth.
+	audit          audit.Sink         // JetStream publisher; NoopSink when CERTD_NATS_URL is unset.
+	auditSrc       journal.Source     // JetStream reader for the portal audit page; NoopSource when CERTD_NATS_URL is unset.
+	version        string             // build-time version string, surfaced in /healthz; empty allowed.
 }
 
 // Config is the constructor argument for [New].
@@ -42,6 +44,12 @@ type Config struct {
 	// CASigner is the CA signing primitive used by the issuance
 	// endpoints. Required.
 	CASigner signer.Signer
+	// X509IssuerCert is the CA certificate used as the issuer when
+	// signing X.509 workload certs. Use [x509engine.NewSelfSignedCA]
+	// to construct it from CASigner, or load a pre-issued cert from
+	// disk. When nil, the /api/v1/x509/* routes return 503; the SSH
+	// signing endpoints are unaffected.
+	X509IssuerCert *x509.Certificate
 	// Policy applies the role table to incoming sign requests. When
 	// nil, sign endpoints are permissive — anyone reaching them can
 	// sign anything within the endpoint TTL ceiling. Production builds
@@ -93,14 +101,15 @@ func New(cfg Config) (*Server, error) {
 		auditSrc = journal.NoopSource{}
 	}
 	return &Server{
-		log:      cfg.Log,
-		caSigner: cfg.CASigner,
-		policy:   cfg.Policy,
-		oidc:     cfg.OIDCVerifier,
-		mtls:     cfg.MTLSStore,
-		audit:    auditSink,
-		auditSrc: auditSrc,
-		version:  cfg.Version,
+		log:            cfg.Log,
+		caSigner:       cfg.CASigner,
+		x509IssuerCert: cfg.X509IssuerCert,
+		policy:         cfg.Policy,
+		oidc:           cfg.OIDCVerifier,
+		mtls:           cfg.MTLSStore,
+		audit:          auditSink,
+		auditSrc:       auditSrc,
+		version:        cfg.Version,
 	}, nil
 }
 
@@ -111,6 +120,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 	mux.HandleFunc("POST /api/v1/ssh/sign-user", s.handleSignUserCert)
 	mux.HandleFunc("POST /api/v1/ssh/sign-host", s.handleSignHostCert)
+	mux.HandleFunc("POST /api/v1/x509/sign-workload", s.handleSignX509WorkloadCert)
 	return mux
 }
 
@@ -125,6 +135,7 @@ type healthzResponse struct {
 	PolicyActive bool   `json:"policy_active"`
 	OIDCActive   bool   `json:"oidc_active"`
 	MTLSActive   bool   `json:"mtls_active"`
+	X509Active   bool   `json:"x509_active"`
 }
 
 func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
@@ -138,6 +149,7 @@ func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 		PolicyActive: s.policy != nil,
 		OIDCActive:   s.oidc != nil,
 		MTLSActive:   s.mtls != nil,
+		X509Active:   s.x509IssuerCert != nil,
 	}
 	_ = json.NewEncoder(w).Encode(body)
 }
