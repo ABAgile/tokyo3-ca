@@ -19,6 +19,7 @@ import (
 	"github.com/abagile/tokyo3-ca/internal/server/mtls"
 	"github.com/abagile/tokyo3-ca/internal/server/oidc"
 	"github.com/abagile/tokyo3-ca/internal/server/policy"
+	"github.com/abagile/tokyo3-ca/internal/server/portal"
 	"github.com/abagile/tokyo3-ca/internal/server/signer"
 )
 
@@ -33,6 +34,7 @@ type Server struct {
 	mtls           mtls.Store         // Cert-principal registry; nil = no mTLS auth.
 	audit          audit.Sink         // JetStream publisher; NoopSink when CERTD_NATS_URL is unset.
 	auditSrc       journal.Source     // JetStream reader for the portal audit page; NoopSource when CERTD_NATS_URL is unset.
+	portal         *portal.Server     // Admin web UI; nil disables /portal/* routes.
 	version        string             // build-time version string, surfaced in /healthz; empty allowed.
 }
 
@@ -78,6 +80,10 @@ type Config struct {
 	// AuditSource is the live-tail reader for the portal audit page.
 	// When nil, a no-op source is used.
 	AuditSource journal.Source
+	// Portal is the admin web UI handler. When nil, /portal/* routes
+	// are not mounted (the API surface still works without a portal —
+	// useful for headless certd deployments).
+	Portal *portal.Server
 	// Version is the build-time semver / commit identifier surfaced in
 	// /healthz. Empty acceptable but discouraged in deployed builds.
 	Version string
@@ -109,18 +115,25 @@ func New(cfg Config) (*Server, error) {
 		mtls:           cfg.MTLSStore,
 		audit:          auditSink,
 		auditSrc:       auditSrc,
+		portal:         cfg.Portal,
 		version:        cfg.Version,
 	}, nil
 }
 
 // Routes returns the HTTP handler tree. Mount under any prefix; routes
-// are absolute (no required prefix).
+// are absolute (no required prefix). When [Config.Portal] was set, the
+// portal handlers are mounted under /portal/ — its routes use the
+// host pattern itself, so the http.ServeMux StripPrefix call here is
+// what makes them resolve correctly.
 func (s *Server) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 	mux.HandleFunc("POST /api/v1/ssh/sign-user", s.handleSignUserCert)
 	mux.HandleFunc("POST /api/v1/ssh/sign-host", s.handleSignHostCert)
 	mux.HandleFunc("POST /api/v1/x509/sign-workload", s.handleSignX509WorkloadCert)
+	if s.portal != nil {
+		mux.Handle("/portal/", http.StripPrefix("/portal", s.portal.Routes()))
+	}
 	return mux
 }
 

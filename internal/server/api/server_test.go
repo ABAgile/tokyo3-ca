@@ -11,6 +11,7 @@ import (
 
 	"github.com/abagile/tokyo3-ca/internal/audit"
 	"github.com/abagile/tokyo3-ca/internal/server/api"
+	"github.com/abagile/tokyo3-ca/internal/server/portal"
 	"github.com/abagile/tokyo3-ca/internal/server/signer"
 )
 
@@ -114,6 +115,53 @@ func TestRoutes_UnknownPathReturns404(t *testing.T) {
 
 	if rec.Code != http.StatusNotFound {
 		t.Errorf("status = %d, want 404", rec.Code)
+	}
+}
+
+func TestRoutes_PortalMountedUnderPrefix(t *testing.T) {
+	caSig, _ := signer.NewEphemeralEd25519()
+	p, err := portal.New(portal.Config{Version: "test"})
+	if err != nil {
+		t.Fatalf("portal.New: %v", err)
+	}
+	srv := mustNewServer(t, api.Config{
+		Log:      silentLogger(),
+		CASigner: caSig,
+		Portal:   p,
+	})
+
+	// GET /portal/ resolves to the portal index.
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/portal/", nil)
+	srv.Routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /portal/: status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if body := rec.Body.String(); !strings.Contains(body, "certd admin portal") {
+		t.Errorf("portal body missing header: %s", body)
+	}
+
+	// GET /portal/healthz works too — confirms the StripPrefix is wired.
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/portal/healthz", nil)
+	srv.Routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Errorf("GET /portal/healthz: status = %d, want 200", rec.Code)
+	}
+}
+
+func TestRoutes_PortalAbsentWhenNotConfigured(t *testing.T) {
+	caSig, _ := signer.NewEphemeralEd25519()
+	srv := mustNewServer(t, api.Config{
+		Log:      silentLogger(),
+		CASigner: caSig,
+		// Portal omitted — /portal/* must 404.
+	})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/portal/", nil)
+	srv.Routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("GET /portal/: status = %d, want 404 (no portal configured)", rec.Code)
 	}
 }
 

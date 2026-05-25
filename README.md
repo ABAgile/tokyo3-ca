@@ -75,6 +75,13 @@ internal/
   pointing at the cert-agentd-managed user cert/key with optional
   `ProxyJump` and `User`. The OpenSSH client re-reads the Include on
   every connection, so renewed user certs apply without SIGHUP.
+- **Admin portal.** `certd` mounts a server-rendered HTML portal at
+  `/portal/`. The scaffold ships a landing page that lists the planned
+  pages (roles, hosts, sessions, audit) with their build status; later
+  slices fill in each page. No client-side framework — pages render
+  fully on the server and submit via standard form posts. The portal
+  is optional: omitting `api.Config.Portal` leaves `/portal/*` routes
+  unmounted (404).
 
 ## License
 

@@ -113,6 +113,7 @@ import (
 	"github.com/abagile/tokyo3-ca/internal/server/api"
 	"github.com/abagile/tokyo3-ca/internal/server/mtls"
 	"github.com/abagile/tokyo3-ca/internal/server/oidc"
+	"github.com/abagile/tokyo3-ca/internal/server/portal"
 	"github.com/abagile/tokyo3-ca/internal/server/signer"
 	"github.com/abagile/tokyo3-ca/internal/server/x509engine"
 )
@@ -192,6 +193,14 @@ func runServe(ctx context.Context) error {
 		return fmt.Errorf("x509 issuer cert: %w", err)
 	}
 
+	portalSrv, err := portal.New(portal.Config{
+		Version: Version,
+		Log:     log,
+	})
+	if err != nil {
+		return fmt.Errorf("portal: %w", err)
+	}
+
 	srv, err := api.New(api.Config{
 		Log:            log,
 		CASigner:       caSigner,
@@ -200,6 +209,7 @@ func runServe(ctx context.Context) error {
 		MTLSStore:      mtlsStore,
 		Audit:          auditSink,
 		AuditSource:    auditSrc,
+		Portal:         portalSrv,
 		Version:        Version,
 	})
 	if err != nil {
