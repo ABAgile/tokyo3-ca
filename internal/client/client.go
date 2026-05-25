@@ -125,3 +125,84 @@ func (c *Client) SignWorkloadCert(ctx context.Context, req SignWorkloadRequest) 
 	}
 	return &out, nil
 }
+
+// SignUserRequest mirrors certd's POST /api/v1/ssh/sign-user body.
+// Keep in sync with the certd handler — fields drift here silently
+// turn into 400s.
+type SignUserRequest struct {
+	// PublicKey is the subject's SSH public key in authorized_keys
+	// format (e.g., "ssh-ed25519 AAAA…").
+	PublicKey string `json:"public_key"`
+	// KeyID is the human-readable identifier embedded in the cert
+	// (also surfaces in certd's audit log). Required.
+	KeyID string `json:"key_id"`
+	// Principals are the Unix usernames the bearer may log in as.
+	// At least one entry required. When policy is active, principals
+	// not authorized for the caller are silently dropped; the full
+	// set being denied is a 403.
+	Principals []string `json:"principals"`
+	// Groups carry the caller's authenticated group membership for
+	// policy enforcement when certd is in body-groups fallback mode.
+	Groups []string `json:"groups,omitempty"`
+	// Extensions are SSH cert extensions (e.g., permit-pty,
+	// permit-port-forwarding). Merged with role default extensions
+	// (request-level wins).
+	Extensions map[string]string `json:"extensions,omitempty"`
+	// CriticalOptions are strictly-enforced sshd options (e.g.,
+	// force-command, source-address).
+	CriticalOptions map[string]string `json:"critical_options,omitempty"`
+	// TTLSeconds is the requested validity window. Zero ⇒ certd's
+	// default. Capped at the endpoint's max and possibly further by
+	// role policy.
+	TTLSeconds int64 `json:"ttl_seconds,omitempty"`
+}
+
+// SignUserResponse mirrors certd's response. Certificate is in the
+// authorized_keys-format cert line ("ssh-ed25519-cert-v01@openssh.com
+// AAAA…").
+type SignUserResponse struct {
+	Certificate string    `json:"certificate"`
+	Serial      uint64    `json:"serial"`
+	KeyID       string    `json:"key_id"`
+	Principals  []string  `json:"principals"`
+	ValidAfter  time.Time `json:"valid_after"`
+	ValidBefore time.Time `json:"valid_before"`
+}
+
+// SignUserCert calls certd's /api/v1/ssh/sign-user endpoint and
+// returns the signed user cert + validity envelope. Behaves
+// identically to [Client.SignWorkloadCert] regarding context,
+// timeouts, and error surfacing.
+func (c *Client) SignUserCert(ctx context.Context, req SignUserRequest) (*SignUserResponse, error) {
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("marshal sign-user request: %w", err)
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		c.baseURL+"/api/v1/ssh/sign-user", bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("build request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.http.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("sign-user http call: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, fmt.Errorf("read sign-user response: %w", err)
+	}
+	if resp.StatusCode/100 != 2 {
+		return nil, fmt.Errorf("sign-user returned %d: %s",
+			resp.StatusCode, strings.TrimSpace(string(respBody)))
+	}
+
+	var out SignUserResponse
+	if err := json.Unmarshal(respBody, &out); err != nil {
+		return nil, fmt.Errorf("decode sign-user response: %w", err)
+	}
+	return &out, nil
+}

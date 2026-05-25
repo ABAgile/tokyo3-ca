@@ -32,16 +32,34 @@
 //	                        certd's default. Capped by the endpoint's
 //	                        hard max and possibly further by policy.
 //
+// Optional SSH user cert renewal:
+//
+//	CERT_AGENTD_SSH_USER_CERT       When set together with
+//	                                CERT_AGENTD_SSH_USER_KEY and
+//	                                CERT_AGENTD_SSH_PRINCIPALS, the
+//	                                agent also renews an SSH user
+//	                                cert. The key is generated on
+//	                                first run (mode 0600); the cert
+//	                                lands at this path (mode 0644).
+//	CERT_AGENTD_SSH_USER_KEY        Path for the matching SSH private
+//	                                key. Reused across renewals once
+//	                                generated.
+//	CERT_AGENTD_SSH_PRINCIPALS      Comma-separated Unix usernames the
+//	                                cert authorizes (e.g.,
+//	                                "alice,deployer").
+//	CERT_AGENTD_SSH_KEY_ID          KeyID embedded in the cert. Default
+//	                                "user:<spiffe-uri-path-tail>".
+//	CERT_AGENTD_SSH_TTL_SECONDS     Requested validity window for the
+//	                                user cert. Zero ⇒ certd's default.
+//
 // Optional ssh_config drop-in:
 //
 //	CERT_AGENTD_SSH_CONFIG_PATH    When set, render an ssh_config
-//	                               snippet to this path. The user's
-//	                               main config should Include it.
+//	                               snippet to this path pointing at
+//	                               the SSH user cert/key above. The
+//	                               user's main config should Include
+//	                               it.
 //	CERT_AGENTD_SSH_HOST_PATTERN   Host pattern in the snippet. Default "*".
-//	CERT_AGENTD_SSH_USER_CERT      Path to the SSH user cert (rendered
-//	                               into CertificateFile).
-//	CERT_AGENTD_SSH_USER_KEY       Path to the SSH user key (rendered
-//	                               into IdentityFile).
 //	CERT_AGENTD_SSH_PROXY_JUMP     ProxyJump directive (e.g.,
 //	                               "alice@proxy.internal:2222").
 //	CERT_AGENTD_SSH_USER           SSH login name.
@@ -56,7 +74,9 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"path"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -162,6 +182,11 @@ func runAgent(ctx context.Context) error {
 		return fmt.Errorf("renewer: %w", err)
 	}
 
+	userRenewer, err := buildUserCertRenewer(certdClient, spiffeURI, log)
+	if err != nil {
+		return fmt.Errorf("ssh user cert renewer: %w", err)
+	}
+
 	// Optional ssh_config drop-in. Written once at startup with the
 	// snippet pointing at the cert-agentd-managed user cert/key
 	// paths. Atomic + deterministic so a no-op re-render doesn't
@@ -173,11 +198,88 @@ func runAgent(ctx context.Context) error {
 	rootCtx, cancel := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	if err := renewer.Run(rootCtx); err != nil && !errors.Is(err, context.Canceled) {
-		return fmt.Errorf("renewer: %w", err)
+	// Run the X.509 workload renewer (always) alongside the SSH user
+	// renewer (when configured) under one ctx. Either component's
+	// exit cancels rootCtx so the other unwinds cleanly.
+	errCh := make(chan error, 2)
+	expected := 1
+	go func() { errCh <- renewer.Run(rootCtx) }()
+	if userRenewer != nil {
+		expected = 2
+		go func() { errCh <- userRenewer.Run(rootCtx) }()
+	}
+	var firstErr error
+	for range expected {
+		err := <-errCh
+		if firstErr == nil && err != nil && !errors.Is(err, context.Canceled) {
+			firstErr = err
+		}
+		cancel()
+	}
+	if firstErr != nil {
+		return fmt.Errorf("renewer: %w", firstErr)
 	}
 	log.Info("stopped")
 	return nil
+}
+
+// buildUserCertRenewer returns a configured SSH user cert renewer
+// when the SSH-cert env vars are populated; otherwise nil so the
+// caller skips the second renewal goroutine. KeyID defaults to
+// "user:<spiffe-uri-path-tail>" — the trailing component of the
+// SPIFFE URI is a sensible identity tag when the operator hasn't
+// chosen one.
+func buildUserCertRenewer(signer renew.UserSigner, spiffeURI string, log *slog.Logger) (*renew.UserCertRenewer, error) {
+	certPath := os.Getenv("CERT_AGENTD_SSH_USER_CERT")
+	keyPath := os.Getenv("CERT_AGENTD_SSH_USER_KEY")
+	principalsRaw := os.Getenv("CERT_AGENTD_SSH_PRINCIPALS")
+	if certPath == "" && keyPath == "" && principalsRaw == "" {
+		log.Warn("CERT_AGENTD_SSH_USER_* unset — SSH user cert renewer disabled")
+		return nil, nil
+	}
+	if certPath == "" || keyPath == "" || principalsRaw == "" {
+		return nil, errors.New("CERT_AGENTD_SSH_USER_CERT, _USER_KEY, and _PRINCIPALS must all be set together")
+	}
+
+	principals := make([]string, 0)
+	for _, p := range strings.Split(principalsRaw, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			principals = append(principals, p)
+		}
+	}
+	if len(principals) == 0 {
+		return nil, errors.New("CERT_AGENTD_SSH_PRINCIPALS is empty after trimming")
+	}
+
+	keyID := os.Getenv("CERT_AGENTD_SSH_KEY_ID")
+	if keyID == "" {
+		keyID = "user:" + path.Base(strings.TrimRight(spiffeURI, "/"))
+	}
+	var ttl time.Duration
+	if v := os.Getenv("CERT_AGENTD_SSH_TTL_SECONDS"); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil || n <= 0 {
+			return nil, fmt.Errorf("CERT_AGENTD_SSH_TTL_SECONDS %q: must be positive integer", v)
+		}
+		ttl = time.Duration(n) * time.Second
+	}
+
+	r, err := renew.NewUserCertRenewer(renew.UserCertConfig{
+		Signer:         signer,
+		KeyID:          keyID,
+		Principals:     principals,
+		CertOutputPath: certPath,
+		KeyOutputPath:  keyPath,
+		RequestedTTL:   ttl,
+		Log:            log,
+	})
+	if err != nil {
+		return nil, err
+	}
+	log.Info("ssh user cert renewer configured",
+		"key_id", keyID, "principals", principals,
+		"cert_path", certPath, "key_path", keyPath)
+	return r, nil
 }
 
 func versionCmd() *cobra.Command {
@@ -282,7 +384,7 @@ func writeSSHSnippetIfConfigured(log *slog.Logger) error {
 	cert := os.Getenv("CERT_AGENTD_SSH_USER_CERT")
 	key := os.Getenv("CERT_AGENTD_SSH_USER_KEY")
 	if cert == "" || key == "" {
-		return errors.New("CERT_AGENTD_SSH_USER_CERT and CERT_AGENTD_SSH_USER_KEY are required when CERT_AGENTD_SSH_CONFIG_PATH is set")
+		return errors.New("CERT_AGENTD_SSH_USER_CERT and CERT_AGENTD_SSH_USER_KEY are required when CERT_AGENTD_SSH_CONFIG_PATH is set (typically the same paths the SSH user cert renewer manages)")
 	}
 	snippet := output.SSHConfigSnippet{
 		HostPattern:     envOr("CERT_AGENTD_SSH_HOST_PATTERN", "*"),
