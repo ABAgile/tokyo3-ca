@@ -167,6 +167,13 @@ internal/
   unset the portal is open and operators front it with oauth2-proxy
   or similar.
 
+## Operations
+
+See [OPERATIONS.md](OPERATIONS.md) for deployment topology, the
+initial-deploy checklist, scenario playbooks (rotate CA key,
+revoke a cert, recover from NATS outage, diagnose replay errors),
+cert-agentd lifecycle notes, and monitoring hooks.
+
 ## Security
 
 See [THREAT_MODEL.md](THREAT_MODEL.md) for the per-surface threat
