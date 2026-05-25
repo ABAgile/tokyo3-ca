@@ -63,6 +63,18 @@ internal/
 - **Single agent** `cert-agentd` is the unified workload credential
   agent — one workload identity, multiple credential outputs (SPIFFE X.509 +
   optional SSH user cert).
+- **Live-rotating mTLS cert.** `cert-agentd` wires its certd HTTP client
+  through a `tls.Config.GetClientCertificate` reloader. After each
+  successful renewal the renewer's `OnRenewed` hook refreshes the
+  holder from disk, so the next mTLS handshake uses the fresh cert
+  without restarting the binary. The bootstrap cert + key are
+  provisioned externally (the agent never generates its X.509 key
+  outside the renewer's `ensureKey` path).
+- **ssh_config snippet (optional).** When `CERT_AGENTD_SSH_CONFIG_PATH`
+  is set, the agent renders an Include-style `ssh_config` drop-in
+  pointing at the cert-agentd-managed user cert/key with optional
+  `ProxyJump` and `User`. The OpenSSH client re-reads the Include on
+  every connection, so renewed user certs apply without SIGHUP.
 
 ## License
 
