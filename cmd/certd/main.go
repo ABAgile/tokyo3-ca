@@ -84,6 +84,16 @@
 //	                        admin portal will replace the file with a
 //	                        Postgres-backed registry in a later slice.
 //
+//	CERTD_SSH_AUDIT_URL     NATS URL for the ssh_audit stream
+//	                        ssh-proxyd publishes recording.completed
+//	                        events to. When set, certd subscribes,
+//	                        decodes the events, and powers the
+//	                        portal's /sessions page. Falls back to
+//	                        CERTD_NATS_URL when unset; truly empty
+//	                        means "no sessions page". TLS material
+//	                        comes from CERTD_SSH_AUDIT_CERT/_KEY/_CA
+//	                        with the same CERTD_NATS_* fallback chain.
+//
 //	CERTD_ROLES_FILE        Path to a JSON file holding the role
 //	                        table — top-level array of role objects
 //	                        matching the [policy.Role] shape (Name,
@@ -219,11 +229,26 @@ func runServe(ctx context.Context) error {
 		hostStore = mtlsStore
 	}
 
+	// SessionTracker subscribes to ssh-proxyd's ssh_audit stream and
+	// powers the /sessions page. Independent NATS subscription so
+	// the streams stay decoupled — certd's own audit and ssh-proxyd's
+	// audit can live in different brokers or under different mTLS
+	// identities if needed.
+	sessionTracker, err := openSSHAuditTracker(log)
+	if err != nil {
+		return fmt.Errorf("session tracker: %w", err)
+	}
+	var sessionStore portal.SessionStore
+	if sessionTracker != nil {
+		sessionStore = sessionTracker
+	}
+
 	portalSrv, err := portal.New(portal.Config{
-		Version:   Version,
-		Log:       log,
-		RoleStore: roleStore,
-		HostStore: hostStore,
+		Version:      Version,
+		Log:          log,
+		RoleStore:    roleStore,
+		HostStore:    hostStore,
+		SessionStore: sessionStore,
 	})
 	if err != nil {
 		return fmt.Errorf("portal: %w", err)
@@ -254,6 +279,14 @@ func runServe(ctx context.Context) error {
 
 	rootCtx, cancel := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
+
+	if sessionTracker != nil {
+		go func() {
+			if err := sessionTracker.Run(rootCtx); err != nil && !errors.Is(err, context.Canceled) {
+				log.Warn("session tracker exited", "err", err)
+			}
+		}()
+	}
 
 	serveErr := make(chan error, 1)
 	go func() {
@@ -603,6 +636,52 @@ func openAuditSource(log *slog.Logger) (journal.Source, error) {
 		Subject:    audit.Subject,
 		TLS:        tlsCfg,
 	})
+}
+
+// openSSHAuditTracker subscribes to ssh-proxyd's ssh_audit stream
+// and returns a [portal.SessionTracker] ready for the portal's
+// /sessions page. When CERTD_SSH_AUDIT_URL is empty, returns nil so
+// the page renders 503 — operators only see sessions once the
+// subscription is configured.
+//
+// Stream + subject are fixed to match ssh-proxyd's audit package
+// constants ("ssh_audit" / "ssh.audit.events"). TLS material reuses
+// the certd NATS env vars by default and falls through to
+// SSH_AUDIT-specific overrides for split-broker deployments.
+func openSSHAuditTracker(log *slog.Logger) (*portal.SessionTracker, error) {
+	url := envFirst("CERTD_SSH_AUDIT_URL", "CERTD_NATS_URL")
+	if os.Getenv("CERTD_SSH_AUDIT_URL") == "" && os.Getenv("CERTD_NATS_URL") == "" {
+		log.Warn("CERTD_SSH_AUDIT_URL unset — /portal/sessions disabled")
+		return nil, nil
+	}
+	tlsCfg, err := btls.FromFiles(
+		envFirst("CERTD_SSH_AUDIT_CERT", "CERTD_NATS_CERT"),
+		envFirst("CERTD_SSH_AUDIT_KEY", "CERTD_NATS_KEY"),
+		envFirst("CERTD_SSH_AUDIT_CA", "CERTD_NATS_CA", "CERTD_WORKLOAD_CA"),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("ssh-audit source TLS: %w", err)
+	}
+	source, err := jetstream.NewSource(jetstream.SourceConfig{
+		URL:        url,
+		StreamName: "ssh_audit",
+		Subject:    "ssh.audit.events",
+		TLS:        tlsCfg,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("ssh-audit source: %w", err)
+	}
+	tracker, err := portal.NewSessionTracker(portal.SessionTrackerConfig{
+		Source:       source,
+		SubjectLabel: "ssh.audit.events",
+		Log:          log,
+	})
+	if err != nil {
+		_ = source.Close()
+		return nil, err
+	}
+	log.Info("ssh-audit session tracker configured", "url", url)
+	return tracker, nil
 }
 
 // closeIfCloser invokes Close on resources that implement io.Closer,

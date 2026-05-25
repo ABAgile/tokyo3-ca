@@ -84,6 +84,16 @@ internal/
   unmounted (404). Per-page template sets keep page-specific
   `{{define "title"}}`/`{{define "body"}}` blocks from clobbering each
   other.
+- **Session list (live).** Set `CERTD_SSH_AUDIT_URL` (or rely on the
+  `CERTD_NATS_URL` fallback) and certd subscribes to ssh-proxyd's
+  `ssh_audit` stream, decoding each `recording.completed` event into a
+  bounded in-memory ring. `/portal/sessions` renders the recent
+  sessions (newest first) with user, target, remote login, duration,
+  and the cast file path. The asciinema-player embed is a follow-up
+  slice — for now operators see the metadata + on-disk path. The ring
+  caps at `DefaultMaxSessions` (200) so the page stays responsive
+  even after weeks of activity.
+
 - **Host registry viewer.** Set `CERTD_MTLS_PRINCIPALS_FILE` and the
   portal's `/portal/hosts` page lists every registered workload mTLS
   principal (SAN, name, group claims). Sorted by SAN for stable

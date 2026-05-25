@@ -94,6 +94,11 @@ type Config struct {
 	// HostStore powers the /hosts page (registered workload mTLS
 	// principals). When nil, /hosts returns 503.
 	HostStore HostStore
+
+	// SessionStore powers the /sessions page (recent recording.completed
+	// events on the ssh_audit JetStream stream). When nil, /sessions
+	// returns 503.
+	SessionStore SessionStore
 }
 
 // New parses the portal templates and returns a ready [Server].
@@ -143,6 +148,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /roles/{name}/edit", s.handleRoleUpdate)
 	mux.HandleFunc("POST /roles/{name}/delete", s.handleRoleDelete)
 	mux.HandleFunc("GET /hosts", s.handleHostsIndex)
+	mux.HandleFunc("GET /sessions", s.handleSessionsIndex)
 	return mux
 }
 
@@ -183,7 +189,7 @@ func (s *Server) landingPages() []pageEntry {
 	return []pageEntry{
 		{Name: "Roles", Path: "/roles", Description: "Role-table viewer: group → principals + host patterns", Status: status(s.cfg.RoleStore != nil)},
 		{Name: "Hosts", Path: "/hosts", Description: "Registered workload mTLS principals (SPIFFE / email SANs → group claims)", Status: status(s.cfg.HostStore != nil)},
-		{Name: "Sessions", Path: "/sessions", Description: "Session list + asciinema-player replay", Status: "planned"},
+		{Name: "Sessions", Path: "/sessions", Description: "Recent recording.completed events from ssh-proxyd", Status: status(s.cfg.SessionStore != nil)},
 		{Name: "Audit", Path: "/audit", Description: "Live audit-event viewer (NATS JetStream tail)", Status: "planned"},
 	}
 }
@@ -407,6 +413,25 @@ func (s *Server) handleHostsIndex(w http.ResponseWriter, _ *http.Request) {
 	})
 }
 
+// sessionsIndexData is the model for the sessions list page.
+type sessionsIndexData struct {
+	Version    string
+	RenderedAt time.Time
+	Sessions   []Session
+}
+
+func (s *Server) handleSessionsIndex(w http.ResponseWriter, _ *http.Request) {
+	if s.cfg.SessionStore == nil {
+		http.Error(w, "session store not configured", http.StatusServiceUnavailable)
+		return
+	}
+	s.render(w, "sessions", sessionsIndexData{
+		Version:    s.cfg.Version,
+		RenderedAt: s.cfg.Now(),
+		Sessions:   s.cfg.SessionStore.Sessions(),
+	})
+}
+
 // renderFormError re-renders the form with the user's input intact
 // plus an error banner. Centralized so create/edit share the same
 // error UX.
@@ -622,6 +647,7 @@ func parsePages() (map[string]*template.Template, error) {
 		"role_detail": roleDetailTemplate,
 		"role_form":   roleFormTemplate,
 		"hosts":       hostsTemplate,
+		"sessions":    sessionsTemplate,
 	}
 	out := make(map[string]*template.Template, len(pages))
 	for name, body := range pages {
@@ -831,5 +857,47 @@ every signing request that traverses the mTLS path.</p>
 </table>
 {{else}}
 <p><em>No hosts registered.</em></p>
+{{end}}
+{{end}}`
+
+const sessionsTemplate = `{{define "page"}}{{template "base" .}}{{end}}
+{{define "title"}}sessions{{end}}
+{{define "body"}}
+<p><a href="/">&larr; home</a></p>
+<h1>Sessions</h1>
+<p>Recent SSH sessions ssh-proxyd has finished recording. Hydrated
+from the <code>recording.completed</code> audit events on the
+<code>ssh_audit</code> JetStream stream — order is newest-first.
+asciinema-player embed lands in a follow-up slice; for now the
+RecordingPath column points at the cast file on the proxy's disk.</p>
+{{if .Sessions}}
+<table>
+<thead>
+<tr>
+  <th>Completed at</th>
+  <th>User</th>
+  <th>Target</th>
+  <th>Remote user</th>
+  <th>Duration</th>
+  <th>Recording</th>
+  <th>Session ID</th>
+</tr>
+</thead>
+<tbody>
+{{range .Sessions}}
+<tr>
+  <td>{{fmtTime .CompletedAt}}</td>
+  <td>{{if .User}}<code>{{.User}}</code>{{else}}<em>-</em>{{end}}</td>
+  <td>{{if .Target}}<code>{{.Target}}</code>{{else}}<em>-</em>{{end}}</td>
+  <td>{{if .RemoteUser}}<code>{{.RemoteUser}}</code>{{else}}<em>-</em>{{end}}</td>
+  <td>{{fmtDuration .Duration}}</td>
+  <td>{{if .RecordingPath}}<code>{{.RecordingPath}}</code>{{else}}<em>-</em>{{end}}</td>
+  <td><code>{{.SessionID}}</code></td>
+</tr>
+{{end}}
+</tbody>
+</table>
+{{else}}
+<p><em>No recorded sessions yet. Hold tight — recording.completed events arrive when ssh-proxyd finishes a PTY session.</em></p>
 {{end}}
 {{end}}`
