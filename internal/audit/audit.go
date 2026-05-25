@@ -50,6 +50,7 @@ const (
 	ActionSSHHostCertDenied      = "ssh.host_cert.denied"
 	ActionX509WorkloadCertSigned = "x509.workload_cert.signed"
 	ActionX509WorkloadCertDenied = "x509.workload_cert.denied"
+	ActionSSHCertRevoked         = "ssh.cert.revoked"
 )
 
 // Caller-identity prefix scheme used in [Entry.Caller]:

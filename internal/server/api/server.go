@@ -16,6 +16,7 @@ import (
 	"golang.org/x/crypto/ssh"
 
 	"github.com/abagile/tokyo3-ca/internal/audit"
+	"github.com/abagile/tokyo3-ca/internal/server/krl"
 	"github.com/abagile/tokyo3-ca/internal/server/mtls"
 	"github.com/abagile/tokyo3-ca/internal/server/oidc"
 	"github.com/abagile/tokyo3-ca/internal/server/policy"
@@ -35,6 +36,7 @@ type Server struct {
 	audit          audit.Sink         // JetStream publisher; NoopSink when CERTD_NATS_URL is unset.
 	auditSrc       journal.Source     // JetStream reader for the portal audit page; NoopSource when CERTD_NATS_URL is unset.
 	portal         *portal.Server     // Admin web UI; nil disables /portal/* routes.
+	krl            krl.Store          // Revocation registry; nil disables /api/v1/ssh/revoke + /revocations.
 	version        string             // build-time version string, surfaced in /healthz; empty allowed.
 }
 
@@ -84,6 +86,12 @@ type Config struct {
 	// are not mounted (the API surface still works without a portal —
 	// useful for headless certd deployments).
 	Portal *portal.Server
+	// KRL is the SSH cert revocation store. When non-nil, the
+	// /api/v1/ssh/revoke + /api/v1/ssh/revocations endpoints are
+	// mounted; otherwise they return 503. The same store should be
+	// passed to ssh-proxyd so its IsRevoked callback uses the
+	// authoritative set.
+	KRL krl.Store
 	// Version is the build-time semver / commit identifier surfaced in
 	// /healthz. Empty acceptable but discouraged in deployed builds.
 	Version string
@@ -116,6 +124,7 @@ func New(cfg Config) (*Server, error) {
 		audit:          auditSink,
 		auditSrc:       auditSrc,
 		portal:         cfg.Portal,
+		krl:            cfg.KRL,
 		version:        cfg.Version,
 	}, nil
 }
@@ -131,6 +140,8 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /api/v1/ssh/sign-user", s.handleSignUserCert)
 	mux.HandleFunc("POST /api/v1/ssh/sign-host", s.handleSignHostCert)
 	mux.HandleFunc("POST /api/v1/x509/sign-workload", s.handleSignX509WorkloadCert)
+	mux.HandleFunc("POST /api/v1/ssh/revoke", s.handleRevoke)
+	mux.HandleFunc("GET /api/v1/ssh/revocations", s.handleRevocations)
 	if s.portal != nil {
 		mux.Handle("/portal/", http.StripPrefix("/portal", s.portal.Routes()))
 	}

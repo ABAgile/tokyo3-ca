@@ -143,6 +143,7 @@ import (
 
 	"github.com/abagile/tokyo3-ca/internal/audit"
 	"github.com/abagile/tokyo3-ca/internal/server/api"
+	"github.com/abagile/tokyo3-ca/internal/server/krl"
 	"github.com/abagile/tokyo3-ca/internal/server/mtls"
 	"github.com/abagile/tokyo3-ca/internal/server/oidc"
 	"github.com/abagile/tokyo3-ca/internal/server/policy"
@@ -278,6 +279,9 @@ func runServe(ctx context.Context) error {
 		return fmt.Errorf("cast store: %w", err)
 	}
 
+	krlStore := krl.NewInMemoryStore()
+	log.Info("revocation store ready (in-memory)")
+
 	portalSrv, err := portal.New(portal.Config{
 		Version:      Version,
 		Log:          log,
@@ -301,6 +305,7 @@ func runServe(ctx context.Context) error {
 		Audit:          auditSink,
 		AuditSource:    auditSrc,
 		Portal:         portalSrv,
+		KRL:            krlStore,
 		Version:        Version,
 	})
 	if err != nil {

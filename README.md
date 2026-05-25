@@ -84,6 +84,16 @@ internal/
   unmounted (404). Per-page template sets keep page-specific
   `{{define "title"}}`/`{{define "body"}}` blocks from clobbering each
   other.
+- **Cert revocation.** `POST /api/v1/ssh/revoke` records a cert as
+  revoked by serial or KeyID (authenticated via the same OIDC/mTLS
+  paths the sign endpoints use); the entry persists in
+  `krl.InMemoryStore` until certd restarts. `GET /api/v1/ssh/revocations`
+  returns the snapshot as JSON for consumers (ssh-proxyd polls this
+  to populate its `IsRevoked` callback in a follow-up slice).
+  Revoke calls emit `ssh.cert.revoked` audit events so the portal
+  audit tail surfaces them. Re-revoking an entry is idempotent and
+  overwrites the Reason/Revoker annotation.
+
 - **Audit viewer (live, multi-stream).** `portal.AuditTracker`
   subscribes to N audit streams concurrently and normalizes each
   event into a common `AuditEvent` shape — both ssh-proxy's
