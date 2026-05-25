@@ -163,7 +163,7 @@ func TestRenewer_SignOnce_GeneratesKeyAndWritesCert(t *testing.T) {
 	// No leftover .tmp files.
 	ents, _ := os.ReadDir(dir)
 	for _, e := range ents {
-		if strings.HasPrefix(e.Name(), ".renew-") {
+		if strings.HasPrefix(e.Name(), ".write-atomic-") {
 			t.Errorf("leftover temp file: %s", e.Name())
 		}
 	}

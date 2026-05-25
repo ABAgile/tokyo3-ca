@@ -21,10 +21,10 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"path/filepath"
 	"sync"
 	"time"
 
+	"github.com/abagile/tokyo3-ca/internal/agent/output"
 	"github.com/abagile/tokyo3-ca/internal/client"
 )
 
@@ -176,7 +176,7 @@ func (r *Renewer) SignOnce(ctx context.Context) (validAfter, validBefore time.Ti
 		return time.Time{}, time.Time{}, errors.New("certd returned empty certificate")
 	}
 
-	if err := writeAtomic(r.cfg.CertOutputPath, []byte(resp.Certificate), 0o644); err != nil {
+	if err := output.WriteAtomic(r.cfg.CertOutputPath, []byte(resp.Certificate), 0o644); err != nil {
 		return time.Time{}, time.Time{}, fmt.Errorf("write cert: %w", err)
 	}
 	r.cfg.Log.Info("workload cert renewed",
@@ -262,7 +262,7 @@ func (r *Renewer) ensureKey() (*ecdsa.PrivateKey, error) {
 	if err != nil {
 		return nil, fmt.Errorf("marshal generated key: %w", err)
 	}
-	if err := writeAtomic(r.cfg.KeyOutputPath, pemBytes, 0o600); err != nil {
+	if err := output.WriteAtomic(r.cfg.KeyOutputPath, pemBytes, 0o600); err != nil {
 		return nil, fmt.Errorf("write key %s: %w", r.cfg.KeyOutputPath, err)
 	}
 	r.cfg.Log.Info("workload private key generated", "path", r.cfg.KeyOutputPath)
@@ -307,41 +307,4 @@ func parsePrivateKeyPEM(b []byte) (*ecdsa.PrivateKey, error) {
 		return nil, fmt.Errorf("unsupported key type %T (expected ECDSA)", key)
 	}
 	return ec, nil
-}
-
-// writeAtomic writes b to path via a temp file + rename so partial
-// writes are never observable by readers. The temp file lives in the
-// same directory to guarantee rename(2) atomicity.
-func writeAtomic(path string, b []byte, mode os.FileMode) error {
-	dir := filepath.Dir(path)
-	tmp, err := os.CreateTemp(dir, ".renew-*.tmp")
-	if err != nil {
-		return err
-	}
-	tmpName := tmp.Name()
-	cleanup := func() { _ = os.Remove(tmpName) }
-	if _, err := tmp.Write(b); err != nil {
-		_ = tmp.Close()
-		cleanup()
-		return err
-	}
-	if err := tmp.Chmod(mode); err != nil {
-		_ = tmp.Close()
-		cleanup()
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
-		cleanup()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		cleanup()
-		return err
-	}
-	if err := os.Rename(tmpName, path); err != nil {
-		cleanup()
-		return err
-	}
-	return nil
 }
