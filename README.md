@@ -143,10 +143,14 @@ internal/
   create/edit/delete forms at `/portal/roles/new` and
   `/portal/roles/{name}/edit|delete`. Writes mutate the in-memory
   store and survive only until restart unless externally persisted.
-  **The CRUD-write routes have no CSRF protection yet** — mounting
-  the portal unauthenticated exposes the role table to cross-site
-  forgery. Production deployments need to gate `/portal/*` behind
-  OIDC + session-bound CSRF tokens before enabling writes.
+  CSRF protection on every POST: each GET sets a `certd_csrf`
+  cookie (256 bits of entropy, `SameSite=Lax`, `Secure` over HTTPS)
+  and the rendered form embeds the matching value as a hidden
+  input. POST handlers reject any submission whose cookie + field
+  don't match (constant-time compare). The portal still needs an
+  authentication gate before production — front it with
+  oauth2-proxy or similar — but cross-site forgery against the
+  mutation surface is closed.
 
 ## License
 

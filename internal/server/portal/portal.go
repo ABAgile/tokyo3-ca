@@ -262,6 +262,7 @@ type roleDetailData struct {
 	Name       string
 	Role       policy.Role
 	Found      bool
+	CSRFToken  string // for the inline delete form
 }
 
 func (s *Server) handleRoleDetail(w http.ResponseWriter, r *http.Request) {
@@ -274,6 +275,7 @@ func (s *Server) handleRoleDetail(w http.ResponseWriter, r *http.Request) {
 		Version:    s.cfg.Version,
 		RenderedAt: s.cfg.Now(),
 		Name:       name,
+		CSRFToken:  ensureCSRFToken(w, r),
 	}
 	for _, role := range s.cfg.RoleStore.All() {
 		if role.Name == name {
@@ -299,6 +301,7 @@ type roleFormData struct {
 	FormAction string
 	Submit     string // submit-button label
 	Error      string // validation error to surface above the form
+	CSRFToken  string // double-submit-cookie value embedded as a hidden input
 
 	// Editing an existing role: OriginalName is the lookup key; Form
 	// is the values to render in inputs.
@@ -321,7 +324,7 @@ type roleFormFields struct {
 	DefaultExtensions string // "key=value" per line; empty value renders as bare "key"
 }
 
-func (s *Server) handleRoleNewForm(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) handleRoleNewForm(w http.ResponseWriter, r *http.Request) {
 	if s.mutableStore() == nil {
 		http.Error(w, "role store is read-only", http.StatusMethodNotAllowed)
 		return
@@ -332,6 +335,7 @@ func (s *Server) handleRoleNewForm(w http.ResponseWriter, _ *http.Request) {
 		Mode:       "create",
 		FormAction: "/roles/new",
 		Submit:     "Create role",
+		CSRFToken:  ensureCSRFToken(w, r),
 	})
 }
 
@@ -341,13 +345,21 @@ func (s *Server) handleRoleCreate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "role store is read-only", http.StatusMethodNotAllowed)
 		return
 	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "parse form: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if !validateCSRF(r) {
+		http.Error(w, "session expired or forged request — reload the page and try again", http.StatusForbidden)
+		return
+	}
 	role, fields, err := parseRoleForm(r)
 	if err != nil {
-		s.renderFormError(w, "create", "/roles/new", "Create role", "", fields, err)
+		s.renderFormError(w, r, "create", "/roles/new", "Create role", "", fields, err)
 		return
 	}
 	if err := store.Add(role); err != nil {
-		s.renderFormError(w, "create", "/roles/new", "Create role", "", fields, err)
+		s.renderFormError(w, r, "create", "/roles/new", "Create role", "", fields, err)
 		return
 	}
 	s.cfg.Log.Info("portal: role created", "name", role.Name)
@@ -374,6 +386,7 @@ func (s *Server) handleRoleEditForm(w http.ResponseWriter, r *http.Request) {
 		Submit:       "Save changes",
 		OriginalName: name,
 		Form:         roleToForm(role),
+		CSRFToken:    ensureCSRFToken(w, r),
 	})
 }
 
@@ -383,14 +396,22 @@ func (s *Server) handleRoleUpdate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "role store is read-only", http.StatusMethodNotAllowed)
 		return
 	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "parse form: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if !validateCSRF(r) {
+		http.Error(w, "session expired or forged request — reload the page and try again", http.StatusForbidden)
+		return
+	}
 	oldName := r.PathValue("name")
 	role, fields, err := parseRoleForm(r)
 	if err != nil {
-		s.renderFormError(w, "edit", "/roles/"+oldName+"/edit", "Save changes", oldName, fields, err)
+		s.renderFormError(w, r, "edit", "/roles/"+oldName+"/edit", "Save changes", oldName, fields, err)
 		return
 	}
 	if err := store.Replace(oldName, role); err != nil {
-		s.renderFormError(w, "edit", "/roles/"+oldName+"/edit", "Save changes", oldName, fields, err)
+		s.renderFormError(w, r, "edit", "/roles/"+oldName+"/edit", "Save changes", oldName, fields, err)
 		return
 	}
 	s.cfg.Log.Info("portal: role updated", "old_name", oldName, "name", role.Name)
@@ -401,6 +422,14 @@ func (s *Server) handleRoleDelete(w http.ResponseWriter, r *http.Request) {
 	store := s.mutableStore()
 	if store == nil {
 		http.Error(w, "role store is read-only", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "parse form: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if !validateCSRF(r) {
+		http.Error(w, "session expired or forged request — reload the page and try again", http.StatusForbidden)
 		return
 	}
 	name := r.PathValue("name")
@@ -567,12 +596,13 @@ type revocationsIndexData struct {
 	RenderedAt time.Time
 	Entries    []krl.Revocation
 	Error      string
+	CSRFToken  string
 	FormSerial string
 	FormKeyID  string
 	FormReason string
 }
 
-func (s *Server) handleRevocationsIndex(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) handleRevocationsIndex(w http.ResponseWriter, r *http.Request) {
 	if s.cfg.RevocationStore == nil {
 		http.Error(w, "revocation store not configured", http.StatusServiceUnavailable)
 		return
@@ -581,6 +611,7 @@ func (s *Server) handleRevocationsIndex(w http.ResponseWriter, _ *http.Request) 
 		Version:    s.cfg.Version,
 		RenderedAt: s.cfg.Now(),
 		Entries:    s.cfg.RevocationStore.Snapshot().Entries,
+		CSRFToken:  ensureCSRFToken(w, r),
 	})
 }
 
@@ -593,6 +624,10 @@ func (s *Server) handleRevocationsCreate(w http.ResponseWriter, r *http.Request)
 		http.Error(w, "parse form: "+err.Error(), http.StatusBadRequest)
 		return
 	}
+	if !validateCSRF(r) {
+		http.Error(w, "session expired or forged request — reload the page and try again", http.StatusForbidden)
+		return
+	}
 	rawSerial := strings.TrimSpace(r.PostForm.Get("serial"))
 	keyID := strings.TrimSpace(r.PostForm.Get("key_id"))
 	reason := strings.TrimSpace(r.PostForm.Get("reason"))
@@ -601,14 +636,14 @@ func (s *Server) handleRevocationsCreate(w http.ResponseWriter, r *http.Request)
 	if rawSerial != "" {
 		n, err := parseUint64(rawSerial)
 		if err != nil {
-			s.renderRevocationError(w, "serial "+rawSerial+" is not a valid unsigned integer",
+			s.renderRevocationError(w, r, "serial "+rawSerial+" is not a valid unsigned integer",
 				rawSerial, keyID, reason)
 			return
 		}
 		serial = n
 	}
 	if serial == 0 && keyID == "" {
-		s.renderRevocationError(w, "serial or key_id is required",
+		s.renderRevocationError(w, r, "serial or key_id is required",
 			rawSerial, keyID, reason)
 		return
 	}
@@ -618,20 +653,21 @@ func (s *Server) handleRevocationsCreate(w http.ResponseWriter, r *http.Request)
 		Reason:  reason,
 		Revoker: "portal",
 	}); err != nil {
-		s.renderRevocationError(w, err.Error(), rawSerial, keyID, reason)
+		s.renderRevocationError(w, r, err.Error(), rawSerial, keyID, reason)
 		return
 	}
 	s.cfg.Log.Info("portal: cert revoked", "serial", serial, "key_id", keyID, "reason", reason)
 	http.Redirect(w, r, "/revocations", http.StatusSeeOther)
 }
 
-func (s *Server) renderRevocationError(w http.ResponseWriter, msg, serial, keyID, reason string) {
+func (s *Server) renderRevocationError(w http.ResponseWriter, r *http.Request, msg, serial, keyID, reason string) {
 	w.WriteHeader(http.StatusBadRequest)
 	s.render(w, "revocations", revocationsIndexData{
 		Version:    s.cfg.Version,
 		RenderedAt: s.cfg.Now(),
 		Entries:    s.cfg.RevocationStore.Snapshot().Entries,
 		Error:      msg,
+		CSRFToken:  ensureCSRFToken(w, r),
 		FormSerial: serial,
 		FormKeyID:  keyID,
 		FormReason: reason,
@@ -677,8 +713,10 @@ func (s *Server) handleAuditIndex(w http.ResponseWriter, _ *http.Request) {
 
 // renderFormError re-renders the form with the user's input intact
 // plus an error banner. Centralized so create/edit share the same
-// error UX.
-func (s *Server) renderFormError(w http.ResponseWriter, mode, action, submit, originalName string, fields roleFormFields, err error) {
+// error UX. The CSRF token is sourced from the existing cookie (the
+// browser carries it across the failing POST + the re-render), so
+// the user can re-submit without reloading.
+func (s *Server) renderFormError(w http.ResponseWriter, r *http.Request, mode, action, submit, originalName string, fields roleFormFields, err error) {
 	w.WriteHeader(http.StatusBadRequest)
 	s.render(w, "role_form", roleFormData{
 		Version:      s.cfg.Version,
@@ -689,6 +727,7 @@ func (s *Server) renderFormError(w http.ResponseWriter, mode, action, submit, or
 		Error:        err.Error(),
 		OriginalName: originalName,
 		Form:         fields,
+		CSRFToken:    ensureCSRFToken(w, r),
 	})
 }
 
@@ -1009,6 +1048,7 @@ const roleDetailTemplate = `{{define "page"}}{{template "base" .}}{{end}}
 <p>
   <a href="/roles/{{.Role.Name}}/edit">Edit</a> ·
   <form method="post" action="/roles/{{.Role.Name}}/delete" style="display:inline" onsubmit="return confirm('Delete role {{.Role.Name}}?');">
+    <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
     <button type="submit" class="link-button">Delete</button>
   </form>
 </p>
@@ -1042,6 +1082,7 @@ const roleFormTemplate = `{{define "page"}}{{template "base" .}}{{end}}
 <h1>{{if eq .Mode "create"}}New role{{else}}Edit role: {{.OriginalName}}{{end}}</h1>
 {{if .Error}}<div class="error">{{.Error}}</div>{{end}}
 <form method="post" action="{{.FormAction}}">
+  <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
   <label>Name
     <input type="text" name="name" value="{{.Form.Name}}" required autocomplete="off">
   </label>
@@ -1243,6 +1284,7 @@ of which field a consumer keys on.</p>
 <h2>Revoke a cert</h2>
 {{if .Error}}<div class="error">{{.Error}}</div>{{end}}
 <form method="post" action="/revocations">
+  <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
   <label>Serial (decimal; leave blank if revoking by Key ID only)
     <input type="text" name="serial" value="{{.FormSerial}}" autocomplete="off">
   </label>

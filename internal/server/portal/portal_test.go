@@ -1,6 +1,7 @@
 package portal_test
 
 import (
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -36,16 +37,62 @@ func newClient() *http.Client {
 	}
 }
 
-func postForm(t *testing.T, url string, form url.Values) *http.Response {
+// postForm runs a GET against the form's typical entry page to
+// acquire a CSRF cookie + token, then submits the POST with the
+// matching csrf_token field + cookie. Tests calling postForm don't
+// need to know about the CSRF wiring — adding a new POST route's
+// happy path keeps working.
+func postForm(t *testing.T, postURL string, form url.Values) *http.Response {
 	t.Helper()
-	req, err := http.NewRequest(http.MethodPost, url, strings.NewReader(form.Encode()))
+	client := newClient()
+
+	// The GET page corresponding to this POST. /edit + /delete map
+	// to the detail page (/roles/{name}); /new and /revocations use
+	// the same URL for both methods (the form is rendered on the
+	// page the POST targets). Strip only the read-on-different-URL
+	// suffixes so /roles/{name}/edit and /roles/{name}/delete both
+	// hit /roles/{name} (which now sets a CSRF cookie).
+	getURL := postURL
+	for _, suffix := range []string{"/edit", "/delete"} {
+		if strings.HasSuffix(getURL, suffix) {
+			getURL = strings.TrimSuffix(getURL, suffix)
+			break
+		}
+	}
+	getResp, err := client.Get(getURL)
+	if err != nil {
+		t.Fatalf("CSRF prefetch GET %s: %v", getURL, err)
+	}
+	defer getResp.Body.Close()
+	_, _ = io.Copy(io.Discard, getResp.Body)
+
+	var token string
+	for _, c := range getResp.Cookies() {
+		if c.Name == "certd_csrf" {
+			token = c.Value
+		}
+	}
+	if token == "" {
+		t.Fatalf("CSRF prefetch returned no cookie for %s", getURL)
+	}
+	// Insert the token into the form. Caller-supplied values win
+	// (for tests that want to deliberately submit a bad token).
+	if _, present := form["csrf_token"]; !present {
+		if form == nil {
+			form = url.Values{}
+		}
+		form.Set("csrf_token", token)
+	}
+
+	req, err := http.NewRequest(http.MethodPost, postURL, strings.NewReader(form.Encode()))
 	if err != nil {
 		t.Fatalf("build request: %v", err)
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	resp, err := newClient().Do(req)
+	req.AddCookie(&http.Cookie{Name: "certd_csrf", Value: token})
+	resp, err := client.Do(req)
 	if err != nil {
-		t.Fatalf("POST %s: %v", url, err)
+		t.Fatalf("POST %s: %v", postURL, err)
 	}
 	return resp
 }
