@@ -14,6 +14,31 @@ This repo ships two binaries:
 | `cert-agentd` | Per-workload credential agent. Renews SPIFFE X.509 + optional SSH user certs from `certd`.   |
 
 
+## Status
+
+**Production-shape, with the documented caveats.** `certd serve`
+exposes the full HTTP API (SSH user / host / X.509 sign + revoke +
+revocations + KRL spec), runs OIDC and mTLS caller auth, applies
+role-table policy, publishes audit to NATS JetStream, and serves
+the admin portal (roles CRUD, hosts list, sessions + asciinema
+replay, audit tail, revocations). `cert-agentd run` renews the
+workload X.509 cert at 60% TTL with KMS-style abstraction
+support, and optionally renews an SSH user cert + writes an
+ssh_config drop-in.
+
+Phase 7 hardening landed:
+[THREAT_MODEL.md](THREAT_MODEL.md) (per-surface threats +
+mitigations), [OPERATIONS.md](OPERATIONS.md) (deploy/scenario
+runbooks), benchmark suite (`go test -bench=. -benchmem ./...`),
+CSRF + HTTP Basic auth gates on the portal, and a remote-signer
+abstraction operators wire KMS adapters against.
+
+Operational caveats are tracked in [OPERATIONS.md §6](OPERATIONS.md):
+in-memory role / mTLS-principal / revocation stores (no
+hot-reload, no persistence yet), portal session ring caps at 200,
+no per-org rate limiting at the API edge.
+
+
 ## Requirements
 
 - Go 1.26.3+
