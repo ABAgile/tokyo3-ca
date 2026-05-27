@@ -147,10 +147,24 @@ to certd. The renewer takes over from there:
 ### What happens when certd is unreachable
 
 The renewer logs at warn and schedules a retry per
-`renew.DefaultRetryBackoff` (30s). The previously-issued cert
-keeps serving until expiry. Operators should alert when
-`cert-agentd`'s structured logs surface "sign workload cert"
-errors for more than ~60% of the cert's TTL.
+`renew.DefaultRetryBackoff` (30s, fixed interval — not exponential).
+The previously-issued cert keeps serving until expiry. Operators
+should alert when `cert-agentd`'s structured logs surface "sign
+workload cert" errors for more than ~60% of the cert's TTL.
+
+Each retry-log line carries `mtls_cert_remaining=<duration>` — the
+time left on the mTLS material the agent currently presents to certd.
+When this number drops to zero before a renewal succeeds, every
+subsequent retry fails at the TLS handshake itself and the agent
+can no longer recover without operator intervention (replace the
+on-disk cert+key manually, then restart). Alert thresholds should
+fire well before `mtls_cert_remaining` reaches zero.
+
+At startup, if the loaded mTLS cert is within 24h of expiry, the
+agent emits a one-shot warn:
+`bootstrap mTLS cert near expiry — first renewal must succeed before it dies`.
+This is the earliest signal that a long certd outage could leave
+the agent unable to recover.
 
 ### When to restart cert-agentd
 

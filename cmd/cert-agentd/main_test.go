@@ -75,6 +75,25 @@ func TestCertReloader_LoadsInitialPair(t *testing.T) {
 	}
 }
 
+func TestCertReloader_LeafExpiry(t *testing.T) {
+	dir := t.TempDir()
+	certPath := filepath.Join(dir, "c.pem")
+	keyPath := filepath.Join(dir, "k.pem")
+	writePEMCertKey(t, certPath, keyPath, "initial", 1)
+
+	r, err := newCertReloader(certPath, keyPath)
+	if err != nil {
+		t.Fatalf("newCertReloader: %v", err)
+	}
+	exp := r.LeafExpiry()
+	// writePEMCertKey sets NotAfter to now+1h; allow a wide window
+	// for slow CI without losing the assertion's intent.
+	remaining := time.Until(exp)
+	if remaining < 30*time.Minute || remaining > 90*time.Minute {
+		t.Errorf("LeafExpiry remaining = %v, want ~1h", remaining)
+	}
+}
+
 func TestCertReloader_RefreshPicksUpNewCert(t *testing.T) {
 	dir := t.TempDir()
 	certPath := filepath.Join(dir, "c.pem")

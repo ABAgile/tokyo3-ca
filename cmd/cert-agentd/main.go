@@ -152,6 +152,18 @@ func runAgent(ctx context.Context) error {
 	log.Info("certd client configured", "url", certdURL,
 		"bootstrap_cert", certPath, "bootstrap_key", keyPath)
 
+	// Surface the bootstrap mTLS cert's remaining validity. If it's
+	// close to expiry, the first renewal MUST succeed before it dies
+	// — once dead, every retry fails at TLS handshake and the agent
+	// can't recover without operator intervention. Threshold is
+	// deliberately broad (24h) to give ops one warn-level signal
+	// before the silent failure window opens.
+	if remaining := time.Until(reloader.LeafExpiry()); !reloader.LeafExpiry().IsZero() && remaining < 24*time.Hour {
+		log.Warn("bootstrap mTLS cert near expiry — first renewal must succeed before it dies",
+			"remaining", remaining.Round(time.Second),
+			"not_after", reloader.LeafExpiry())
+	}
+
 	var ttl time.Duration
 	if v := os.Getenv("CERT_AGENTD_TTL_SECONDS"); v != "" {
 		n, err := strconv.ParseInt(v, 10, 64)
@@ -175,6 +187,13 @@ func runAgent(ctx context.Context) error {
 			}
 			log.Info("workload cert installed for mTLS",
 				"valid_after", validAfter, "valid_before", validBefore)
+		},
+		SignErrorAttrs: func() []any {
+			exp := reloader.LeafExpiry()
+			if exp.IsZero() {
+				return nil
+			}
+			return []any{"mtls_cert_remaining", time.Until(exp).Round(time.Second)}
 		},
 		Log: log,
 	})
@@ -335,6 +354,7 @@ type certReloader struct {
 	certPath, keyPath string
 	mu                sync.RWMutex
 	cert              *tls.Certificate
+	notAfter          time.Time // cached from cert.Leaf so callers don't reparse on every read
 }
 
 func newCertReloader(certPath, keyPath string) (*certReloader, error) {
@@ -347,16 +367,36 @@ func newCertReloader(certPath, keyPath string) (*certReloader, error) {
 
 // Refresh re-reads the cert+key from disk and atomically replaces
 // the holder. Called from renewer.OnRenewed after each successful
-// renewal.
+// renewal. Parses the leaf cert so [certReloader.LeafExpiry] can
+// surface expiry to operators without reparsing per-handshake.
 func (r *certReloader) Refresh() error {
 	cert, err := tls.LoadX509KeyPair(r.certPath, r.keyPath)
 	if err != nil {
 		return fmt.Errorf("load %s/%s: %w", r.certPath, r.keyPath, err)
 	}
+	if len(cert.Certificate) > 0 {
+		leaf, err := x509.ParseCertificate(cert.Certificate[0])
+		if err != nil {
+			return fmt.Errorf("parse leaf %s: %w", r.certPath, err)
+		}
+		cert.Leaf = leaf
+	}
 	r.mu.Lock()
 	r.cert = &cert
+	if cert.Leaf != nil {
+		r.notAfter = cert.Leaf.NotAfter
+	}
 	r.mu.Unlock()
 	return nil
+}
+
+// LeafExpiry returns the loaded cert's NotAfter. Zero value when no
+// cert is loaded yet (which the Refresh path treats as a fatal
+// startup error, so the zero only appears in test scaffolding).
+func (r *certReloader) LeafExpiry() time.Time {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.notAfter
 }
 
 // GetClientCertificate satisfies the tls.Config callback signature.
