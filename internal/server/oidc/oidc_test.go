@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -270,6 +271,142 @@ func TestHTTPVerifier_IssuerAudienceAccessors(t *testing.T) {
 	}
 	if got := ver.Audience(); got != "certd" {
 		t.Errorf("Audience() = %q, want %q", got, "certd")
+	}
+}
+
+// ── LazyVerifier tests ────────────────────────────────────────────────────────
+
+func TestNewLazyHTTPVerifier_RejectsEmptyArgs(t *testing.T) {
+	if _, err := oidc.NewLazyHTTPVerifier("", "audience"); err == nil ||
+		!strings.Contains(err.Error(), "issuer") {
+		t.Errorf("empty issuer: err = %v, want 'issuer' message", err)
+	}
+	if _, err := oidc.NewLazyHTTPVerifier("https://example.com", ""); err == nil ||
+		!strings.Contains(err.Error(), "audience") {
+		t.Errorf("empty audience: err = %v, want 'audience' message", err)
+	}
+}
+
+func TestNewLazyHTTPVerifier_NoDialOnConstruction(t *testing.T) {
+	// Point the lazy verifier at an issuer that is unreachable.
+	// Construction must succeed regardless — the whole point is
+	// that certd boots even when authd is down.
+	if _, err := oidc.NewLazyHTTPVerifier("http://127.0.0.1:1", "certd"); err != nil {
+		t.Fatalf("construction must not error on unreachable issuer: %v", err)
+	}
+}
+
+func TestLazyVerifier_DiscoveryDeferredUntilFirstVerify(t *testing.T) {
+	var discoveryHits int32
+	fi := newCountingIssuer(t, &discoveryHits, nil)
+
+	ver, err := oidc.NewLazyHTTPVerifier(fi.issuer, "certd")
+	if err != nil {
+		t.Fatalf("NewLazyHTTPVerifier: %v", err)
+	}
+	if got := atomic.LoadInt32(&discoveryHits); got != 0 {
+		t.Fatalf("discovery hit on construction: %d, want 0", got)
+	}
+
+	now := time.Now().Unix()
+	tok := fi.signToken(t, map[string]any{
+		"iss": fi.issuer,
+		"aud": "certd",
+		"sub": "user-uuid-123",
+		"iat": now,
+		"exp": now + 300,
+	})
+
+	if _, err := ver.Verify(context.Background(), tok); err != nil {
+		t.Fatalf("first Verify: %v", err)
+	}
+	if got := atomic.LoadInt32(&discoveryHits); got != 1 {
+		t.Fatalf("discovery hits after first Verify: %d, want 1", got)
+	}
+
+	// Second Verify reuses the cached verifier — no new discovery.
+	if _, err := ver.Verify(context.Background(), tok); err != nil {
+		t.Fatalf("second Verify: %v", err)
+	}
+	if got := atomic.LoadInt32(&discoveryHits); got != 1 {
+		t.Fatalf("discovery hits after second Verify: %d, want 1 (cached)", got)
+	}
+}
+
+// newCountingIssuer is a fakeIssuer variant whose discovery endpoint
+// increments hits on every call. If shouldFail is non-nil and returns
+// true, the hit responds with 503 instead of the real discovery doc —
+// used to simulate authd being unreachable.
+func newCountingIssuer(t *testing.T, hits *int32, shouldFail func() bool) *fakeIssuer {
+	t.Helper()
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("rsa keygen: %v", err)
+	}
+	fi := &fakeIssuer{priv: priv, kid: "test-key-1"}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(hits, 1)
+		if shouldFail != nil && shouldFail() {
+			http.Error(w, "issuer unreachable", http.StatusServiceUnavailable)
+			return
+		}
+		fi.handleDiscovery(w, r)
+	})
+	mux.HandleFunc("/.well-known/jwks.json", fi.handleJWKS)
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	fi.server = srv
+	fi.issuer = srv.URL
+	fi.jwksURL = srv.URL + "/.well-known/jwks.json"
+	return fi
+}
+
+func TestLazyVerifier_DiscoveryFailureRetriesOnNextCall(t *testing.T) {
+	// Issuer endpoint returns 503 until failFirst flips false —
+	// models authd coming up after certd has already booted.
+	var hits int32
+	failFirst := int32(1)
+	fi := newCountingIssuer(t, &hits, func() bool {
+		return atomic.LoadInt32(&failFirst) == 1
+	})
+
+	ver, err := oidc.NewLazyHTTPVerifier(fi.issuer, "certd")
+	if err != nil {
+		t.Fatalf("NewLazyHTTPVerifier: %v", err)
+	}
+
+	now := time.Now().Unix()
+	tok := fi.signToken(t, map[string]any{
+		"iss": fi.issuer,
+		"aud": "certd",
+		"sub": "u",
+		"iat": now,
+		"exp": now + 300,
+	})
+
+	if _, err := ver.Verify(context.Background(), tok); err == nil {
+		t.Fatal("first Verify must fail while issuer returns 503")
+	}
+
+	// Issuer recovers. Next call must retry discovery (failure was
+	// not memoised) and succeed.
+	atomic.StoreInt32(&failFirst, 0)
+	if _, err := ver.Verify(context.Background(), tok); err != nil {
+		t.Fatalf("second Verify after issuer recovered: %v", err)
+	}
+}
+
+func TestLazyVerifier_IssuerAudienceAccessors(t *testing.T) {
+	ver, err := oidc.NewLazyHTTPVerifier("https://auth.example.com", "certd")
+	if err != nil {
+		t.Fatalf("NewLazyHTTPVerifier: %v", err)
+	}
+	if got := ver.Issuer(); got != "https://auth.example.com" {
+		t.Errorf("Issuer() = %q", got)
+	}
+	if got := ver.Audience(); got != "certd" {
+		t.Errorf("Audience() = %q", got)
 	}
 }
 

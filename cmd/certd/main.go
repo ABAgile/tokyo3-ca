@@ -478,7 +478,13 @@ func loadCASigner(log *slog.Logger) (signer.Signer, error) {
 // when CERTD_OIDC_ISSUER + CERTD_OIDC_AUDIENCE are both set. Either
 // alone is an error (asymmetric config), and both unset returns nil
 // (no OIDC — sign endpoints fall back to body groups).
-func loadOIDCVerifier(ctx context.Context, log *slog.Logger) (oidc.TokenVerifier, error) {
+//
+// The returned verifier is lazy: OIDC discovery + JWKS fetch is
+// deferred to the first sign request, so certd's bootstrap does not
+// block on authd's reachability. A transient authd outage at boot
+// surfaces as a 401 on the first sign request and self-heals when
+// authd comes back.
+func loadOIDCVerifier(_ context.Context, log *slog.Logger) (oidc.TokenVerifier, error) {
 	issuer := os.Getenv("CERTD_OIDC_ISSUER")
 	audience := os.Getenv("CERTD_OIDC_AUDIENCE")
 	if issuer == "" && audience == "" {
@@ -488,11 +494,11 @@ func loadOIDCVerifier(ctx context.Context, log *slog.Logger) (oidc.TokenVerifier
 	if issuer == "" || audience == "" {
 		return nil, fmt.Errorf("CERTD_OIDC_ISSUER and CERTD_OIDC_AUDIENCE must both be set or both unset")
 	}
-	v, err := oidc.NewHTTPVerifier(ctx, issuer, audience)
+	v, err := oidc.NewLazyHTTPVerifier(issuer, audience)
 	if err != nil {
 		return nil, err
 	}
-	log.Info("oidc verifier ready", "issuer", issuer, "audience", audience)
+	log.Info("oidc verifier configured (lazy)", "issuer", issuer, "audience", audience)
 	return v, nil
 }
 

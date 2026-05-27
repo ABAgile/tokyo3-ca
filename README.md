@@ -117,6 +117,12 @@ internal/
 - **Authorization**: `authd` issues OIDC tokens with a `groups` claim; certd's
   role table maps groups to allowed Unix principals + host patterns; the cert
   carries those as extensions; ssh-proxyd enforces what the cert says.
+- **Lazy OIDC discovery.** certd's OIDC verifier defers issuer
+  discovery + JWKS fetch to the first sign request, so certd boots
+  even when authd is unreachable. A transient authd outage at start
+  surfaces as a 401 on the first sign request and self-heals on the
+  next call once authd is up — no startup ordering required between
+  the two daemons, no cyclic dependency.
 - **Single agent** `cert-agentd` is the unified workload credential
   agent — one workload identity, multiple credential outputs (SPIFFE X.509 +
   optional SSH user cert).

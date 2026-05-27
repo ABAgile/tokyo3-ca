@@ -14,6 +14,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 
 	goidc "github.com/coreos/go-oidc/v3/oidc"
 )
@@ -109,3 +110,61 @@ func (v *HTTPVerifier) Verify(ctx context.Context, rawIDToken string) (*Claims, 
 // /healthz and audit events for operator visibility.
 func (v *HTTPVerifier) Issuer() string   { return v.issuer }
 func (v *HTTPVerifier) Audience() string { return v.audience }
+
+// LazyVerifier defers OIDC discovery + JWKS fetch to the first
+// [LazyVerifier.Verify] call. This decouples certd's startup from
+// authd's reachability: certd can boot when authd is down, and the
+// first sign request after authd comes back up succeeds. Discovery
+// failures bubble up as ordinary verification errors (the API layer
+// maps them to 401), and the next request retries discovery — so a
+// transient authd outage at boot is self-healing.
+type LazyVerifier struct {
+	issuer, audience string
+
+	mu       sync.Mutex
+	verifier *HTTPVerifier
+}
+
+// NewLazyHTTPVerifier returns a verifier that performs no I/O at
+// construction. The (issuer, audience) pair is validated immediately
+// — same shape as [NewHTTPVerifier] — but the network round-trip to
+// the issuer is deferred until the first [LazyVerifier.Verify] call.
+func NewLazyHTTPVerifier(issuer, audience string) (*LazyVerifier, error) {
+	if issuer == "" {
+		return nil, errors.New("issuer is required")
+	}
+	if audience == "" {
+		return nil, errors.New("audience is required")
+	}
+	return &LazyVerifier{issuer: issuer, audience: audience}, nil
+}
+
+// Verify satisfies [TokenVerifier]. On the first call, it performs
+// OIDC discovery against the configured issuer; if discovery fails
+// (e.g., authd is unreachable), the error is returned to the caller
+// and the next call retries discovery. Once discovery succeeds the
+// resolved [HTTPVerifier] is cached for the lifetime of the process.
+func (v *LazyVerifier) Verify(ctx context.Context, rawIDToken string) (*Claims, error) {
+	hv, err := v.ensure(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return hv.Verify(ctx, rawIDToken)
+}
+
+func (v *LazyVerifier) ensure(ctx context.Context) (*HTTPVerifier, error) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.verifier != nil {
+		return v.verifier, nil
+	}
+	hv, err := NewHTTPVerifier(ctx, v.issuer, v.audience)
+	if err != nil {
+		return nil, err
+	}
+	v.verifier = hv
+	return hv, nil
+}
+
+func (v *LazyVerifier) Issuer() string   { return v.issuer }
+func (v *LazyVerifier) Audience() string { return v.audience }
