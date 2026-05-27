@@ -290,7 +290,7 @@ func TestNewLazyHTTPVerifier_RejectsEmptyArgs(t *testing.T) {
 func TestNewLazyHTTPVerifier_NoDialOnConstruction(t *testing.T) {
 	// Point the lazy verifier at an issuer that is unreachable.
 	// Construction must succeed regardless — the whole point is
-	// that certd boots even when authd is down.
+	// that certd boots even when the IdP is down.
 	if _, err := oidc.NewLazyHTTPVerifier("http://127.0.0.1:1", "certd"); err != nil {
 		t.Fatalf("construction must not error on unreachable issuer: %v", err)
 	}
@@ -336,7 +336,7 @@ func TestLazyVerifier_DiscoveryDeferredUntilFirstVerify(t *testing.T) {
 // newCountingIssuer is a fakeIssuer variant whose discovery endpoint
 // increments hits on every call. If shouldFail is non-nil and returns
 // true, the hit responds with 503 instead of the real discovery doc —
-// used to simulate authd being unreachable.
+// used to simulate the IdP being unreachable.
 func newCountingIssuer(t *testing.T, hits *int32, shouldFail func() bool) *fakeIssuer {
 	t.Helper()
 	priv, err := rsa.GenerateKey(rand.Reader, 2048)
@@ -364,7 +364,7 @@ func newCountingIssuer(t *testing.T, hits *int32, shouldFail func() bool) *fakeI
 
 func TestLazyVerifier_DiscoveryFailureRetriesOnNextCall(t *testing.T) {
 	// Issuer endpoint returns 503 until failFirst flips false —
-	// models authd coming up after certd has already booted.
+	// models the IdP coming up after certd has already booted.
 	var hits int32
 	failFirst := int32(1)
 	fi := newCountingIssuer(t, &hits, func() bool {

@@ -1,7 +1,7 @@
-// Package oidc verifies inbound OIDC ID tokens — specifically the ones
-// authd issues — so certd can derive a caller's groups from a
-// cryptographically-signed assertion rather than a self-declared
-// request field.
+// Package oidc verifies inbound OIDC ID tokens — minted by whatever
+// OIDC IdP the operator configures — so certd can derive a caller's
+// groups from a cryptographically-signed assertion rather than a
+// self-declared request field.
 //
 // The verifier is consumed by the API layer through a small interface
 // ([TokenVerifier]) so tests can inject a deterministic stub instead
@@ -24,14 +24,14 @@ import (
 // claim renames in the underlying token format are absorbed here.
 type Claims struct {
 	// Subject is the OIDC `sub` claim — the stable user identifier
-	// from authd (UUID).
+	// from the IdP (typically a UUID).
 	Subject string
-	// Email is the verified email of the user, when authd surfaces it.
+	// Email is the verified email of the user, when the IdP surfaces it.
 	Email string
 	// Name is the user's display name, when present.
 	Name string
-	// Groups is the authoritative group-membership list. authd derives
-	// this from SCIM group records.
+	// Groups is the authoritative group-membership list. The IdP
+	// derives this from its own group/SCIM records.
 	Groups []string
 }
 
@@ -44,7 +44,7 @@ type TokenVerifier interface {
 
 // HTTPVerifier wraps go-oidc with discovery + JWKS auto-refresh. Built
 // for a single (issuer, audience) pair; create a separate instance per
-// authd cluster certd should trust.
+// IdP cluster certd should trust.
 type HTTPVerifier struct {
 	verifier *goidc.IDTokenVerifier
 	issuer   string
@@ -53,11 +53,11 @@ type HTTPVerifier struct {
 
 // NewHTTPVerifier discovers issuer's OIDC metadata, fetches its JWKS,
 // and returns a verifier configured for audience. The returned
-// verifier transparently refreshes the JWKS when authd rotates keys —
-// no manual reload needed.
+// verifier transparently refreshes the JWKS when the IdP rotates keys
+// — no manual reload needed.
 //
-// issuer is the authd public URL (e.g., "https://auth.example.com").
-// audience matches the `aud` claim on every token authd issues for
+// issuer is the IdP's public issuer URL (e.g., "https://auth.example.com").
+// audience matches the `aud` claim on every token the IdP issues for
 // certd.
 //
 // Errors at this stage mean the issuer is unreachable, the discovery
@@ -112,12 +112,12 @@ func (v *HTTPVerifier) Issuer() string   { return v.issuer }
 func (v *HTTPVerifier) Audience() string { return v.audience }
 
 // LazyVerifier defers OIDC discovery + JWKS fetch to the first
-// [LazyVerifier.Verify] call. This decouples certd's startup from
-// authd's reachability: certd can boot when authd is down, and the
-// first sign request after authd comes back up succeeds. Discovery
+// [LazyVerifier.Verify] call. This decouples certd's startup from the
+// IdP's reachability: certd can boot when the IdP is down, and the
+// first sign request after the IdP comes back up succeeds. Discovery
 // failures bubble up as ordinary verification errors (the API layer
 // maps them to 401), and the next request retries discovery — so a
-// transient authd outage at boot is self-healing.
+// transient IdP outage at boot is self-healing.
 type LazyVerifier struct {
 	issuer, audience string
 
@@ -141,7 +141,7 @@ func NewLazyHTTPVerifier(issuer, audience string) (*LazyVerifier, error) {
 
 // Verify satisfies [TokenVerifier]. On the first call, it performs
 // OIDC discovery against the configured issuer; if discovery fails
-// (e.g., authd is unreachable), the error is returned to the caller
+// (e.g., the IdP is unreachable), the error is returned to the caller
 // and the next call retries discovery. Once discovery succeeds the
 // resolved [HTTPVerifier] is cached for the lifetime of the process.
 func (v *LazyVerifier) Verify(ctx context.Context, rawIDToken string) (*Claims, error) {

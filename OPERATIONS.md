@@ -8,13 +8,13 @@ Day-to-day operational guidance for running `certd` and
 ## 1. Deployment topology
 
 ```
-                                         ┌────────────────┐
-            ┌──────────────────────► OIDC IdP (authd)      │
-            │      ID tokens          └────────────────┘
+                                         ┌─────────────────┐
+            ┌───────────────────────────►│    OIDC IdP     │
+            │     discovery + JWKS       └─────────────────┘
             │
-┌───────────┴───────────┐                ┌────────────────┐
-│       certd (this)    │◄───────────────┤  NATS JetStream │
-│  HTTPS  :8443         │  audit publish └────────────────┘
+┌───────────┴───────────┐                ┌─────────────────┐
+│       certd (this)    │───────────────►│  NATS JetStream │
+│  HTTPS  :8443         │  audit publish └─────────────────┘
 │  mTLS + OIDC auth     │
 └──────────┬────────────┘
            │

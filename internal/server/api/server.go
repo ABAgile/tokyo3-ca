@@ -61,9 +61,9 @@ type Config struct {
 	// integration tests can exercise the cert engines directly.
 	Policy *policy.Engine
 	// OIDCVerifier validates inbound Authorization: Bearer tokens
-	// against authd. When set, sign endpoints accept a valid token
-	// and derive the caller's groups from its claims. When nil, the
-	// bearer-token path is closed.
+	// against the configured OIDC IdP. When set, sign endpoints
+	// accept a valid token and derive the caller's groups from its
+	// claims. When nil, the bearer-token path is closed.
 	OIDCVerifier oidc.TokenVerifier
 	// MTLSStore maps the SANs presented on the inbound TLS client
 	// cert to a workload identity + group claims. When set, sign

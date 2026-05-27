@@ -2,9 +2,9 @@
 
 Certificate authority for internal platform. Issues short-lived SSH
 certificates (user / host / per-session) and X.509 / SPIFFE workload identity
-certificates against an OIDC-group-driven role table. Integrates with the
-existing `authd` (OIDC IdP) and `vaultd` (secret store + envelope crypto)
-services under the same application suite platform.
+certificates against an OIDC-group-driven role table. Integrates with an
+external OIDC IdP (for human authentication) and `vaultd` (secret store +
+envelope crypto) under the same application suite platform.
 
 This repo ships two binaries:
 
@@ -114,14 +114,14 @@ internal/
   with a `remote sign:` prefix; existing SSH cert + X.509 cert
   issuance paths work unchanged because the wrapper satisfies
   `crypto.Signer`.
-- **Authorization**: `authd` issues OIDC tokens with a `groups` claim; certd's
+- **Authorization**: the OIDC IdP issues tokens with a `groups` claim; certd's
   role table maps groups to allowed Unix principals + host patterns; the cert
   carries those as extensions; ssh-proxyd enforces what the cert says.
 - **Lazy OIDC discovery.** certd's OIDC verifier defers issuer
   discovery + JWKS fetch to the first sign request, so certd boots
-  even when authd is unreachable. A transient authd outage at start
+  even when the IdP is unreachable. A transient IdP outage at start
   surfaces as a 401 on the first sign request and self-heals on the
-  next call once authd is up — no startup ordering required between
+  next call once the IdP is up — no startup ordering required between
   the two daemons, no cyclic dependency.
 - **Single agent** `cert-agentd` is the unified workload credential
   agent — one workload identity, multiple credential outputs (SPIFFE X.509 +

@@ -132,9 +132,9 @@ Threats:
 
 - `tokyo3-base/tls` produces correct TLS configurations from the
   configured PEM files. Trusted.
-- The operator's IdP (`authd` or equivalent) issues OIDC tokens that
-  honour the `groups` claim. Trusted; certd verifies the signature
-  but not the IdP's internal flows.
+- The operator's OIDC IdP issues tokens that honour the `groups`
+  claim. Trusted; certd verifies the signature but not the IdP's
+  internal flows.
 - NATS JetStream's append-only retention is configured correctly by
   the operator. Trusted.
 - The KMS / HSM the operator configures for `RemoteSigner` enforces

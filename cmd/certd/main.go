@@ -42,14 +42,14 @@
 //	CERTD_NATS_CA           CA certificate PEM path for verifying the NATS
 //	                        server cert. Falls back to CERTD_WORKLOAD_CA.
 //
-//	CERTD_OIDC_ISSUER       authd public URL (e.g., https://auth.example.com).
+//	CERTD_OIDC_ISSUER       OIDC IdP issuer URL (e.g., https://auth.example.com).
 //	                        When set together with CERTD_OIDC_AUDIENCE,
 //	                        sign endpoints require a valid Authorization:
 //	                        Bearer token and derive the caller's groups
 //	                        from its claims. When unset, body groups are
 //	                        used (for tests and pre-prod).
-//	CERTD_OIDC_AUDIENCE     The `aud` claim authd embeds on every token
-//	                        minted for certd (the OIDC client_id authd
+//	CERTD_OIDC_AUDIENCE     The `aud` claim the IdP embeds on every token
+//	                        minted for certd (the OIDC client_id the IdP
 //	                        registers for this service). Required when
 //	                        CERTD_OIDC_ISSUER is set.
 //
@@ -481,9 +481,9 @@ func loadCASigner(log *slog.Logger) (signer.Signer, error) {
 //
 // The returned verifier is lazy: OIDC discovery + JWKS fetch is
 // deferred to the first sign request, so certd's bootstrap does not
-// block on authd's reachability. A transient authd outage at boot
+// block on the IdP's reachability. A transient IdP outage at boot
 // surfaces as a 401 on the first sign request and self-heals when
-// authd comes back.
+// the IdP comes back.
 func loadOIDCVerifier(_ context.Context, log *slog.Logger) (oidc.TokenVerifier, error) {
 	issuer := os.Getenv("CERTD_OIDC_ISSUER")
 	audience := os.Getenv("CERTD_OIDC_AUDIENCE")
