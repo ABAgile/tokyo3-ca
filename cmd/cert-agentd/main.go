@@ -63,6 +63,29 @@
 //	CERT_AGENTD_SSH_PROXY_JUMP     ProxyJump directive (e.g.,
 //	                               "alice@proxy.internal:2222").
 //	CERT_AGENTD_SSH_USER           SSH login name.
+//
+// Optional operational log shipping (cert-agentd runs on every
+// workload host, so log lines land on per-instance subjects):
+//
+//	CERT_AGENTD_NATS_URL    NATS server URL (e.g., tls://nats:4222).
+//	                        When set, log lines fan out to subject
+//	                        "app_log.cert-agentd.<instance>". Unset
+//	                        leaves the logger at stdout only.
+//	CERT_AGENTD_NATS_CERT   Publisher client cert PEM (mTLS to NATS).
+//	                        Defaults to CERT_AGENTD_CERT so the
+//	                        single workload identity covers both
+//	                        certd issuance and log shipping.
+//	CERT_AGENTD_NATS_KEY    Matching private key. Defaults to
+//	                        CERT_AGENTD_KEY.
+//	CERT_AGENTD_NATS_CA     CA bundle that signs the NATS server
+//	                        cert. Defaults to CERT_AGENTD_CA.
+//	CERT_AGENTD_INSTANCE    Per-host identifier appended to the NATS
+//	                        subject and added as an "instance" log
+//	                        attribute on every line. Defaults to
+//	                        os.Hostname(). Operators may override
+//	                        when hostnames aren't stable (e.g.,
+//	                        Kubernetes pod names) or distinguishable
+//	                        across the fleet.
 package main
 
 import (
@@ -122,7 +145,16 @@ func runCmd() *cobra.Command {
 }
 
 func runAgent(ctx context.Context) error {
-	log, _ := applog.AppLogger(appName, applog.WithStdout())
+	log, _, drainLog := applog.AppLoggerWithNATS(applog.Config{
+		App:      appName,
+		Instance: envOr("CERT_AGENTD_INSTANCE", hostnameOrEmpty()),
+	}, applog.NATSConfig{
+		URL:      os.Getenv("CERT_AGENTD_NATS_URL"),
+		CertFile: envFirst("CERT_AGENTD_NATS_CERT", "CERT_AGENTD_CERT"),
+		KeyFile:  envFirst("CERT_AGENTD_NATS_KEY", "CERT_AGENTD_KEY"),
+		CAFile:   envFirst("CERT_AGENTD_NATS_CA", "CERT_AGENTD_CA"),
+	}, applog.WithStdout())
+	defer drainLog()
 
 	certdURL := mustEnv("CERT_AGENTD_CERTD_URL")
 	certPath := mustEnv("CERT_AGENTD_CERT")
@@ -337,6 +369,32 @@ func mustEnv(key string) string {
 		os.Exit(2)
 	}
 	return v
+}
+
+// envFirst returns the first non-empty value among the named env
+// vars (left-to-right), or "" when all are unset. Used for the
+// fallback chains where a NATS-specific override falls through to
+// the workload-identity material.
+func envFirst(keys ...string) string {
+	for _, k := range keys {
+		if v := os.Getenv(k); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// hostnameOrEmpty returns os.Hostname() on success and "" on error.
+// Used as the default for CERT_AGENTD_INSTANCE so the NATS subject
+// hierarchy picks up a sensible per-host suffix without any
+// operator action; the empty fallback keeps the helper at its
+// legacy singleton-subject shape when the OS refuses to answer.
+func hostnameOrEmpty() string {
+	h, err := os.Hostname()
+	if err != nil {
+		return ""
+	}
+	return h
 }
 
 // loadCAPool reads the CA bundle PEM file and returns it as an
