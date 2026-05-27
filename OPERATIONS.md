@@ -166,6 +166,33 @@ agent emits a one-shot warn:
 This is the earliest signal that a long certd outage could leave
 the agent unable to recover.
 
+### CA-bundle rotation (zero-restart)
+
+`CERT_AGENTD_CA` is mtime-polled every 30s. Operators can drop in
+a new bundle (typically `[OLD, NEW]` during a rotation overlap
+window) and the agent picks it up on the next tick — no restart
+required. Read failures keep the previous pool live and log at
+warn (`CA bundle reload failed; keeping previous pool`) so a
+corrupt drop-in never opens a trust window.
+
+Rotation workflow:
+
+1. Drop `[OLD, NEW]` bundle on every host. Wait ≥30s + safety
+   margin for every agent's poll to fire.
+2. Switch certd's signing key from OLD to NEW. This still
+   requires a certd restart — the signing key isn't hot-reloaded.
+3. Wait for cert-agentd's normal renewal cadence (~60% TTL) to
+   roll every workload onto NEW-signed leafs. Monitor via certd's
+   audit stream.
+4. Drop `[NEW]` bundle on every host. Trust set narrows back to
+   single-CA on the next mtime poll.
+
+The TLS material the agent presents to certd uses
+`InsecureSkipVerify + VerifyConnection` rather than the standard
+verifier so each handshake reads the *current* pool snapshot
+rather than the one captured at config-construction time;
+hostname + chain verification still run inside the callback.
+
 ### When to restart cert-agentd
 
 - Configuration changes (env vars) — restart.

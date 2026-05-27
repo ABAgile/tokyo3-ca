@@ -30,6 +30,7 @@ func writePEMCertKey(t *testing.T, certPath, keyPath, cn string, serial int64) *
 	tmpl := &x509.Certificate{
 		SerialNumber: big.NewInt(serial),
 		Subject:      pkix.Name{CommonName: cn},
+		DNSNames:     []string{cn}, // SAN mirrors CN so hostname verification finds a match
 		NotBefore:    time.Now().Add(-time.Hour),
 		NotAfter:     time.Now().Add(time.Hour),
 		KeyUsage:     x509.KeyUsageDigitalSignature,
@@ -58,7 +59,7 @@ func TestCertReloader_LoadsInitialPair(t *testing.T) {
 	keyPath := filepath.Join(dir, "k.pem")
 	wantSerial := writePEMCertKey(t, certPath, keyPath, "initial", 1)
 
-	r, err := newCertReloader(certPath, keyPath)
+	r, err := newCertReloader(certPath, keyPath, certPath)
 	if err != nil {
 		t.Fatalf("newCertReloader: %v", err)
 	}
@@ -81,7 +82,7 @@ func TestCertReloader_LeafExpiry(t *testing.T) {
 	keyPath := filepath.Join(dir, "k.pem")
 	writePEMCertKey(t, certPath, keyPath, "initial", 1)
 
-	r, err := newCertReloader(certPath, keyPath)
+	r, err := newCertReloader(certPath, keyPath, certPath)
 	if err != nil {
 		t.Fatalf("newCertReloader: %v", err)
 	}
@@ -100,7 +101,7 @@ func TestCertReloader_RefreshPicksUpNewCert(t *testing.T) {
 	keyPath := filepath.Join(dir, "k.pem")
 	firstSerial := writePEMCertKey(t, certPath, keyPath, "v1", 1)
 
-	r, _ := newCertReloader(certPath, keyPath)
+	r, _ := newCertReloader(certPath, keyPath, certPath)
 
 	// Renewal happens on disk — same paths, different cert.
 	secondSerial := writePEMCertKey(t, certPath, keyPath, "v2", 2)
@@ -126,9 +127,110 @@ func TestCertReloader_RefreshPicksUpNewCert(t *testing.T) {
 }
 
 func TestCertReloader_RejectsMissingFiles(t *testing.T) {
-	_, err := newCertReloader("/no/such/cert", "/no/such/key")
+	_, err := newCertReloader("/no/such/cert", "/no/such/key", "/no/such/ca")
 	if err == nil {
 		t.Fatal("expected error for missing files")
+	}
+}
+
+// TestCertReloader_RefreshCABundleOnMtimeChange asserts the
+// mtime-poll path: writing a new bundle PEM with a later mtime
+// must update the in-memory pool. Same mtime → no-op.
+func TestCertReloader_RefreshCABundleOnMtimeChange(t *testing.T) {
+	dir := t.TempDir()
+	certPath := filepath.Join(dir, "c.pem")
+	keyPath := filepath.Join(dir, "k.pem")
+	caPath := filepath.Join(dir, "ca.pem")
+	writePEMCertKey(t, certPath, keyPath, "initial", 1)
+	caV1Path := filepath.Join(dir, "ca-v1.pem")
+	caV2Path := filepath.Join(dir, "ca-v2.pem")
+	writePEMCertKey(t, caV1Path, filepath.Join(dir, "ca-v1.key"), "ca-v1", 100)
+	writePEMCertKey(t, caV2Path, filepath.Join(dir, "ca-v2.key"), "ca-v2", 200)
+	caV1, _ := os.ReadFile(caV1Path)
+	caV2, _ := os.ReadFile(caV2Path)
+	if err := os.WriteFile(caPath, caV1, 0o644); err != nil {
+		t.Fatalf("write initial bundle: %v", err)
+	}
+
+	r, err := newCertReloader(certPath, keyPath, caPath)
+	if err != nil {
+		t.Fatalf("newCertReloader: %v", err)
+	}
+	initialMtime := r.caMtime
+
+	// Re-call refreshCABundle without changing the file — no-op.
+	if err := r.refreshCABundle(); err != nil {
+		t.Fatalf("refreshCABundle (unchanged): %v", err)
+	}
+	if !r.caMtime.Equal(initialMtime) {
+		t.Errorf("caMtime advanced without file change: %v → %v", initialMtime, r.caMtime)
+	}
+
+	// Drop in an expanded bundle. Sleep so the filesystem records a
+	// different mtime (second-granularity filesystems can otherwise
+	// collapse two rapid writes onto the same stamp).
+	time.Sleep(1100 * time.Millisecond)
+	if err := os.WriteFile(caPath, append(caV1, caV2...), 0o644); err != nil {
+		t.Fatalf("write expanded bundle: %v", err)
+	}
+	if err := r.refreshCABundle(); err != nil {
+		t.Fatalf("refreshCABundle (after change): %v", err)
+	}
+	if !r.caMtime.After(initialMtime) {
+		t.Errorf("caMtime did not advance after file change: %v → %v", initialMtime, r.caMtime)
+	}
+}
+
+// TestCertReloader_VerifyConnection_UsesCurrentPool exercises the
+// VerifyConnection callback against a synthesised tls.ConnectionState.
+// A peer signed by a CA in the bundle verifies; one signed outside
+// does not.
+func TestCertReloader_VerifyConnection_UsesCurrentPool(t *testing.T) {
+	dir := t.TempDir()
+	certPath := filepath.Join(dir, "c.pem")
+	keyPath := filepath.Join(dir, "k.pem")
+	caPath := filepath.Join(dir, "ca.pem")
+	writePEMCertKey(t, certPath, keyPath, "agent", 1)
+
+	// Use the agent's own self-signed cert as the trusted CA. A peer
+	// presenting that same cert verifies; a different self-signed
+	// cert (= different CA) does not.
+	b, _ := os.ReadFile(certPath)
+	if err := os.WriteFile(caPath, b, 0o644); err != nil {
+		t.Fatalf("write ca bundle: %v", err)
+	}
+	r, err := newCertReloader(certPath, keyPath, caPath)
+	if err != nil {
+		t.Fatalf("newCertReloader: %v", err)
+	}
+
+	trustedBlock, _ := pem.Decode(b)
+	trustedLeaf, err := x509.ParseCertificate(trustedBlock.Bytes)
+	if err != nil {
+		t.Fatalf("parse trusted leaf: %v", err)
+	}
+
+	cs := tls.ConnectionState{
+		ServerName:       "agent",
+		PeerCertificates: []*x509.Certificate{trustedLeaf},
+	}
+	if err := r.VerifyConnection(cs); err != nil {
+		t.Errorf("VerifyConnection (trusted): %v", err)
+	}
+
+	// Untrusted peer: a fresh self-signed cert not in the bundle.
+	otherCertPath := filepath.Join(dir, "other.pem")
+	otherKeyPath := filepath.Join(dir, "other.key")
+	writePEMCertKey(t, otherCertPath, otherKeyPath, "agent", 99)
+	otherPEM, _ := os.ReadFile(otherCertPath)
+	otherBlock, _ := pem.Decode(otherPEM)
+	otherLeaf, err := x509.ParseCertificate(otherBlock.Bytes)
+	if err != nil {
+		t.Fatalf("parse other leaf: %v", err)
+	}
+	cs.PeerCertificates = []*x509.Certificate{otherLeaf}
+	if err := r.VerifyConnection(cs); err == nil {
+		t.Error("VerifyConnection (untrusted) should reject peer signed outside bundle")
 	}
 }
 
@@ -141,7 +243,7 @@ func TestCertReloader_ConcurrentGetClientCertWithRefresh(t *testing.T) {
 	certPath := filepath.Join(dir, "c.pem")
 	keyPath := filepath.Join(dir, "k.pem")
 	writePEMCertKey(t, certPath, keyPath, "initial", 1)
-	r, _ := newCertReloader(certPath, keyPath)
+	r, _ := newCertReloader(certPath, keyPath, certPath)
 
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
