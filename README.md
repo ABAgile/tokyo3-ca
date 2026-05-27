@@ -307,6 +307,38 @@ docker run --rm \
         --cert-out /root/.ssh/auth_ed25519-cert.pub
 ```
 
+## Operational log shipping
+
+Both binaries ship structured log lines to NATS (alongside stdout)
+when their `*_NATS_URL` env var is set; unset leaves the logger at
+stdout only. Subject layout depends on whether the daemon is a
+cluster-wide singleton or runs on every workload host:
+
+| Binary        | Subject                              | Env-var prefix    | `Instance` source                                       |
+|---------------|--------------------------------------|-------------------|----------------------------------------------------------|
+| `certd`       | `app_log.certd`                      | `CERTD_NATS_*`    | n/a — singleton                                          |
+| `cert-agentd` | `app_log.cert-agentd.<instance>`     | `CERT_AGENTD_NATS_*` | `CERT_AGENTD_INSTANCE` (default `os.Hostname()`)      |
+
+Operators can tail per-host with `nats sub 'app_log.cert-agentd.host-42'`
+or fleet-wide with `nats sub 'app_log.cert-agentd.>'`. Every log
+line on the per-host subject also carries a matching `"instance"`
+slog attribute so attribute-based consumers can filter without
+parsing subjects.
+
+certd reuses its existing `CERTD_NATS_*` audit env vars (one
+broker, two subjects). cert-agentd's NATS cert / key / CA each
+fall back to the workload-identity material it already uses for
+certd (`CERT_AGENTD_CERT/_KEY/_CA`), so a single TLS file set
+covers both certd issuance and log shipping.
+
+The shipper dials with `RetryOnFailedConnect(true)` and unbounded
+reconnects — a broker that's down at boot doesn't fail process
+startup; entries drop (200-entry discard-on-full buffer) while
+disconnected and resume on reconnect. See the per-binary godoc in
+[`cmd/certd/main.go`](cmd/certd/main.go) and
+[`cmd/cert-agentd/main.go`](cmd/cert-agentd/main.go) for the
+authoritative env-var reference.
+
 ## Operations
 
 See [OPERATIONS.md](OPERATIONS.md) for deployment topology, the
