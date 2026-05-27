@@ -67,8 +67,10 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -134,7 +136,7 @@ func runAgent(ctx context.Context) error {
 	// successful renewal, and a background mtime poller refreshes
 	// the CA bundle when operators drop in a new one (e.g., during
 	// a CA-rotation overlap window).
-	reloader, err := newCertReloader(certPath, keyPath, caPath)
+	reloader, err := newCertReloader(certPath, keyPath, caPath, log)
 	if err != nil {
 		return fmt.Errorf("bootstrap cert: %w", err)
 	}
@@ -361,8 +363,14 @@ func loadCAPool(path string) (*x509.CertPool, error) {
 // new bundle (e.g., during a CA rotation overlap window) without
 // restarting the agent. Concurrent reads from TLS handshakes are
 // protected by a read/write mutex.
+//
+// log is used to surface bundle reloads at info level — operators
+// rely on this line ("CA bundle reloaded") to confirm a rotated
+// bundle has propagated to every daemon in the fleet before
+// flipping the upstream signing key. nil ⇒ slog.Default().
 type certReloader struct {
 	certPath, keyPath, caPath string
+	log                       *slog.Logger
 
 	mu       sync.RWMutex
 	cert     *tls.Certificate
@@ -378,8 +386,11 @@ type certReloader struct {
 // only have one number to think about.
 const DefaultCAPollInterval = 30 * time.Second
 
-func newCertReloader(certPath, keyPath, caPath string) (*certReloader, error) {
-	r := &certReloader{certPath: certPath, keyPath: keyPath, caPath: caPath}
+func newCertReloader(certPath, keyPath, caPath string, log *slog.Logger) (*certReloader, error) {
+	if log == nil {
+		log = slog.Default()
+	}
+	r := &certReloader{certPath: certPath, keyPath: keyPath, caPath: caPath, log: log}
 	if err := r.Refresh(); err != nil {
 		return nil, err
 	}
@@ -417,7 +428,9 @@ func (r *certReloader) Refresh() error {
 // refreshCABundle reads the CA bundle from disk and atomically
 // replaces the pool when the file's mtime has advanced. No-op when
 // the mtime is unchanged so the poll path is cheap even when
-// operators leave the bundle alone for days at a time.
+// operators leave the bundle alone for days at a time. Logs at
+// info on every successful swap so operators can confirm a rotated
+// bundle has propagated.
 func (r *certReloader) refreshCABundle() error {
 	stat, err := os.Stat(r.caPath)
 	if err != nil {
@@ -441,7 +454,20 @@ func (r *certReloader) refreshCABundle() error {
 	r.pool = pool
 	r.caMtime = stat.ModTime()
 	r.mu.Unlock()
+	r.log.Info("CA bundle reloaded",
+		"path", r.caPath,
+		"mtime", stat.ModTime(),
+		"fingerprint", bundleFingerprint(pem))
 	return nil
+}
+
+// bundleFingerprint is the first 8 bytes of sha256(pem), hex-
+// encoded. Short enough for human-friendly log diffing across a
+// fleet, long enough that distinct bundles don't collide in
+// practice.
+func bundleFingerprint(pem []byte) string {
+	sum := sha256.Sum256(pem)
+	return hex.EncodeToString(sum[:8])
 }
 
 func (r *certReloader) poolLoaded() bool {

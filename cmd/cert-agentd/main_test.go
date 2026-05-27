@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	cryptorand "crypto/rand"
@@ -8,6 +9,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"log/slog"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -59,7 +61,7 @@ func TestCertReloader_LoadsInitialPair(t *testing.T) {
 	keyPath := filepath.Join(dir, "k.pem")
 	wantSerial := writePEMCertKey(t, certPath, keyPath, "initial", 1)
 
-	r, err := newCertReloader(certPath, keyPath, certPath)
+	r, err := newCertReloader(certPath, keyPath, certPath, nil)
 	if err != nil {
 		t.Fatalf("newCertReloader: %v", err)
 	}
@@ -82,7 +84,7 @@ func TestCertReloader_LeafExpiry(t *testing.T) {
 	keyPath := filepath.Join(dir, "k.pem")
 	writePEMCertKey(t, certPath, keyPath, "initial", 1)
 
-	r, err := newCertReloader(certPath, keyPath, certPath)
+	r, err := newCertReloader(certPath, keyPath, certPath, nil)
 	if err != nil {
 		t.Fatalf("newCertReloader: %v", err)
 	}
@@ -101,7 +103,7 @@ func TestCertReloader_RefreshPicksUpNewCert(t *testing.T) {
 	keyPath := filepath.Join(dir, "k.pem")
 	firstSerial := writePEMCertKey(t, certPath, keyPath, "v1", 1)
 
-	r, _ := newCertReloader(certPath, keyPath, certPath)
+	r, _ := newCertReloader(certPath, keyPath, certPath, nil)
 
 	// Renewal happens on disk — same paths, different cert.
 	secondSerial := writePEMCertKey(t, certPath, keyPath, "v2", 2)
@@ -127,7 +129,7 @@ func TestCertReloader_RefreshPicksUpNewCert(t *testing.T) {
 }
 
 func TestCertReloader_RejectsMissingFiles(t *testing.T) {
-	_, err := newCertReloader("/no/such/cert", "/no/such/key", "/no/such/ca")
+	_, err := newCertReloader("/no/such/cert", "/no/such/key", "/no/such/ca", nil)
 	if err == nil {
 		t.Fatal("expected error for missing files")
 	}
@@ -152,7 +154,7 @@ func TestCertReloader_RefreshCABundleOnMtimeChange(t *testing.T) {
 		t.Fatalf("write initial bundle: %v", err)
 	}
 
-	r, err := newCertReloader(certPath, keyPath, caPath)
+	r, err := newCertReloader(certPath, keyPath, caPath, nil)
 	if err != nil {
 		t.Fatalf("newCertReloader: %v", err)
 	}
@@ -181,6 +183,64 @@ func TestCertReloader_RefreshCABundleOnMtimeChange(t *testing.T) {
 	}
 }
 
+// TestCertReloader_LogsOnBundleReload asserts the info log
+// operators rely on for rotation coordination fires (only) when
+// the pool actually changes. No-op polls stay silent.
+func TestCertReloader_LogsOnBundleReload(t *testing.T) {
+	dir := t.TempDir()
+	certPath := filepath.Join(dir, "c.pem")
+	keyPath := filepath.Join(dir, "k.pem")
+	caPath := filepath.Join(dir, "ca.pem")
+	writePEMCertKey(t, certPath, keyPath, "initial", 1)
+	caV1Path := filepath.Join(dir, "ca-v1.pem")
+	caV2Path := filepath.Join(dir, "ca-v2.pem")
+	writePEMCertKey(t, caV1Path, filepath.Join(dir, "ca-v1.key"), "ca-v1", 100)
+	writePEMCertKey(t, caV2Path, filepath.Join(dir, "ca-v2.key"), "ca-v2", 200)
+	caV1, _ := os.ReadFile(caV1Path)
+	caV2, _ := os.ReadFile(caV2Path)
+	if err := os.WriteFile(caPath, caV1, 0o644); err != nil {
+		t.Fatalf("write initial bundle: %v", err)
+	}
+
+	var buf bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&buf, nil))
+	r, err := newCertReloader(certPath, keyPath, caPath, log)
+	if err != nil {
+		t.Fatalf("newCertReloader: %v", err)
+	}
+	// Constructor's first refresh fires one log line.
+	if got := strings.Count(buf.String(), "CA bundle reloaded"); got != 1 {
+		t.Errorf("after construction: %d 'CA bundle reloaded' lines, want 1", got)
+	}
+	wantFP := bundleFingerprint(caV1)
+	if !strings.Contains(buf.String(), "fingerprint="+wantFP) {
+		t.Errorf("constructor log missing fingerprint=%s; got:\n%s", wantFP, buf.String())
+	}
+
+	// No-op poll stays silent.
+	buf.Reset()
+	if err := r.refreshCABundle(); err != nil {
+		t.Fatalf("refreshCABundle (no-op): %v", err)
+	}
+	if buf.Len() != 0 {
+		t.Errorf("no-op poll logged: %s", buf.String())
+	}
+
+	// Drop in [v1, v2] — second log line fires with new fingerprint.
+	time.Sleep(1100 * time.Millisecond)
+	expanded := append(caV1, caV2...)
+	if err := os.WriteFile(caPath, expanded, 0o644); err != nil {
+		t.Fatalf("write expanded bundle: %v", err)
+	}
+	if err := r.refreshCABundle(); err != nil {
+		t.Fatalf("refreshCABundle (after change): %v", err)
+	}
+	wantFP2 := bundleFingerprint(expanded)
+	if !strings.Contains(buf.String(), "fingerprint="+wantFP2) {
+		t.Errorf("expected log with fingerprint=%s; got:\n%s", wantFP2, buf.String())
+	}
+}
+
 // TestCertReloader_VerifyConnection_UsesCurrentPool exercises the
 // VerifyConnection callback against a synthesised tls.ConnectionState.
 // A peer signed by a CA in the bundle verifies; one signed outside
@@ -199,7 +259,7 @@ func TestCertReloader_VerifyConnection_UsesCurrentPool(t *testing.T) {
 	if err := os.WriteFile(caPath, b, 0o644); err != nil {
 		t.Fatalf("write ca bundle: %v", err)
 	}
-	r, err := newCertReloader(certPath, keyPath, caPath)
+	r, err := newCertReloader(certPath, keyPath, caPath, nil)
 	if err != nil {
 		t.Fatalf("newCertReloader: %v", err)
 	}
@@ -243,7 +303,7 @@ func TestCertReloader_ConcurrentGetClientCertWithRefresh(t *testing.T) {
 	certPath := filepath.Join(dir, "c.pem")
 	keyPath := filepath.Join(dir, "k.pem")
 	writePEMCertKey(t, certPath, keyPath, "initial", 1)
-	r, _ := newCertReloader(certPath, keyPath, certPath)
+	r, _ := newCertReloader(certPath, keyPath, certPath, nil)
 
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
