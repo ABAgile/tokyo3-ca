@@ -1,15 +1,22 @@
 # Multi-stage build for the tokyo3-ca project.
 #
-# - Stage `builder` compiles both binaries (certd + cert-agentd). Building
-#   them together amortises `go mod download` across a single cache layer.
+# - Stage `builder` compiles all three binaries (certd + cert-agentd +
+#   auth-ssh-creds). Building them together amortises `go mod download`
+#   across a single cache layer.
 #
 # - Stage `agent` ships only cert-agentd. The default workload image — runs
 #   on every host that needs renewable identity credentials.
 #
+# - Stage `cli` ships only the auth-ssh-creds helper. Useful for CI runners
+#   and dev containers that prefer a containerized binary over `go install`.
+#   No ENTRYPOINT — users explicitly invoke the binary:
+#     docker run --rm <image> auth-ssh-creds get --certd ... --principals ...
+#   Reachable via `docker build --target cli .`.
+#
 # - Stage `server` (default — last stage) ships only certd. The central
 #   CA service. Plain `docker build .` produces this image.
 #
-# Both targets honour TARGETOS / TARGETARCH for cross-builds.
+# All targets honour TARGETOS / TARGETARCH for cross-builds.
 
 # ── Stage 1: Build Go binaries ────────────────────────────────────────────────
 FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS builder
@@ -30,6 +37,8 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     go build -ldflags="-s -w" -o /out/certd ./cmd/certd
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     go build -ldflags="-s -w" -o /out/cert-agentd ./cmd/cert-agentd
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+    go build -ldflags="-s -w" -o /out/auth-ssh-creds ./cmd/auth-ssh-creds
 
 # ── Stage 2: Agent image (build with --target agent) ──────────────────────────
 FROM alpine:3.21 AS agent
@@ -41,7 +50,19 @@ COPY --from=builder /out/cert-agentd /usr/local/bin/cert-agentd
 ENTRYPOINT ["/usr/local/bin/cert-agentd"]
 CMD ["run"]
 
-# ── Stage 3: Server runtime image (default target) ────────────────────────────
+# ── Stage 3: CLI image (build with --target cli) ──────────────────────────────
+FROM alpine:3.21 AS cli
+
+# ca-certificates so the helper can verify TLS to the auth issuer and certd.
+RUN apk add --no-cache ca-certificates
+
+COPY --from=builder /out/auth-ssh-creds /usr/local/bin/auth-ssh-creds
+
+# No ENTRYPOINT — users invoke the binary explicitly so this image can
+# grow more CLI tools later without breaking existing invocations.
+CMD ["/bin/sh"]
+
+# ── Stage 4: Server runtime image (default target) ────────────────────────────
 FROM alpine:3.21 AS server
 
 RUN apk add --no-cache ca-certificates

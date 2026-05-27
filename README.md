@@ -49,7 +49,7 @@ no per-org rate limiting at the API edge.
 ## Build
 
 ```sh
-make build         # → bin/certd + bin/cert-agentd
+make build         # → bin/certd + bin/cert-agentd + bin/auth-ssh-creds
 make check         # gofmt + test + staticcheck + gopls + govulncheck
 ```
 
@@ -68,6 +68,7 @@ go test -bench=. -benchmem -run=^$ ./internal/server/signer/...
 cmd/
   certd/main.go              # central CA service entry point
   cert-agentd/main.go        # per-workload agent entry point
+  auth-ssh-creds/main.go     # human-facing CLI: SSO → /api/v1/ssh/sign-user → SSH user cert
 internal/
   server/                    # certd only
     api/                     # HTTP handlers (sign, role admin, recording ingest)
@@ -191,6 +192,100 @@ internal/
   watchdogs don't need the credential. When the basic-auth pair is
   unset the portal is open and operators front it with oauth2-proxy
   or similar.
+
+## CLI access via `auth-ssh-creds`
+
+`auth-ssh-creds` is the human-facing client for certd's
+`/api/v1/ssh/sign-user` endpoint. It runs an OIDC SSO dance against
+an external IdP (typically tokyo3-auth), uses the resulting ID
+token as the bearer for a single POST to certd, and writes the
+signed cert + private key next to each other on disk so `ssh` can
+pick them up via `-i`.
+
+Lives in this repo (not the auth repo) because the wire shape it
+tracks — certd's sign-user request/response — is owned here. SSO is
+the prerequisite, not the API surface.
+
+```sh
+go install github.com/abagile/tokyo3-ca/cmd/auth-ssh-creds@latest
+```
+
+**One-time login** (re-uses the same OAuth public client you
+registered for any other SSO-shaped CLI in your installation —
+auth-aws-creds, future helpers, etc.):
+
+```sh
+auth-ssh-creds login --issuer https://id.example.com --client-id tokyo3-cli
+# Browser flow on a loopback redirect; caches refresh + id tokens
+# at ~/.config/auth-sso/{config,tokens}.json.
+```
+
+`--device` selects the RFC 8628 device authorization grant for
+headless hosts (CI runners, container builds, jump boxes).
+
+**On-demand cert minting**:
+
+```sh
+auth-ssh-creds get \
+    --certd https://certd.internal \
+    --principals alice,deployer \
+    --ttl 1h
+# auth-ssh-creds: cert written
+#   key:  ~/.config/auth-sso/ssh-creds/keys/id_ed25519
+#   cert: ~/.config/auth-sso/ssh-creds/keys/id_ed25519-cert.pub
+#   ttl:  59m59s (valid_before 2026-05-27T15:00:00Z)
+#   principals: alice,deployer
+```
+
+The first `get` generates an ed25519 keypair in
+`~/.config/auth-sso/ssh-creds/keys/`; subsequent calls reuse it and
+only refresh the signed certificate. `key_id` defaults to the `email`
+claim in the ID token (falling back to `sub`); override with
+`--key-id`. Pass `--groups eng,sre` when certd is configured with
+`Policy` to enforce role-table membership.
+
+**Drop-in `ssh_config` snippet** — pass `--proxy-jump
+<ssh-proxyd-host:port>` and the helper prints a block you can
+append to `~/.ssh/config` (or to a file `Include`d from it):
+
+```sh
+auth-ssh-creds get --certd ... --principals alice --proxy-jump bastion.internal:22 \
+  | tee -a ~/.ssh/config.d/abagile
+```
+
+**Cache layout** under `${XDG_CONFIG_HOME:-~/.config}/auth-sso/`
+(shared with every other `auth-*-creds` helper, so one `login`
+serves all of them):
+
+```
+auth-sso/
+├── config.json              ← issuer + client_id (non-secret, 0600)
+├── tokens.json              ← OAuth access + refresh + id tokens (0600)
+└── ssh-creds/
+    └── keys/                ← ed25519 keypair + certd-signed cert (0600/0644)
+```
+
+The OIDC plumbing (browser flow, PKCE, token cache, refresh
+rotation) lives in
+[`github.com/abagile/tokyo3-base/auth/oidcclient`](https://github.com/abagile/tokyo3-base/tree/main/auth/oidcclient).
+Only the SSH-specific bits (keypair generation,
+`POST /api/v1/ssh/sign-user`, on-disk cert layout, ssh_config
+snippet emission) live in
+[`cmd/auth-ssh-creds`](cmd/auth-ssh-creds).
+
+A containerized build is published as
+`ghcr.io/abagile/tokyo3-ca-cli` for CI runners / dev containers
+that prefer not to `go install`:
+
+```sh
+docker run --rm \
+    -v "$HOME/.config/auth-sso:/root/.config/auth-sso" \
+    -v "$HOME/.ssh:/root/.ssh" \
+    ghcr.io/abagile/tokyo3-ca-cli \
+    auth-ssh-creds get --certd https://certd.internal --principals alice \
+        --key-out /root/.ssh/auth_ed25519 \
+        --cert-out /root/.ssh/auth_ed25519-cert.pub
+```
 
 ## Operations
 
