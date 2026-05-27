@@ -415,13 +415,18 @@ func envFirst(keys ...string) string {
 	return ""
 }
 
-// openLogNATS dials a plain NATS connection used by applog's
+// openLogNATS dials a NATS connection used by applog's
 // WithAsyncNats writer to ship operational log lines on subject
 // "app_log.certd". Reuses the CERTD_NATS_URL / CERT / KEY / CA env vars
 // (CA falls back to CERTD_WORKLOAD_CA). Returns (nil, nil) when the URL
 // is unset — log shipping is disabled and applog falls back to
-// stdout-only. On dial failure returns (nil, err); callers treat it as
-// non-fatal observability and surface a warning.
+// stdout-only.
+//
+// RetryOnFailedConnect + unbounded MaxReconnects mean a broker that's
+// down at boot doesn't permanently disable log shipping for the
+// process lifetime — entries get dropped (AsyncWriter is
+// discard-on-full) while disconnected, and shipping auto-resumes
+// once NATS comes back.
 func openLogNATS() (*nats.Conn, error) {
 	url := os.Getenv("CERTD_NATS_URL")
 	if url == "" {
@@ -433,6 +438,9 @@ func openLogNATS() (*nats.Conn, error) {
 		envFirst("CERTD_NATS_CA", "CERTD_WORKLOAD_CA"),
 		nats.Timeout(1*time.Second),
 		nats.DrainTimeout(500*time.Millisecond),
+		nats.RetryOnFailedConnect(true),
+		nats.MaxReconnects(-1),
+		nats.ReconnectWait(2*time.Second),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("log shipping: %w", err)
@@ -458,7 +466,11 @@ func newAppLogger() (*slog.Logger, func()) {
 	if logNATSErr != nil {
 		log.Warn("operational log shipping disabled", "err", logNATSErr)
 	} else if logNATS != nil {
-		log.Info("operational logs shipping to NATS", "subject", "app_log."+appName)
+		// "configured" rather than "shipping" — RetryOnFailedConnect
+		// means the connection may still be establishing in the
+		// background; entries get dropped (AsyncWriter is
+		// discard-on-full) until it does.
+		log.Info("operational log shipping configured", "subject", "app_log."+appName)
 	}
 	return log, drain
 }
@@ -678,6 +690,7 @@ func openAuditSink(log *slog.Logger) (audit.Sink, error) {
 		URL:     url,
 		Subject: audit.Subject,
 		TLS:     tlsCfg,
+		Log:     log,
 	})
 	if err != nil {
 		return nil, err
@@ -708,6 +721,7 @@ func openAuditSource(log *slog.Logger) (journal.Source, error) {
 		StreamName: audit.StreamName,
 		Subject:    audit.Subject,
 		TLS:        tlsCfg,
+		Log:        log,
 	})
 }
 
@@ -759,6 +773,7 @@ func openSSHAuditSource(log *slog.Logger) (journal.Source, error) {
 		StreamName: "ssh_audit",
 		Subject:    "ssh.audit.events",
 		TLS:        tlsCfg,
+		Log:        log,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("ssh-audit source: %w", err)

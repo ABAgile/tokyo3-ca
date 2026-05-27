@@ -3,7 +3,7 @@ module github.com/abagile/tokyo3-ca
 go 1.26.3
 
 require (
-	github.com/abagile/tokyo3-base v0.5.0
+	github.com/abagile/tokyo3-base v0.5.1
 	github.com/coreos/go-oidc/v3 v3.18.0
 	github.com/google/uuid v1.6.0
 	github.com/nats-io/nats.go v1.50.0
