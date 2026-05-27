@@ -131,10 +131,15 @@ func TestSessionTracker_BoundedByMaxSessions(t *testing.T) {
 		pushEntry(t, src, "ssh.recording.completed",
 			"sess-"+itoa(i), "u", "h:22", "alice", "/cast", 1, time.Now())
 	}
-	// Wait for the buffer to settle.
+	// Wait for the LAST-pushed event to surface at the head of the
+	// ring. Polling on len(Sessions()) >= 3 races: the slice hits 3
+	// after sess-2 ingests but before sess-3/4/5 do, so the test can
+	// observe a stale newest=sess-2 head. Pinning on sess-5 means we
+	// only continue once the producer side is fully drained.
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		if len(tracker.Sessions()) >= 3 {
+		got := tracker.Sessions()
+		if len(got) > 0 && got[0].SessionID == "sess-5" {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
