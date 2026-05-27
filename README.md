@@ -62,6 +62,20 @@ go test -bench=. -benchmem -run=^$ ./internal/server/krl/...
 go test -bench=. -benchmem -run=^$ ./internal/server/signer/...
 ```
 
+### Docker images
+
+Three images are published to GHCR on each tagged release
+(multi-arch: linux/amd64 + linux/arm64):
+
+| Image                                | Stage    | Ships                  | Use case                                                |
+|--------------------------------------|----------|------------------------|---------------------------------------------------------|
+| `ghcr.io/abagile/tokyo3-ca`          | `server` | `certd`                | Central CA service.                                     |
+| `ghcr.io/abagile/tokyo3-ca-agent`    | `agent`  | `cert-agentd`          | Per-workload renewal agent on hosts that need certs.    |
+| `ghcr.io/abagile/tokyo3-ca-cli`      | `cli`    | `auth-ssh-creds`       | CI runners / dev containers that prefer not to `go install`. |
+
+Local builds via `make docker-build` (server), `make docker-build-agent`,
+`make docker-build-cli`.
+
 ## Layout
 
 ```

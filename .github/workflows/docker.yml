@@ -50,9 +50,34 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      # ── Agent image — ghcr.io/<repo>-agent (cert-agentd) ───────────────
+      # Shares the builder layer via the gha cache populated above, so
+      # this build is just the small alpine + COPY tail.
+      - id: meta-agent
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository }}-agent
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=sha
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: agent
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta-agent.outputs.tags }}
+          labels: ${{ steps.meta-agent.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
       # ── CLI image — ghcr.io/<repo>-cli (auth-ssh-creds) ────────────────
       # Shares the builder layer via the gha cache populated above, so
-      # the second build is just the small alpine + COPY tail.
+      # this build is just the small alpine + COPY tail.
       - id: meta-cli
         uses: docker/metadata-action@v6
         with:

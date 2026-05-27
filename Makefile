@@ -6,6 +6,7 @@
 ##   make check              Full pre-commit sequence (gofmt + test + vet + staticcheck + gopls + govulncheck)
 ##   make tidy               Run go mod tidy
 ##   make docker-build       Build the server Docker image (linux/arm64, default)
+##   make docker-build-agent Build the agent image (cert-agentd — for host-level renewal)
 ##   make docker-build-cli   Build the CLI image (auth-ssh-creds — for CI runners + dev containers)
 ##   make install            Install certd + cert-agentd to GOPATH/bin
 ##   make install-cli        Install the auth-ssh-creds helper to GOPATH/bin
@@ -40,7 +41,7 @@ IMAGE_TAG  ?= $(VERSION)
 
 .PHONY: all build build-linux build-linux-amd64 build-darwin \
         test test-verbose tidy vet lint check \
-        docker-build docker-build-amd64 docker-build-cli docker-push \
+        docker-build docker-build-amd64 docker-build-agent docker-build-cli docker-push \
         install install-cli clean help
 
 all: build
@@ -130,6 +131,19 @@ docker-build-amd64:
 	  --target server \
 	  -t $(IMAGE_NAME):$(IMAGE_TAG)-amd64 \
 	  .
+
+## docker-build-agent: Build the cert-agentd image. Runs on every host that
+## needs renewable identity credentials (TLS or SSH host certs). Default
+## platform is linux/arm64 (Graviton); override via TARGETARCH.
+docker-build-agent:
+	docker build \
+	  --platform linux/arm64 \
+	  --build-arg TARGETARCH=arm64 \
+	  --target agent \
+	  -t $(IMAGE_NAME)-agent:$(IMAGE_TAG) \
+	  -t $(IMAGE_NAME)-agent:latest \
+	  .
+	@echo "  built $(IMAGE_NAME)-agent:$(IMAGE_TAG)"
 
 ## docker-build-cli: Build a thin image containing the auth-ssh-creds CLI
 ## helper. The default certd server image deliberately omits this binary —
