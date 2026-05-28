@@ -90,7 +90,6 @@ package main
 
 import (
 	"context"
-	"crypto/x509"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -188,11 +187,7 @@ func runAgent(ctx context.Context) error {
 	// can't recover without operator intervention. Threshold is
 	// deliberately broad (24h) to give ops one warn-level signal
 	// before the silent failure window opens.
-	if remaining := time.Until(r.LeafExpiry()); !r.LeafExpiry().IsZero() && remaining < 24*time.Hour {
-		log.Warn("bootstrap mTLS cert near expiry — first renewal must succeed before it dies",
-			"remaining", remaining.Round(time.Second),
-			"not_after", r.LeafExpiry())
-	}
+	r.WarnIfNearExpiry(24*time.Hour, "bootstrap mTLS cert near expiry — first renewal must succeed before it dies")
 
 	var ttl time.Duration
 	if v := os.Getenv("CERT_AGENTD_TTL_SECONDS"); v != "" {
@@ -218,14 +213,8 @@ func runAgent(ctx context.Context) error {
 			log.Info("workload cert installed for mTLS",
 				"valid_after", validAfter, "valid_before", validBefore)
 		},
-		SignErrorAttrs: func() []any {
-			exp := r.LeafExpiry()
-			if exp.IsZero() {
-				return nil
-			}
-			return []any{"mtls_cert_remaining", time.Until(exp).Round(time.Second)}
-		},
-		Log: log,
+		SignErrorAttrs: r.ExpiryAttrs("mtls_cert_remaining"),
+		Log:            log,
 	})
 	if err != nil {
 		return fmt.Errorf("renewer: %w", err)
@@ -346,22 +335,6 @@ func versionCmd() *cobra.Command {
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
-
-// loadCAPool reads the CA bundle PEM file and returns it as an
-// [*x509.CertPool] suitable for [tls.Config.RootCAs]. Rejects bundles
-// with zero PEM blocks so a typo'd path doesn't silently disable
-// server cert verification.
-func loadCAPool(path string) (*x509.CertPool, error) {
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("read %s: %w", path, err)
-	}
-	pool := x509.NewCertPool()
-	if !pool.AppendCertsFromPEM(b) {
-		return nil, fmt.Errorf("%s contains no PEM certs", path)
-	}
-	return pool, nil
-}
 
 // writeSSHSnippetIfConfigured renders the optional ssh_config drop-in
 // when CERT_AGENTD_SSH_CONFIG_PATH is set. Required-when-present env

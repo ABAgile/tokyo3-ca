@@ -594,34 +594,15 @@ func buildServerTLS(log *slog.Logger) (*tls.Config, error) {
 // and the CERTD_NATS_CERT/KEY/CA env vars. When the URL is empty,
 // returns [audit.NoopSink] — keeps the dev/no-NATS path working.
 func openAuditSink(log *slog.Logger) (audit.Sink, error) {
-	url := os.Getenv("CERTD_NATS_URL")
-	if url == "" {
-		log.Warn("CERTD_NATS_URL not set — audit sink is no-op; not for production")
-		return audit.NoopSink, nil
-	}
-	tlsCfg, err := btls.FromFiles(
-		os.Getenv("CERTD_NATS_CERT"),
-		os.Getenv("CERTD_NATS_KEY"),
-		envutil.First("CERTD_NATS_CA", "CERTD_WORKLOAD_CA"),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("nats audit TLS: %w", err)
-	}
-	if tlsCfg != nil {
-		log.Info("audit sink: NATS JetStream with mTLS", "url", url)
-	} else {
-		log.Warn("audit sink: CERTD_NATS_CERT not set — connecting without mTLS (not for production)")
-	}
-	jSink, err := jetstream.NewSink(jetstream.SinkConfig{
-		URL:     url,
-		Subject: audit.Subject,
-		TLS:     tlsCfg,
-		Log:     log,
+	return jetstream.NewAuditSink[audit.Entry](jetstream.AuditSinkConfig{
+		URL:       os.Getenv("CERTD_NATS_URL"),
+		CertFile:  os.Getenv("CERTD_NATS_CERT"),
+		KeyFile:   os.Getenv("CERTD_NATS_KEY"),
+		CAFile:    envutil.First("CERTD_NATS_CA", "CERTD_WORKLOAD_CA"),
+		Subject:   audit.Subject,
+		EnvPrefix: "CERTD_NATS",
+		Log:       log,
 	})
-	if err != nil {
-		return nil, err
-	}
-	return journal.NewJSONSink[audit.Entry](jSink), nil
 }
 
 // openAuditSource is the read-side counterpart of openAuditSink:
@@ -629,24 +610,14 @@ func openAuditSink(log *slog.Logger) (audit.Sink, error) {
 // subject so the portal admin /portal/admin/audit page can tail the
 // audit log live. When CERTD_NATS_URL is empty, returns NoopSource.
 func openAuditSource(log *slog.Logger) (journal.Source, error) {
-	url := os.Getenv("CERTD_NATS_URL")
-	if url == "" {
-		log.Warn("CERTD_NATS_URL not set — audit source is no-op; admin audit page will be empty")
-		return journal.NoopSource{}, nil
-	}
-	tlsCfg, err := btls.FromFiles(
-		os.Getenv("CERTD_NATS_CERT"),
-		os.Getenv("CERTD_NATS_KEY"),
-		envutil.First("CERTD_NATS_CA", "CERTD_WORKLOAD_CA"),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("nats audit source TLS: %w", err)
-	}
-	return jetstream.NewSource(jetstream.SourceConfig{
-		URL:        url,
+	return jetstream.NewAuditSource(jetstream.AuditSourceConfig{
+		URL:        os.Getenv("CERTD_NATS_URL"),
+		CertFile:   os.Getenv("CERTD_NATS_CERT"),
+		KeyFile:    os.Getenv("CERTD_NATS_KEY"),
+		CAFile:     envutil.First("CERTD_NATS_CA", "CERTD_WORKLOAD_CA"),
 		StreamName: audit.StreamName,
 		Subject:    audit.Subject,
-		TLS:        tlsCfg,
+		EnvPrefix:  "CERTD_NATS",
 		Log:        log,
 	})
 }
