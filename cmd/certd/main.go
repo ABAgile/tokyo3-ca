@@ -146,6 +146,7 @@ import (
 	"time"
 
 	"github.com/abagile/tokyo3-base/applog"
+	"github.com/abagile/tokyo3-base/envutil"
 	"github.com/abagile/tokyo3-base/journal"
 	"github.com/abagile/tokyo3-base/journal/jetstream"
 	btls "github.com/abagile/tokyo3-base/tls"
@@ -199,11 +200,11 @@ func runServe(ctx context.Context) error {
 		URL:      os.Getenv("CERTD_NATS_URL"),
 		CertFile: os.Getenv("CERTD_NATS_CERT"),
 		KeyFile:  os.Getenv("CERTD_NATS_KEY"),
-		CAFile:   envFirst("CERTD_NATS_CA", "CERTD_WORKLOAD_CA"),
+		CAFile:   envutil.First("CERTD_NATS_CA", "CERTD_WORKLOAD_CA"),
 	}, applog.WithStdout())
 	defer drainLog()
 
-	addr := envOr("CERTD_ADDR", ":8443")
+	addr := envutil.Or("CERTD_ADDR", ":8443")
 
 	caSigner, err := loadCASigner(log)
 	if err != nil {
@@ -215,12 +216,12 @@ func runServe(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("audit sink: %w", err)
 	}
-	defer closeIfCloser(auditSink)
+	defer envutil.CloseIfCloser(auditSink)
 	auditSrc, err := openAuditSource(log)
 	if err != nil {
 		return fmt.Errorf("audit source: %w", err)
 	}
-	defer closeIfCloser(auditSrc)
+	defer envutil.CloseIfCloser(auditSrc)
 
 	tlsCfg, err := buildServerTLS(log)
 	if err != nil {
@@ -400,24 +401,6 @@ func versionCmd() *cobra.Command {
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
-func envOr(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return fallback
-}
-
-// envFirst returns the value of the first non-empty env var among keys.
-// Used for chained fallbacks (e.g., CERTD_NATS_CA → CERTD_WORKLOAD_CA).
-func envFirst(keys ...string) string {
-	for _, k := range keys {
-		if v := os.Getenv(k); v != "" {
-			return v
-		}
-	}
-	return ""
-}
-
 // loadCASigner returns the CA signing primitive. CERTD_CA_KEY_FILE
 // points at a PKCS#8 Ed25519 PEM file; when unset, certd generates an
 // ephemeral keypair and warns that issued certs won't survive a restart.
@@ -480,7 +463,7 @@ func loadOrGenerateX509Issuer(log *slog.Logger, caSigner signer.Signer) (*x509.C
 		log.Info("x509 issuer ready", "source", "file", "path", path, "cn", cert.Subject.CommonName)
 		return cert, nil
 	}
-	cn := envOr("CERTD_CA_X509_CERT_CN", "tokyo3-ca")
+	cn := envutil.Or("CERTD_CA_X509_CERT_CN", "tokyo3-ca")
 	cert, err := x509engine.NewSelfSignedCA(rand.Reader, caSigner, cn)
 	if err != nil {
 		return nil, err
@@ -619,7 +602,7 @@ func openAuditSink(log *slog.Logger) (audit.Sink, error) {
 	tlsCfg, err := btls.FromFiles(
 		os.Getenv("CERTD_NATS_CERT"),
 		os.Getenv("CERTD_NATS_KEY"),
-		envFirst("CERTD_NATS_CA", "CERTD_WORKLOAD_CA"),
+		envutil.First("CERTD_NATS_CA", "CERTD_WORKLOAD_CA"),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("nats audit TLS: %w", err)
@@ -654,7 +637,7 @@ func openAuditSource(log *slog.Logger) (journal.Source, error) {
 	tlsCfg, err := btls.FromFiles(
 		os.Getenv("CERTD_NATS_CERT"),
 		os.Getenv("CERTD_NATS_KEY"),
-		envFirst("CERTD_NATS_CA", "CERTD_WORKLOAD_CA"),
+		envutil.First("CERTD_NATS_CA", "CERTD_WORKLOAD_CA"),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("nats audit source TLS: %w", err)
@@ -702,11 +685,11 @@ func openSSHAuditSource(log *slog.Logger) (journal.Source, error) {
 		log.Warn("CERTD_SSH_AUDIT_URL unset — /portal/sessions and ssh-proxy audit disabled")
 		return nil, nil
 	}
-	url := envFirst("CERTD_SSH_AUDIT_URL", "CERTD_NATS_URL")
+	url := envutil.First("CERTD_SSH_AUDIT_URL", "CERTD_NATS_URL")
 	tlsCfg, err := btls.FromFiles(
-		envFirst("CERTD_SSH_AUDIT_CERT", "CERTD_NATS_CERT"),
-		envFirst("CERTD_SSH_AUDIT_KEY", "CERTD_NATS_KEY"),
-		envFirst("CERTD_SSH_AUDIT_CA", "CERTD_NATS_CA", "CERTD_WORKLOAD_CA"),
+		envutil.First("CERTD_SSH_AUDIT_CERT", "CERTD_NATS_CERT"),
+		envutil.First("CERTD_SSH_AUDIT_KEY", "CERTD_NATS_KEY"),
+		envutil.First("CERTD_SSH_AUDIT_CA", "CERTD_NATS_CA", "CERTD_WORKLOAD_CA"),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("ssh-audit source TLS: %w", err)
@@ -764,12 +747,4 @@ func newAuditTracker(log *slog.Logger, certdSrc, sshSrc journal.Source) (*portal
 	}
 	log.Info("audit tracker configured", "sources", len(sources))
 	return tracker, nil
-}
-
-// closeIfCloser invokes Close on resources that implement io.Closer,
-// silently ignoring values that don't (e.g., NoopSource).
-func closeIfCloser(v any) {
-	if c, ok := v.(interface{ Close() error }); ok {
-		_ = c.Close()
-	}
 }

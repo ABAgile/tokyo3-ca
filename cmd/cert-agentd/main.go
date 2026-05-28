@@ -107,6 +107,7 @@ import (
 	"time"
 
 	"github.com/abagile/tokyo3-base/applog"
+	"github.com/abagile/tokyo3-base/envutil"
 	"github.com/spf13/cobra"
 
 	"github.com/abagile/tokyo3-ca/internal/agent/output"
@@ -147,20 +148,20 @@ func runCmd() *cobra.Command {
 func runAgent(ctx context.Context) error {
 	log, _, drainLog := applog.AppLoggerWithNATS(applog.Config{
 		App:      appName,
-		Instance: envOr("CERT_AGENTD_INSTANCE", hostnameOrEmpty()),
+		Instance: envutil.Or("CERT_AGENTD_INSTANCE", envutil.HostnameOrEmpty()),
 	}, applog.NATSConfig{
 		URL:      os.Getenv("CERT_AGENTD_NATS_URL"),
-		CertFile: envFirst("CERT_AGENTD_NATS_CERT", "CERT_AGENTD_CERT"),
-		KeyFile:  envFirst("CERT_AGENTD_NATS_KEY", "CERT_AGENTD_KEY"),
-		CAFile:   envFirst("CERT_AGENTD_NATS_CA", "CERT_AGENTD_CA"),
+		CertFile: envutil.First("CERT_AGENTD_NATS_CERT", "CERT_AGENTD_CERT"),
+		KeyFile:  envutil.First("CERT_AGENTD_NATS_KEY", "CERT_AGENTD_KEY"),
+		CAFile:   envutil.First("CERT_AGENTD_NATS_CA", "CERT_AGENTD_CA"),
 	}, applog.WithStdout())
 	defer drainLog()
 
-	certdURL := mustEnv("CERT_AGENTD_CERTD_URL")
-	certPath := mustEnv("CERT_AGENTD_CERT")
-	keyPath := mustEnv("CERT_AGENTD_KEY")
-	caPath := mustEnv("CERT_AGENTD_CA")
-	spiffeURI := mustEnv("CERT_AGENTD_SPIFFE_URI")
+	certdURL := envutil.MustEnv("CERT_AGENTD_CERTD_URL")
+	certPath := envutil.MustEnv("CERT_AGENTD_CERT")
+	keyPath := envutil.MustEnv("CERT_AGENTD_KEY")
+	caPath := envutil.MustEnv("CERT_AGENTD_CA")
+	spiffeURI := envutil.MustEnv("CERT_AGENTD_SPIFFE_URI")
 
 	// Bootstrap: load the workload cert + key + CA bundle once. The
 	// reloader is what TLS actually reads on every handshake — the
@@ -354,48 +355,6 @@ func versionCmd() *cobra.Command {
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
-
-func envOr(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return fallback
-}
-
-func mustEnv(key string) string {
-	v := os.Getenv(key)
-	if v == "" {
-		fmt.Fprintf(os.Stderr, "%s: %s is required\n", appName, key)
-		os.Exit(2)
-	}
-	return v
-}
-
-// envFirst returns the first non-empty value among the named env
-// vars (left-to-right), or "" when all are unset. Used for the
-// fallback chains where a NATS-specific override falls through to
-// the workload-identity material.
-func envFirst(keys ...string) string {
-	for _, k := range keys {
-		if v := os.Getenv(k); v != "" {
-			return v
-		}
-	}
-	return ""
-}
-
-// hostnameOrEmpty returns os.Hostname() on success and "" on error.
-// Used as the default for CERT_AGENTD_INSTANCE so the NATS subject
-// hierarchy picks up a sensible per-host suffix without any
-// operator action; the empty fallback keeps the helper at its
-// legacy singleton-subject shape when the OS refuses to answer.
-func hostnameOrEmpty() string {
-	h, err := os.Hostname()
-	if err != nil {
-		return ""
-	}
-	return h
-}
 
 // loadCAPool reads the CA bundle PEM file and returns it as an
 // [*x509.CertPool] suitable for [tls.Config.RootCAs]. Rejects bundles
@@ -622,7 +581,7 @@ func writeSSHSnippetIfConfigured(log *slog.Logger) error {
 		return errors.New("CERT_AGENTD_SSH_USER_CERT and CERT_AGENTD_SSH_USER_KEY are required when CERT_AGENTD_SSH_CONFIG_PATH is set (typically the same paths the SSH user cert renewer manages)")
 	}
 	snippet := output.SSHConfigSnippet{
-		HostPattern:     envOr("CERT_AGENTD_SSH_HOST_PATTERN", "*"),
+		HostPattern:     envutil.Or("CERT_AGENTD_SSH_HOST_PATTERN", "*"),
 		CertificateFile: cert,
 		IdentityFile:    key,
 		ProxyJump:       os.Getenv("CERT_AGENTD_SSH_PROXY_JUMP"),
