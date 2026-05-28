@@ -90,10 +90,7 @@ package main
 
 import (
 	"context"
-	"crypto/sha256"
-	"crypto/tls"
 	"crypto/x509"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -102,12 +99,12 @@ import (
 	"path"
 	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
 	"github.com/abagile/tokyo3-base/applog"
 	"github.com/abagile/tokyo3-base/envutil"
+	"github.com/abagile/tokyo3-base/tls/reloader"
 	"github.com/spf13/cobra"
 
 	"github.com/abagile/tokyo3-ca/internal/agent/output"
@@ -169,22 +166,16 @@ func runAgent(ctx context.Context) error {
 	// successful renewal, and a background mtime poller refreshes
 	// the CA bundle when operators drop in a new one (e.g., during
 	// a CA-rotation overlap window).
-	reloader, err := newCertReloader(certPath, keyPath, caPath, log)
+	r, err := reloader.New(reloader.Config{
+		CertPath: certPath,
+		KeyPath:  keyPath,
+		Pools:    map[string]string{"ca": caPath},
+		Log:      log,
+	})
 	if err != nil {
 		return fmt.Errorf("bootstrap cert: %w", err)
 	}
-	// InsecureSkipVerify + VerifyConnection so the standard
-	// verification path — which freezes RootCAs at config-
-	// construction time — doesn't compete with hot-reload semantics.
-	// VerifyConnection runs full chain + hostname verification
-	// against the current pool snapshot on every handshake.
-	tlsCfg := &tls.Config{
-		GetClientCertificate: reloader.GetClientCertificate,
-		InsecureSkipVerify:   true,
-		VerifyConnection:     reloader.VerifyConnection,
-		MinVersion:           tls.VersionTLS12,
-	}
-	certdClient, err := client.NewClient(certdURL, tlsCfg)
+	certdClient, err := client.NewClient(certdURL, r.TLSConfig("ca"))
 	if err != nil {
 		return fmt.Errorf("certd client: %w", err)
 	}
@@ -197,10 +188,10 @@ func runAgent(ctx context.Context) error {
 	// can't recover without operator intervention. Threshold is
 	// deliberately broad (24h) to give ops one warn-level signal
 	// before the silent failure window opens.
-	if remaining := time.Until(reloader.LeafExpiry()); !reloader.LeafExpiry().IsZero() && remaining < 24*time.Hour {
+	if remaining := time.Until(r.LeafExpiry()); !r.LeafExpiry().IsZero() && remaining < 24*time.Hour {
 		log.Warn("bootstrap mTLS cert near expiry — first renewal must succeed before it dies",
 			"remaining", remaining.Round(time.Second),
-			"not_after", reloader.LeafExpiry())
+			"not_after", r.LeafExpiry())
 	}
 
 	var ttl time.Duration
@@ -220,7 +211,7 @@ func runAgent(ctx context.Context) error {
 		KeyOutputPath:     keyPath,
 		RequestedTTL:      ttl,
 		OnRenewed: func(validAfter, validBefore time.Time) {
-			if err := reloader.Refresh(); err != nil {
+			if err := r.Refresh(); err != nil {
 				log.Warn("reload cert into TLS config", "err", err)
 				return
 			}
@@ -228,7 +219,7 @@ func runAgent(ctx context.Context) error {
 				"valid_after", validAfter, "valid_before", validBefore)
 		},
 		SignErrorAttrs: func() []any {
-			exp := reloader.LeafExpiry()
+			exp := r.LeafExpiry()
 			if exp.IsZero() {
 				return nil
 			}
@@ -265,7 +256,7 @@ func runAgent(ctx context.Context) error {
 	errCh := make(chan error, 3)
 	expected := 2
 	go func() { errCh <- renewer.Run(rootCtx) }()
-	go func() { errCh <- reloader.RunCAPoll(rootCtx, DefaultCAPollInterval, log) }()
+	go func() { errCh <- r.RunPoll(rootCtx, reloader.DefaultPollInterval) }()
 	if userRenewer != nil {
 		expected = 3
 		go func() { errCh <- userRenewer.Run(rootCtx) }()
@@ -370,200 +361,6 @@ func loadCAPool(path string) (*x509.CertPool, error) {
 		return nil, fmt.Errorf("%s contains no PEM certs", path)
 	}
 	return pool, nil
-}
-
-// certReloader wraps the workload cert+key paths AND the CA bundle
-// path so a TLS handshake always sees the current on-disk material.
-// The cert+key are refreshed event-driven (by the renewer's
-// OnRenewed hook); the CA bundle is refreshed by an mtime-polling
-// goroutine ([certReloader.RunCAPoll]) so operators can drop in a
-// new bundle (e.g., during a CA rotation overlap window) without
-// restarting the agent. Concurrent reads from TLS handshakes are
-// protected by a read/write mutex.
-//
-// log is used to surface bundle reloads at info level — operators
-// rely on this line ("CA bundle reloaded") to confirm a rotated
-// bundle has propagated to every daemon in the fleet before
-// flipping the upstream signing key. nil ⇒ slog.Default().
-type certReloader struct {
-	certPath, keyPath, caPath string
-	log                       *slog.Logger
-
-	mu       sync.RWMutex
-	cert     *tls.Certificate
-	notAfter time.Time // cached from cert.Leaf so callers don't reparse on every read
-	pool     *x509.CertPool
-	caMtime  time.Time
-}
-
-// DefaultCAPollInterval is the mtime-poll cadence for the CA bundle.
-// Cheap (one os.Stat) and a minute-scale upper bound on "I dropped
-// in a new bundle, how long until daemons trust it?". 30s is the
-// same cadence ssh-proxyd uses for revocation polling — operators
-// only have one number to think about.
-const DefaultCAPollInterval = 30 * time.Second
-
-func newCertReloader(certPath, keyPath, caPath string, log *slog.Logger) (*certReloader, error) {
-	if log == nil {
-		log = slog.Default()
-	}
-	r := &certReloader{certPath: certPath, keyPath: keyPath, caPath: caPath, log: log}
-	if err := r.Refresh(); err != nil {
-		return nil, err
-	}
-	if err := r.refreshCABundle(); err != nil {
-		return nil, fmt.Errorf("initial CA bundle: %w", err)
-	}
-	return r, nil
-}
-
-// Refresh re-reads the cert+key from disk and atomically replaces
-// the holder. Called from renewer.OnRenewed after each successful
-// renewal. Parses the leaf cert so [certReloader.LeafExpiry] can
-// surface expiry to operators without reparsing per-handshake.
-func (r *certReloader) Refresh() error {
-	cert, err := tls.LoadX509KeyPair(r.certPath, r.keyPath)
-	if err != nil {
-		return fmt.Errorf("load %s/%s: %w", r.certPath, r.keyPath, err)
-	}
-	if len(cert.Certificate) > 0 {
-		leaf, err := x509.ParseCertificate(cert.Certificate[0])
-		if err != nil {
-			return fmt.Errorf("parse leaf %s: %w", r.certPath, err)
-		}
-		cert.Leaf = leaf
-	}
-	r.mu.Lock()
-	r.cert = &cert
-	if cert.Leaf != nil {
-		r.notAfter = cert.Leaf.NotAfter
-	}
-	r.mu.Unlock()
-	return nil
-}
-
-// refreshCABundle reads the CA bundle from disk and atomically
-// replaces the pool when the file's mtime has advanced. No-op when
-// the mtime is unchanged so the poll path is cheap even when
-// operators leave the bundle alone for days at a time. Logs at
-// info on every successful swap so operators can confirm a rotated
-// bundle has propagated.
-func (r *certReloader) refreshCABundle() error {
-	stat, err := os.Stat(r.caPath)
-	if err != nil {
-		return fmt.Errorf("stat %s: %w", r.caPath, err)
-	}
-	r.mu.RLock()
-	prev := r.caMtime
-	r.mu.RUnlock()
-	if !stat.ModTime().After(prev) && r.poolLoaded() {
-		return nil
-	}
-	pem, err := os.ReadFile(r.caPath)
-	if err != nil {
-		return fmt.Errorf("read %s: %w", r.caPath, err)
-	}
-	pool := x509.NewCertPool()
-	if !pool.AppendCertsFromPEM(pem) {
-		return fmt.Errorf("%s contains no PEM certs", r.caPath)
-	}
-	r.mu.Lock()
-	r.pool = pool
-	r.caMtime = stat.ModTime()
-	r.mu.Unlock()
-	r.log.Info("CA bundle reloaded",
-		"path", r.caPath,
-		"mtime", stat.ModTime(),
-		"fingerprint", bundleFingerprint(pem))
-	return nil
-}
-
-// bundleFingerprint is the first 8 bytes of sha256(pem), hex-
-// encoded. Short enough for human-friendly log diffing across a
-// fleet, long enough that distinct bundles don't collide in
-// practice.
-func bundleFingerprint(pem []byte) string {
-	sum := sha256.Sum256(pem)
-	return hex.EncodeToString(sum[:8])
-}
-
-func (r *certReloader) poolLoaded() bool {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	return r.pool != nil
-}
-
-// RunCAPoll ticks every interval and re-reads the CA bundle when
-// its mtime advances. Logs at warn on read errors (the previous
-// pool stays live; operators can fix the file and the next tick
-// picks it up). Returns when ctx is cancelled.
-func (r *certReloader) RunCAPoll(ctx context.Context, interval time.Duration, log *slog.Logger) error {
-	if interval <= 0 {
-		interval = DefaultCAPollInterval
-	}
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-ticker.C:
-			if err := r.refreshCABundle(); err != nil {
-				log.Warn("CA bundle reload failed; keeping previous pool", "path", r.caPath, "err", err)
-			}
-		}
-	}
-}
-
-// VerifyConnection runs full chain + hostname verification against
-// the current pool snapshot. Wired into tls.Config.VerifyConnection
-// (with tls.Config.InsecureSkipVerify = true) so the standard
-// verification path — which reads RootCAs at config-construction
-// time — doesn't compete with hot-reload semantics. ServerName comes
-// from the http.Transport's SNI which mirrors the URL host, so
-// hostname-against-cert still matches the standard verifier's check.
-func (r *certReloader) VerifyConnection(cs tls.ConnectionState) error {
-	r.mu.RLock()
-	pool := r.pool
-	r.mu.RUnlock()
-	if pool == nil {
-		return errors.New("certReloader: no CA bundle loaded")
-	}
-	if len(cs.PeerCertificates) == 0 {
-		return errors.New("certReloader: peer presented no certificates")
-	}
-	opts := x509.VerifyOptions{
-		Roots:         pool,
-		DNSName:       cs.ServerName,
-		Intermediates: x509.NewCertPool(),
-	}
-	for _, cert := range cs.PeerCertificates[1:] {
-		opts.Intermediates.AddCert(cert)
-	}
-	_, err := cs.PeerCertificates[0].Verify(opts)
-	return err
-}
-
-// LeafExpiry returns the loaded cert's NotAfter. Zero value when no
-// cert is loaded yet (which the Refresh path treats as a fatal
-// startup error, so the zero only appears in test scaffolding).
-func (r *certReloader) LeafExpiry() time.Time {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	return r.notAfter
-}
-
-// GetClientCertificate satisfies the tls.Config callback signature.
-// Returns the current workload cert; tls.Config invokes this on
-// every handshake so the fresh cert is picked up automatically
-// without rebuilding the http.Client.
-func (r *certReloader) GetClientCertificate(_ *tls.CertificateRequestInfo) (*tls.Certificate, error) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	if r.cert == nil {
-		return nil, errors.New("certReloader: no cert loaded yet")
-	}
-	return r.cert, nil
 }
 
 // writeSSHSnippetIfConfigured renders the optional ssh_config drop-in
