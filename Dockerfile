@@ -43,11 +43,15 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
 # ── Stage 2: Agent image (build with --target agent) ──────────────────────────
 FROM alpine:3.21 AS agent
 
-RUN apk add --no-cache ca-certificates
+# tini as PID 1 reaps orphaned children (e.g. the ssl_client that
+# busybox-wget healthchecks leave behind) and forwards signals so the
+# binary still shuts down cleanly. Without it a non-reaping Go PID 1
+# accumulates <defunct> processes — cgroup pids.current climbs forever.
+RUN apk add --no-cache ca-certificates tini
 
 COPY --from=builder /out/cert-agentd /usr/local/bin/cert-agentd
 
-ENTRYPOINT ["/usr/local/bin/cert-agentd"]
+ENTRYPOINT ["/sbin/tini", "--", "/usr/local/bin/cert-agentd"]
 CMD ["run"]
 
 # ── Stage 3: CLI image (build with --target cli) ──────────────────────────────
@@ -65,11 +69,15 @@ CMD ["/bin/sh"]
 # ── Stage 4: Server runtime image (default target) ────────────────────────────
 FROM alpine:3.21 AS server
 
-RUN apk add --no-cache ca-certificates
+# tini as PID 1 reaps orphaned children (notably the ssl_client that the
+# busybox-wget HTTPS healthcheck orphans every probe) and forwards
+# signals so certd shuts down cleanly. Without it a non-reaping Go PID 1
+# accumulates <defunct> processes — cgroup pids.current climbs forever.
+RUN apk add --no-cache ca-certificates tini
 
 COPY --from=builder /out/certd /usr/local/bin/certd
 
 EXPOSE 443
 
-ENTRYPOINT ["/usr/local/bin/certd"]
+ENTRYPOINT ["/sbin/tini", "--", "/usr/local/bin/certd"]
 CMD ["serve"]
