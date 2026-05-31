@@ -43,6 +43,8 @@ jobs:
         with:
           context: .
           target: server
+          build-args: |
+            VERSION=${{ steps.meta-server.outputs.version }}
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta-server.outputs.tags }}
@@ -68,6 +70,8 @@ jobs:
         with:
           context: .
           target: agent
+          build-args: |
+            VERSION=${{ steps.meta-agent.outputs.version }}
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta-agent.outputs.tags }}
@@ -93,6 +97,8 @@ jobs:
         with:
           context: .
           target: cli
+          build-args: |
+            VERSION=${{ steps.meta-cli.outputs.version }}
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta-cli.outputs.tags }}

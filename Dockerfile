@@ -24,6 +24,15 @@ FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS builder
 ARG TARGETOS=linux
 ARG TARGETARCH=arm64
 
+# VERSION is injected into each binary's `var Version` via -ldflags.
+# Defaults to "dev" when callers leave it unset; the in-binary
+# resolveVersion() helper then falls back to runtime/debug.BuildInfo
+# (vcs.revision + vcs.modified are stamped by the Go toolchain when
+# building from a VCS tree). Both compose rigs pass dev-docker by
+# default so image-built binaries are trivially distinguishable from
+# `go install`-built ones.
+ARG VERSION=dev
+
 WORKDIR /src
 
 # Download deps first (cached layer unless go.mod/go.sum change).
@@ -34,11 +43,11 @@ COPY cmd/ cmd/
 COPY internal/ internal/
 
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
-    go build -ldflags="-s -w" -o /out/certd ./cmd/certd
+    go build -ldflags="-s -w -X main.Version=${VERSION}" -o /out/certd ./cmd/certd
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
-    go build -ldflags="-s -w" -o /out/cert-agentd ./cmd/cert-agentd
+    go build -ldflags="-s -w -X main.Version=${VERSION}" -o /out/cert-agentd ./cmd/cert-agentd
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
-    go build -ldflags="-s -w" -o /out/auth-ssh-creds ./cmd/auth-ssh-creds
+    go build -ldflags="-s -w -X main.Version=${VERSION}" -o /out/auth-ssh-creds ./cmd/auth-ssh-creds
 
 # ── Stage 2: Agent image (build with --target agent) ──────────────────────────
 FROM alpine:3.21 AS agent
