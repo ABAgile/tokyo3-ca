@@ -405,8 +405,9 @@ parsing subjects.
 certd reuses its existing `CERTD_NATS_*` audit env vars (one
 broker, two subjects). cert-agentd's NATS cert / key / CA each
 fall back to the workload-identity material it already uses for
-certd (`CERT_AGENTD_CERT/_KEY/_CA`), so a single TLS file set
-covers both certd issuance and log shipping.
+certd (`CERT_AGENTD_WORKLOAD_CERT/_KEY/_CA`) via the `WORKLOAD_*`
+convention in `tokyo3-base/cli`, so a single TLS file set covers
+both certd issuance and log shipping.
 
 The shipper dials with `RetryOnFailedConnect(true)` and unbounded
 reconnects — a broker that's down at boot doesn't fail process

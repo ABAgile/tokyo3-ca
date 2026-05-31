@@ -11,122 +11,104 @@
 //
 // Optional env vars:
 //
-//	CERTD_ADDR              HTTPS listen address (default ":8443").
+//	CERTD_ADDR  HTTPS listen address (default ":8443").
 //
-//	CERTD_API_CERT          Server TLS certificate PEM path. Hot-reloaded
-//	                        (mtime polled at most once per second across
-//	                        handshakes, so rotations land within ~1s).
-//	CERTD_API_KEY           Server TLS private key PEM path. Required iff
-//	                        CERTD_API_CERT is set. If neither is set an
-//	                        ephemeral self-signed cert is generated (dev only).
-//	CERTD_API_CLIENT_CA     Optional CA PEM for client cert verification (mTLS).
-//	                        When set, client certs are validated against this
-//	                        bundle (VerifyClientCertIfGiven mode).
+//	CERTD_DEBUG_ADDR  Optional plaintext address for net/http/pprof + a 30s goroutine/OS-thread
+//	                  stats log (e.g. "127.0.0.1:6060"). Unset ⇒ disabled. Never expose publicly
+//	                  — it serves unauthenticated profiling on its own listener, off the mTLS
+//	                  API.
 //
-//	CERTD_WORKLOAD_CA       CA PEM that signs every internal workload cert
-//	                        certd connects to (NATS, future DB). Used as the
-//	                        fallback for CERTD_NATS_CA when that var is unset.
+//	CERTD_API_CERT       Server TLS certificate PEM path. Hot-reloaded (mtime polled at most
+//	                     once per second across handshakes, so rotations land within ~1s).
+//	CERTD_API_KEY        Server TLS private key PEM path. Required iff CERTD_API_CERT is set. If
+//	                     neither is set an ephemeral self-signed cert is generated (dev only).
+//	CERTD_API_CLIENT_CA  Optional CA PEM for verifying inbound mTLS client certs (mesh
+//	                     workloads); falls back to CERTD_WORKLOAD_CA. When set, client certs are
+//	                     validated against the bundle (VerifyClientCertIfGiven mode). Both unset
+//	                     ⇒ client-cert verification off.
 //
-//	CERTD_CA_KEY_FILE       PKCS#8-encoded Ed25519 private key PEM path used
-//	                        as the CA signing key. When unset, certd generates
-//	                        an ephemeral key at startup — dev only; certs are
-//	                        invalidated on every restart.
+//	CERTD_WORKLOAD_CA  CA PEM that signs every internal workload cert certd connects to (NATS,
+//	                   future DB). Used as the fallback for CERTD_NATS_CA when that var is
+//	                   unset.
 //
-//	CERTD_NATS_URL          NATS server URL (e.g., nats://nats:4222 or
-//	                        tls://nats:4222). Empty disables JetStream
-//	                        publishing — audit sink becomes [audit.NoopSink],
-//	                        audit source becomes [journal.NoopSource].
-//	CERTD_NATS_CERT         Publisher client certificate PEM path (mTLS).
-//	CERTD_NATS_KEY          Publisher client key PEM path. Required iff
-//	                        CERTD_NATS_CERT is set.
-//	CERTD_NATS_CA           CA certificate PEM path for verifying the NATS
-//	                        server cert. Falls back to CERTD_WORKLOAD_CA.
+//	CERTD_CA_KEY_FILE        PKCS#8-encoded Ed25519 private key PEM path — the CA signing key
+//	                         used for BOTH SSH user/host certs and X.509/SPIFFE workload certs
+//	                         (one key: wrapped for SSH, used directly for X.509). When unset,
+//	                         certd generates an ephemeral key at startup — dev only; certs are
+//	                         invalidated on every restart.
+//	CERTD_CA_X509_CERT_FILE  X.509-only issuer cert for the workload/SPIFFE certs signed by that
+//	                         key. SSH needs no issuer cert — clients trust the key's public half
+//	                         via TrustedUserCAKeys. When unset, certd self-signs one at startup
+//	                         from the CA signing key — dev only; production should pin a stable
+//	                         cert so consumers can verify the chain.
+//	CERTD_CA_X509_CERT_CN    Subject CN for the self-signed startup CA cert. Default
+//	                         "tokyo3-ca".
 //
-//	CERTD_OIDC_ISSUER       OIDC IdP issuer URL (e.g., https://auth.example.com).
-//	                        When set together with CERTD_OIDC_AUDIENCE,
-//	                        sign endpoints require a valid Authorization:
-//	                        Bearer token and derive the caller's groups
-//	                        from its claims. When unset, body groups are
-//	                        used (for tests and pre-prod).
-//	CERTD_OIDC_AUDIENCE     The `aud` claim the IdP embeds on every token
-//	                        minted for certd (the OIDC client_id the IdP
-//	                        registers for this service). Required when
-//	                        CERTD_OIDC_ISSUER is set.
+//	CERTD_NATS_URL   NATS server URL (e.g., nats://nats:4222 or tls://nats:4222). Empty disables
+//	                 JetStream publishing — audit sink becomes [audit.NoopSink], audit source
+//	                 becomes [journal.NoopSource].
+//	CERTD_NATS_CERT  Publisher client certificate PEM path (mTLS).
+//	CERTD_NATS_KEY   Publisher client key PEM path. Required iff CERTD_NATS_CERT is set.
+//	CERTD_NATS_CA    CA certificate PEM path for verifying the NATS server cert. Falls back to
+//	                 CERTD_WORKLOAD_CA.
 //
-//	CERTD_CA_X509_CERT_FILE  Path to a PEM-encoded CA certificate used
-//	                        as the issuer for X.509 / SPIFFE workload
-//	                        certs. When unset, certd generates a
-//	                        self-signed CA cert at startup using the
-//	                        configured CA signer — appropriate for dev;
-//	                        production should set this to a stable
-//	                        cert so consumers can pin trust.
-//	CERTD_CA_X509_CERT_CN   Subject CN used when self-signing the
-//	                        startup-generated CA cert. Default
-//	                        "tokyo3-ca".
+//	CERTD_OIDC_ISSUER    OIDC IdP issuer URL (e.g., https://auth.example.com). When set together
+//	                     with CERTD_OIDC_AUDIENCE, sign endpoints require a valid Authorization:
+//	                     Bearer token and derive the caller's groups from its claims. When
+//	                     unset, body groups are used (for tests and pre-prod).
+//	CERTD_OIDC_AUDIENCE  The `aud` claim the IdP embeds on every token minted for certd (the
+//	                     OIDC client_id the IdP registers for this service). Required when
+//	                     CERTD_OIDC_ISSUER is set.
 //
 //	CERTD_MTLS_PRINCIPALS_FILE  Path to a JSON file mapping cert SANs
-//	                        (SPIFFE URI or email) to workload identities
-//	                        + group claims. When set, sign endpoints
-//	                        accept a verified client cert as an
-//	                        alternative to the OIDC bearer path. File
-//	                        shape:
+//	                            (SPIFFE URI or email) to workload identities
+//	                            + group claims. When set, sign endpoints
+//	                            accept a verified client cert as an
+//	                            alternative to the OIDC bearer path. File
+//	                            shape:
 //
-//	                          [
-//	                            {"name":"ssh-proxyd-prod",
-//	                             "san":"spiffe://corp/svc/ssh-proxyd",
-//	                             "groups":["ssh-proxy-service"]},
-//	                            {"name":"ops-bot",
-//	                             "san":"ops@corp.com",
-//	                             "groups":["ops"]}
-//	                          ]
+//	                              [
+//	                                {"name":"ssh-proxyd-prod",
+//	                                 "san":"spiffe://corp/svc/ssh-proxyd",
+//	                                 "groups":["ssh-proxy-service"]},
+//	                                {"name":"ops-bot",
+//	                                 "san":"ops@corp.com",
+//	                                 "groups":["ops"]}
+//	                              ]
 //
-//	                        Unset disables the mTLS auth path. The
-//	                        admin portal will replace the file with a
-//	                        Postgres-backed registry in a later slice.
+//	                            Unset disables the mTLS auth path. The
+//	                            admin portal will replace the file with a
+//	                            Postgres-backed registry in a later slice.
 //
-//	CERTD_PORTAL_USERNAME   When set together with CERTD_PORTAL_PASSWORD,
-//	                        every /portal/* request (except /healthz)
-//	                        must present matching HTTP Basic
-//	                        credentials. Unset leaves the portal open
-//	                        and operators are expected to front it
-//	                        with oauth2-proxy / mTLS / similar.
-//	CERTD_PORTAL_PASSWORD   The matching secret. Constant-time
-//	                        compared against the request's
-//	                        Authorization header.
-//	CERTD_PORTAL_REALM      Optional Basic-auth realm shown in the
-//	                        browser prompt. Default "certd portal".
+//	CERTD_PORTAL_USERNAME       When set together with CERTD_PORTAL_PASSWORD, every /portal/*
+//	                            request (except /healthz) must present matching HTTP Basic
+//	                            credentials. Unset leaves the portal open and operators are
+//	                            expected to front it with oauth2-proxy / mTLS / similar.
+//	CERTD_PORTAL_PASSWORD       The matching secret. Constant-time compared against the
+//	                            request's Authorization header.
+//	CERTD_PORTAL_REALM          Optional Basic-auth realm shown in the browser prompt. Default
+//	                            "certd portal".
 //
-//	CERTD_CAST_DIR          Directory containing the asciinema cast
-//	                        files referenced by recording.completed
-//	                        events (typically the same path
-//	                        ssh-proxyd writes to, mounted into the
-//	                        certd container). Required for the
-//	                        portal's session-replay embed and the
-//	                        /sessions/{id}/cast endpoint; unset
-//	                        leaves the player hidden. Paths outside
-//	                        this directory are rejected with 403.
+//	CERTD_CAST_DIR  Directory containing the asciinema cast files referenced by
+//	                recording.completed events (typically the same path ssh-proxyd writes to,
+//	                mounted into the certd container). Required for the portal's session-replay
+//	                embed and the /sessions/{id}/cast endpoint; unset leaves the player hidden.
+//	                Paths outside this directory are rejected with 403.
 //
-//	CERTD_SSH_AUDIT_URL     NATS URL for the ssh_audit stream
-//	                        ssh-proxyd publishes recording.completed
-//	                        events to. When set, certd subscribes,
-//	                        decodes the events, and powers the
-//	                        portal's /sessions page. Falls back to
-//	                        CERTD_NATS_URL when unset; truly empty
-//	                        means "no sessions page". TLS material
-//	                        comes from CERTD_SSH_AUDIT_CERT/_KEY/_CA
-//	                        with the same CERTD_NATS_* fallback chain.
+//	CERTD_SSH_AUDIT_URL  NATS URL for the ssh_audit stream ssh-proxyd publishes
+//	                     recording.completed events to. When set, certd subscribes, decodes the
+//	                     events, and powers the portal's /sessions page. Falls back to
+//	                     CERTD_NATS_URL when unset; truly empty means "no sessions page". TLS
+//	                     material comes from CERTD_SSH_AUDIT_CERT/_KEY/_CA with the same
+//	                     CERTD_NATS_* fallback chain.
 //
-//	CERTD_ROLES_FILE        Path to a JSON file holding the role
-//	                        table — top-level array of role objects
-//	                        matching the [policy.Role] shape (Name,
-//	                        GroupClaim, AllowedPrincipals,
-//	                        HostPatterns, SPIFFEPatterns, MaxFooCertTTL,
-//	                        DefaultExtensions). When set, role-table
-//	                        policy is applied to every sign request
-//	                        and the portal's /roles page renders the
-//	                        configured roles. Unset leaves certd in
-//	                        permissive mode (existing dev behavior)
-//	                        and the portal page returns 503.
+//	CERTD_ROLES_FILE  Path to a JSON file holding the role table — top-level array of role
+//	                  objects matching the [policy.Role] shape (Name, GroupClaim,
+//	                  AllowedPrincipals, HostPatterns, SPIFFEPatterns, MaxFooCertTTL,
+//	                  DefaultExtensions). When set, role-table policy is applied to every sign
+//	                  request and the portal's /roles page renders the configured roles. Unset
+//	                  leaves certd in permissive mode (existing dev behavior) and the portal
+//	                  page returns 503.
 package main
 
 import (
@@ -141,15 +123,14 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
-	"os/signal"
-	"syscall"
 	"time"
 
-	"github.com/abagile/tokyo3-base/applog"
+	"github.com/abagile/tokyo3-base/cli"
 	"github.com/abagile/tokyo3-base/envutil"
 	"github.com/abagile/tokyo3-base/journal"
 	"github.com/abagile/tokyo3-base/journal/jetstream"
 	btls "github.com/abagile/tokyo3-base/tls"
+	"github.com/abagile/tokyo3-base/version"
 	"github.com/spf13/cobra"
 
 	"github.com/abagile/tokyo3-ca/internal/audit"
@@ -166,6 +147,12 @@ import (
 const appName = "certd"
 
 // Version is overridden at build time via -ldflags "-X main.Version=...".
+// When that injection is absent — most notably `go install
+// github.com/abagile/tokyo3-ca/cmd/certd@vX.Y.Z` — version.Resolve falls
+// back to runtime/debug.BuildInfo, which exposes the module version + VCS
+// metadata the Go toolchain stamps into every binary since 1.18. Result:
+// tagged installs report their tag, local builds report "dev-<sha7>",
+// and ldflags-injected release builds win when present.
 var Version = "dev"
 
 func main() {
@@ -196,13 +183,9 @@ func serveCmd() *cobra.Command {
 }
 
 func runServe(ctx context.Context) error {
-	log, _, drainLog := applog.AppLoggerWithNATS(applog.Config{App: appName}, applog.NATSConfig{
-		URL:      os.Getenv("CERTD_NATS_URL"),
-		CertFile: os.Getenv("CERTD_NATS_CERT"),
-		KeyFile:  os.Getenv("CERTD_NATS_KEY"),
-		CAFile:   envutil.First("CERTD_NATS_CA", "CERTD_WORKLOAD_CA"),
-	}, applog.WithStdout())
-	defer drainLog()
+	rt := cli.App{Name: appName, EnvPrefix: "CERTD"}.Setup(ctx)
+	defer rt.Shutdown()
+	log := rt.Log
 
 	addr := envutil.Or("CERTD_ADDR", ":8443")
 
@@ -212,12 +195,12 @@ func runServe(ctx context.Context) error {
 	}
 	log.Info("ca signer ready", "signer", caSigner.Description())
 
-	auditSink, err := openAuditSink(log)
+	auditSink, err := cli.AuditSink[audit.Entry](rt, audit.Subject)
 	if err != nil {
 		return fmt.Errorf("audit sink: %w", err)
 	}
 	defer envutil.CloseIfCloser(auditSink)
-	auditSrc, err := openAuditSource(log)
+	auditSrc, err := cli.AuditSource(rt, audit.StreamName, audit.Subject)
 	if err != nil {
 		return fmt.Errorf("audit source: %w", err)
 	}
@@ -339,10 +322,19 @@ func runServe(ctx context.Context) error {
 		Handler:           srv.Routes(),
 		TLSConfig:         tlsCfg,
 		ReadHeaderTimeout: 10 * time.Second,
+		// IdleTimeout reaps idle keep-alive connections (and their
+		// per-connection serve goroutines) instead of letting them
+		// linger until TCP keepalive eventually trips — without it a
+		// half-closed or pooled client connection can pin a goroutine
+		// indefinitely. Set above cert-agentd's renewal interval so the
+		// agent's reused connection isn't torn down between cycles.
+		// WriteTimeout is deliberately omitted: the portal's audit
+		// viewer streams a long-lived SSE response that a write deadline
+		// would sever.
+		IdleTimeout: 120 * time.Second,
 	}
 
-	rootCtx, cancel := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
-	defer cancel()
+	rootCtx := rt.Ctx
 
 	if sessionTracker != nil {
 		go func() {
@@ -394,7 +386,7 @@ func versionCmd() *cobra.Command {
 		Use:   "version",
 		Short: "Print version and exit",
 		Run: func(cmd *cobra.Command, _ []string) {
-			fmt.Printf("%s %s\n", appName, Version)
+			fmt.Printf("%s %s\n", appName, version.Resolve(Version))
 		},
 	}
 }
@@ -553,7 +545,11 @@ func loadMTLSStore(log *slog.Logger) (mtls.Store, error) {
 func buildServerTLS(log *slog.Logger) (*tls.Config, error) {
 	certFile := os.Getenv("CERTD_API_CERT")
 	keyFile := os.Getenv("CERTD_API_KEY")
-	clientCAFile := os.Getenv("CERTD_API_CLIENT_CA")
+	// Inbound mTLS clients are mesh workloads, so the trust anchor for
+	// their certs is the workload CA — fall back to CERTD_WORKLOAD_CA
+	// when no API-specific client CA is set (same pattern as the NATS
+	// CA). Both unset ⇒ client-cert verification stays off.
+	clientCAFile := envutil.First("CERTD_API_CLIENT_CA", "CERTD_WORKLOAD_CA")
 
 	if (certFile == "") != (keyFile == "") {
 		return nil, fmt.Errorf("CERTD_API_CERT and CERTD_API_KEY must both be set or both unset")
@@ -588,38 +584,6 @@ func buildServerTLS(log *slog.Logger) (*tls.Config, error) {
 	}
 
 	return cfg, nil
-}
-
-// openAuditSink builds the JetStream publisher Sink from CERTD_NATS_URL
-// and the CERTD_NATS_CERT/KEY/CA env vars. When the URL is empty,
-// returns [audit.NoopSink] — keeps the dev/no-NATS path working.
-func openAuditSink(log *slog.Logger) (audit.Sink, error) {
-	return jetstream.NewAuditSink[audit.Entry](jetstream.AuditSinkConfig{
-		URL:       os.Getenv("CERTD_NATS_URL"),
-		CertFile:  os.Getenv("CERTD_NATS_CERT"),
-		KeyFile:   os.Getenv("CERTD_NATS_KEY"),
-		CAFile:    envutil.First("CERTD_NATS_CA", "CERTD_WORKLOAD_CA"),
-		Subject:   audit.Subject,
-		EnvPrefix: "CERTD_NATS",
-		Log:       log,
-	})
-}
-
-// openAuditSource is the read-side counterpart of openAuditSink:
-// returns a journal.Source attached to the same NATS URL + stream +
-// subject so the portal admin /portal/admin/audit page can tail the
-// audit log live. When CERTD_NATS_URL is empty, returns NoopSource.
-func openAuditSource(log *slog.Logger) (journal.Source, error) {
-	return jetstream.NewAuditSource(jetstream.AuditSourceConfig{
-		URL:        os.Getenv("CERTD_NATS_URL"),
-		CertFile:   os.Getenv("CERTD_NATS_CERT"),
-		KeyFile:    os.Getenv("CERTD_NATS_KEY"),
-		CAFile:     envutil.First("CERTD_NATS_CA", "CERTD_WORKLOAD_CA"),
-		StreamName: audit.StreamName,
-		Subject:    audit.Subject,
-		EnvPrefix:  "CERTD_NATS",
-		Log:        log,
-	})
 }
 
 // loadCastStore wires the asciinema cast directory the portal's

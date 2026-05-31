@@ -3,7 +3,7 @@ module github.com/abagile/tokyo3-ca
 go 1.26.3
 
 require (
-	github.com/abagile/tokyo3-base v0.5.7
+	github.com/abagile/tokyo3-base v0.6.0
 	github.com/coreos/go-oidc/v3 v3.18.0
 	github.com/google/uuid v1.6.0
 	github.com/spf13/cobra v1.10.2

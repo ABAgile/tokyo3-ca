@@ -128,13 +128,15 @@ services:
 
   # ── certd: the CA service ────────────────────────────────────────────────────
   # Permissive mode for the dev rig — no CERTD_OIDC_*, no
-  # CERTD_MTLS_PRINCIPALS_FILE, and CERTD_API_CLIENT_CA deliberately
-  # unset (cert-agentd's bootstrap cert is signed by mkcert's root,
-  # but after first renewal its cert is signed by certd's own signing
-  # key; accepting any client cert at the TLS layer keeps the loop
-  # closed without bundling certd-signing's X.509 chain). App-layer
-  # mTLS auth is disabled; body-groups fallback handles sign requests.
-  # Production wires OIDC + role table on top.
+  # CERTD_MTLS_PRINCIPALS_FILE, and neither CERTD_API_CLIENT_CA nor
+  # CERTD_WORKLOAD_CA set (so the client-CA fallback also resolves to
+  # nothing). cert-agentd's bootstrap cert is mkcert-signed but after
+  # first renewal its cert is signed by certd's own signing key;
+  # accepting any client cert at the TLS layer keeps the loop closed
+  # without bundling certd-signing's X.509 chain. App-layer mTLS auth
+  # is disabled; body-groups fallback handles sign requests. Production
+  # sets CERTD_WORKLOAD_CA (covering both inbound client-cert
+  # verification and outbound NATS trust) + OIDC + role table.
   certd:
     build:
       context: .
@@ -221,9 +223,9 @@ services:
       - agent_state:/certs:rw
     environment:
       CERT_AGENTD_CERTD_URL: https://certd:8443
-      CERT_AGENTD_CERT: /certs/cert-agentd.crt
-      CERT_AGENTD_KEY: /certs/cert-agentd.key
-      CERT_AGENTD_CA: /certs/ca.crt
+      CERT_AGENTD_WORKLOAD_CERT: /certs/cert-agentd.crt
+      CERT_AGENTD_WORKLOAD_KEY: /certs/cert-agentd.key
+      CERT_AGENTD_WORKLOAD_CA: /certs/ca.crt
       CERT_AGENTD_SPIFFE_URI: spiffe://demo/workload/cert-agentd
       CERT_AGENTD_TTL_SECONDS: "120"
       CERT_AGENTD_NATS_URL: nats://nats:4222

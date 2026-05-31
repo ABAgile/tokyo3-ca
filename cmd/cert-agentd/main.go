@@ -10,82 +10,68 @@
 //
 // Required env vars:
 //
-//	CERT_AGENTD_CERTD_URL   certd base URL (e.g., https://certd.internal).
-//	CERT_AGENTD_CERT        Workload X.509 cert PEM path. Bootstrap cert
-//	                        on first run; the renewer overwrites this
-//	                        atomically on each successful renewal.
-//	CERT_AGENTD_KEY         Matching private key PEM path. Read on
-//	                        startup and reused across renewals — only
-//	                        the cert rotates, the key is stable.
-//	CERT_AGENTD_CA          CA bundle that signs certd's server cert.
-//	CERT_AGENTD_SPIFFE_URI  SPIFFE URI to embed in the renewed cert
-//	                        (e.g., "spiffe://tokyo3.example/host/db-1").
-//	                        certd's role table decides whether the
-//	                        caller may obtain it.
+//	CERT_AGENTD_CERTD_URL      certd base URL (e.g., https://certd.internal).
+//	CERT_AGENTD_WORKLOAD_CERT  Workload X.509 cert PEM path — this agent's mTLS identity.
+//	                           Bootstrap cert on first run; the renewer overwrites it atomically
+//	                           on each successful renewal. Also the default NATS publisher cert
+//	                           (see the WORKLOAD_* convention in tokyo3-base/cli).
+//	CERT_AGENTD_WORKLOAD_KEY   Matching private key PEM path. Read on startup and reused across
+//	                           renewals — only the cert rotates, the key is stable.
+//	CERT_AGENTD_WORKLOAD_CA    CA bundle that signs certd's server cert (and, by default, the
+//	                           NATS server cert).
+//	CERT_AGENTD_SPIFFE_URI     SPIFFE URI to embed in the renewed cert (e.g.,
+//	                           "spiffe://tokyo3.example/host/db-1"). certd's role table decides
+//	                           whether the caller may obtain it.
 //
 // Optional env vars:
 //
-//	CERT_AGENTD_SUBJECT_CN  Optional X.509 Subject CN. Modern verifiers
-//	                        ignore CN as identity; populating it just
-//	                        makes tooling output friendlier.
-//	CERT_AGENTD_TTL_SECONDS Requested validity window. Zero/unset ⇒
-//	                        certd's default. Capped by the endpoint's
-//	                        hard max and possibly further by policy.
+//	CERT_AGENTD_SUBJECT_CN   Optional X.509 Subject CN. Modern verifiers ignore CN as identity;
+//	                         populating it just makes tooling output friendlier.
+//	CERT_AGENTD_TTL_SECONDS  Requested validity window. Zero/unset ⇒ certd's default. Capped by
+//	                         the endpoint's hard max and possibly further by policy.
 //
 // Optional SSH user cert renewal:
 //
-//	CERT_AGENTD_SSH_USER_CERT       When set together with
-//	                                CERT_AGENTD_SSH_USER_KEY and
-//	                                CERT_AGENTD_SSH_PRINCIPALS, the
-//	                                agent also renews an SSH user
-//	                                cert. The key is generated on
-//	                                first run (mode 0600); the cert
-//	                                lands at this path (mode 0644).
-//	CERT_AGENTD_SSH_USER_KEY        Path for the matching SSH private
-//	                                key. Reused across renewals once
-//	                                generated.
-//	CERT_AGENTD_SSH_PRINCIPALS      Comma-separated Unix usernames the
-//	                                cert authorizes (e.g.,
-//	                                "alice,deployer").
-//	CERT_AGENTD_SSH_KEY_ID          KeyID embedded in the cert. Default
-//	                                "user:<spiffe-uri-path-tail>".
-//	CERT_AGENTD_SSH_TTL_SECONDS     Requested validity window for the
-//	                                user cert. Zero ⇒ certd's default.
+//	CERT_AGENTD_SSH_USER_CERT    When set together with CERT_AGENTD_SSH_USER_KEY and
+//	                             CERT_AGENTD_SSH_PRINCIPALS, the agent also renews an SSH user
+//	                             cert. The key is generated on first run (mode 0600); the cert
+//	                             lands at this path (mode 0644).
+//	CERT_AGENTD_SSH_USER_KEY     Path for the matching SSH private key. Reused across renewals
+//	                             once generated.
+//	CERT_AGENTD_SSH_PRINCIPALS   Comma-separated Unix usernames the cert authorizes (e.g.,
+//	                             "alice,deployer").
+//	CERT_AGENTD_SSH_KEY_ID       KeyID embedded in the cert. Default "user:<spiffe-uri-path-
+//	                             tail>".
+//	CERT_AGENTD_SSH_TTL_SECONDS  Requested validity window for the user cert. Zero ⇒ certd's
+//	                             default.
 //
 // Optional ssh_config drop-in:
 //
-//	CERT_AGENTD_SSH_CONFIG_PATH    When set, render an ssh_config
-//	                               snippet to this path pointing at
-//	                               the SSH user cert/key above. The
-//	                               user's main config should Include
-//	                               it.
-//	CERT_AGENTD_SSH_HOST_PATTERN   Host pattern in the snippet. Default "*".
-//	CERT_AGENTD_SSH_PROXY_JUMP     ProxyJump directive (e.g.,
-//	                               "alice@proxy.internal:2222").
-//	CERT_AGENTD_SSH_USER           SSH login name.
+//	CERT_AGENTD_SSH_CONFIG_PATH   When set, render an ssh_config snippet to this path pointing
+//	                              at the SSH user cert/key above. The user's main config should
+//	                              Include it.
+//	CERT_AGENTD_SSH_HOST_PATTERN  Host pattern in the snippet. Default "*".
+//	CERT_AGENTD_SSH_PROXY_JUMP    ProxyJump directive (e.g., "alice@proxy.internal:2222").
+//	CERT_AGENTD_SSH_USER          SSH login name.
 //
 // Optional operational log shipping (cert-agentd runs on every
 // workload host, so log lines land on per-instance subjects):
 //
-//	CERT_AGENTD_NATS_URL    NATS server URL (e.g., tls://nats:4222).
-//	                        When set, log lines fan out to subject
-//	                        "app_log.cert-agentd.<instance>". Unset
-//	                        leaves the logger at stdout only.
-//	CERT_AGENTD_NATS_CERT   Publisher client cert PEM (mTLS to NATS).
-//	                        Defaults to CERT_AGENTD_CERT so the
-//	                        single workload identity covers both
-//	                        certd issuance and log shipping.
-//	CERT_AGENTD_NATS_KEY    Matching private key. Defaults to
-//	                        CERT_AGENTD_KEY.
-//	CERT_AGENTD_NATS_CA     CA bundle that signs the NATS server
-//	                        cert. Defaults to CERT_AGENTD_CA.
-//	CERT_AGENTD_INSTANCE    Per-host identifier appended to the NATS
-//	                        subject and added as an "instance" log
-//	                        attribute on every line. Defaults to
-//	                        os.Hostname(). Operators may override
-//	                        when hostnames aren't stable (e.g.,
-//	                        Kubernetes pod names) or distinguishable
-//	                        across the fleet.
+//	CERT_AGENTD_NATS_URL    NATS server URL (e.g., tls://nats:4222). When set, log lines fan out
+//	                        to subject "app_log.cert-agentd.<instance>". Unset leaves the logger
+//	                        at stdout only.
+//	CERT_AGENTD_NATS_CERT   Publisher client cert PEM (mTLS to NATS). Defaults to
+//	                        CERT_AGENTD_WORKLOAD_CERT so the single workload identity covers
+//	                        both certd issuance and log shipping.
+//	CERT_AGENTD_NATS_KEY    Matching private key. Defaults to CERT_AGENTD_WORKLOAD_KEY.
+//	CERT_AGENTD_NATS_CA     CA bundle that signs the NATS server cert. Defaults to
+//	                        CERT_AGENTD_WORKLOAD_CA.
+//	CERT_AGENTD_INSTANCE    Per-host identifier appended to the NATS subject and added as an
+//	                        "instance" log attribute on every line. Defaults to os.Hostname().
+//	                        Operators may override when hostnames aren't stable (e.g.,
+//	                        Kubernetes pod names) or distinguishable across the fleet.
+//	CERT_AGENTD_DEBUG_ADDR  Optional pprof + runtime-stats listener (e.g. "127.0.0.1:6060");
+//	                        unset disables it. Never expose publicly.
 package main
 
 import (
@@ -94,16 +80,15 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"os/signal"
 	"path"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
-	"github.com/abagile/tokyo3-base/applog"
+	"github.com/abagile/tokyo3-base/cli"
 	"github.com/abagile/tokyo3-base/envutil"
 	"github.com/abagile/tokyo3-base/tls/reloader"
+	"github.com/abagile/tokyo3-base/version"
 	"github.com/spf13/cobra"
 
 	"github.com/abagile/tokyo3-ca/internal/agent/output"
@@ -114,6 +99,8 @@ import (
 const appName = "cert-agentd"
 
 // Version is overridden at build time via -ldflags "-X main.Version=...".
+// version.Resolve falls back to runtime/debug.BuildInfo when the ldflags
+// injection is absent (e.g. `go install …@vX.Y.Z`).
 var Version = "dev"
 
 func main() {
@@ -142,22 +129,19 @@ func runCmd() *cobra.Command {
 }
 
 func runAgent(ctx context.Context) error {
-	log, _, drainLog := applog.AppLoggerWithNATS(applog.Config{
-		App:      appName,
-		Instance: envutil.Or("CERT_AGENTD_INSTANCE", envutil.HostnameOrEmpty()),
-	}, applog.NATSConfig{
-		URL:      os.Getenv("CERT_AGENTD_NATS_URL"),
-		CertFile: envutil.First("CERT_AGENTD_NATS_CERT", "CERT_AGENTD_CERT"),
-		KeyFile:  envutil.First("CERT_AGENTD_NATS_KEY", "CERT_AGENTD_KEY"),
-		CAFile:   envutil.First("CERT_AGENTD_NATS_CA", "CERT_AGENTD_CA"),
-	}, applog.WithStdout())
-	defer drainLog()
-
 	certdURL := envutil.MustEnv("CERT_AGENTD_CERTD_URL")
-	certPath := envutil.MustEnv("CERT_AGENTD_CERT")
-	keyPath := envutil.MustEnv("CERT_AGENTD_KEY")
-	caPath := envutil.MustEnv("CERT_AGENTD_CA")
+	certPath := envutil.MustEnv("CERT_AGENTD_WORKLOAD_CERT")
+	keyPath := envutil.MustEnv("CERT_AGENTD_WORKLOAD_KEY")
+	caPath := envutil.MustEnv("CERT_AGENTD_WORKLOAD_CA")
 	spiffeURI := envutil.MustEnv("CERT_AGENTD_SPIFFE_URI")
+
+	rt := cli.App{
+		Name:      appName,
+		EnvPrefix: "CERT_AGENTD",
+		Instance:  envutil.Or("CERT_AGENTD_INSTANCE", envutil.HostnameOrEmpty()),
+	}.Setup(ctx)
+	defer rt.Shutdown()
+	log := rt.Log
 
 	// Bootstrap: load the workload cert + key + CA bundle once. The
 	// reloader is what TLS actually reads on every handshake — the
@@ -233,7 +217,10 @@ func runAgent(ctx context.Context) error {
 		return fmt.Errorf("ssh-config snippet: %w", err)
 	}
 
-	rootCtx, cancel := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
+	// Derive a cancellable child of rt.Ctx so one component's exit
+	// unwinds the others (cancel() in the collector loop below); rt.Ctx
+	// itself is cancelled on signal/shutdown by rt.Shutdown.
+	rootCtx, cancel := context.WithCancel(rt.Ctx)
 	defer cancel()
 
 	// Run the X.509 workload renewer (always) alongside the SSH user
@@ -329,7 +316,7 @@ func versionCmd() *cobra.Command {
 		Use:   "version",
 		Short: "Print version and exit",
 		Run: func(cmd *cobra.Command, _ []string) {
-			fmt.Printf("%s %s\n", appName, Version)
+			fmt.Printf("%s %s\n", appName, version.Resolve(Version))
 		},
 	}
 }
