@@ -76,6 +76,83 @@ Three images are published to GHCR on each tagged release
 Local builds via `make docker-build` (server), `make docker-build-agent`,
 `make docker-build-cli`.
 
+### Local dev rig (docker-compose)
+
+`docker-compose.yml` stands up a self-contained certd ↔ cert-agentd
+loop for end-to-end testing without external infrastructure:
+
+```sh
+make gen-certs                      # one-time: mkcert + openssl + ssh-keygen → ./shared/certs/
+make docker-up                      # _sync-shared + compose up (auto-runs gen-certs if needed)
+docker compose logs -f cert-agentd  # observe renewal cycle (~70 s with TTL=120 s)
+curl https://localhost:8443/healthz # mkcert root in OS trust store — no --cacert needed
+docker compose exec natsbox \
+    nats stream view ca_audit       # tail the audit event stream
+docker compose exec natsbox \
+    nats stream view app_log        # tail certd + cert-agentd operational logs
+make docker-down                    # stop (preserves volumes)
+make clean-all                      # full reset (wipes shared/certs/* + named volumes)
+```
+
+**Layout.** Dev material lives under `./shared/` (mirrors the
+tokyo3-auth tree so future expansion — postgres init scripts,
+traefik configs, etc. — slots into the same shape):
+
+```
+shared/
+  certs/
+    gen.sh                # mkcert + openssl + ssh-keygen, host-side
+    ca.crt                # mkcert root (host + container trust bundle)
+    certd.{crt,key}       # certd HTTPS server cert
+    cert-agentd.{crt,key} # bootstrap workload identity
+    certd-signing.key     # CA signing key, PKCS#8 PEM (signs X.509 + SSH)
+    certd-signing.key.pub # OpenSSH-format CA pubkey (TrustedUserCAKeys)
+```
+
+**Volume model.** `make docker-up` tar-pipes `./shared/` into a
+docker-namespaced `ca_shared_data` named volume (compose's
+auto-namespacing keeps it from colliding with sibling repos' own
+`shared_data`). Every consumer mounts it read-only at `/shared`.
+cert-agentd is the exception — it renews its own cert in place, so
+the rig copies the bootstrap material onto a separate writeable
+`agent_state` volume via the `cert-agentd-init` service on first
+boot. That way, re-running `_sync-shared` never clobbers a renewed
+cert.
+
+**Permissive mode.** No `CERTD_OIDC_*`, no
+`CERTD_MTLS_PRINCIPALS_FILE`, no `CERTD_API_CLIENT_CA` — the
+renewal loop works even after cert-agentd switches from its
+mkcert-signed bootstrap cert to a cert signed by certd's own signing
+key. Production wires policy on top of this base.
+
+**Streams.** `natsbox` provisions two JetStream streams on boot:
+`ca_audit` (compliance audit events, `ca.audit.events`; immutable,
+long retention) and `app_log` (operational log shipping from certd +
+cert-agentd via `tokyo3-base/applog`, capturing `app_log.>`; bounded
+and deletable). `applog` publishes with core NATS, so without the
+`app_log` stream those lines are silently dropped.
+
+**Healthchecks.** certd (HTTPS `/healthz`) and cert-agentd
+(filesystem mtime of the cert file, recent renewal proof). `natsbox`
+is healthy once both streams exist, and stays running so you can
+`docker compose exec natsbox sh` for the full `nats` CLI.
+
+**Debugging (pprof).** Set `CERTD_DEBUG_ADDR` to expose
+`net/http/pprof` on its own plaintext listener plus a 30s
+goroutine/OS-thread stats log line — the dev rig enables it on `:6060`.
+Use it to chase leaks (`pids.current` growth, goroutine counts):
+
+```sh
+curl http://localhost:6060/debug/pprof/goroutine?debug=1     # counts grouped by stack
+curl http://localhost:6060/debug/pprof/threadcreate?debug=1  # OS threads ≈ pids.current
+docker compose logs certd | grep 'runtime stats'            # goroutines/os_threads over time
+```
+
+Never set `CERTD_DEBUG_ADDR` on a deployed certd — pprof is
+unauthenticated and rides its own listener, off the mTLS API.
+
+See `shared/certs/gen.sh` for cert-generation details.
+
 ## Layout
 
 ```

@@ -5,12 +5,16 @@
 ##   make test               Run all tests
 ##   make check              Full pre-commit sequence (gofmt + test + vet + staticcheck + gopls + govulncheck)
 ##   make tidy               Run go mod tidy
+##   make gen-certs          Generate dev TLS material in ./certs/ via mkcert (host-side, pre-flight for docker compose)
 ##   make docker-build       Build the server Docker image (linux/arm64, default)
 ##   make docker-build-agent Build the agent image (cert-agentd — for host-level renewal)
 ##   make docker-build-cli   Build the CLI image (auth-ssh-creds — for CI runners + dev containers)
+##   make docker-up          Run gen-certs (if needed) and bring up the compose rig
+##   make docker-down        Stop the compose rig (preserves nats-data + ./certs/)
 ##   make install            Install certd + cert-agentd to GOPATH/bin
 ##   make install-cli        Install the auth-ssh-creds helper to GOPATH/bin
 ##   make clean              Remove ./bin/
+##   make clean-all          Remove ./bin/ AND ./certs/ (full reset)
 ##   make help               Show this help
 
 # ── Variables ─────────────────────────────────────────────────────────────────
@@ -41,8 +45,23 @@ IMAGE_TAG  ?= $(VERSION)
 
 .PHONY: all build build-linux build-linux-amd64 build-darwin \
         test test-verbose tidy vet lint check \
+        gen-certs _sync-shared \
         docker-build docker-build-amd64 docker-build-agent docker-build-cli docker-push \
-        install install-cli clean help
+        docker-up docker-down \
+        install install-cli clean clean-all help
+
+# ── shared_data volume ────────────────────────────────────────────────────────
+# shared_data is declared `external` in docker-compose.yml because the
+# Makefile (not compose) owns it: _sync-shared creates and populates it
+# before compose runs. The external volume's name is pinned to
+# <project>_shared_data, so COMPOSE_PROJECT_NAME must reach the compose
+# subprocess for both project namespacing and the ${COMPOSE_PROJECT_NAME}
+# interpolation in the volume `name:` — hence the `export` below. Default
+# is "ca" (the directory name); override it if you run with -p.
+COMPOSE_PROJECT_NAME ?= ca
+export COMPOSE_PROJECT_NAME
+SHARED_VOLUME        := $(COMPOSE_PROJECT_NAME)_shared_data
+AGENT_STATE_VOLUME   := $(COMPOSE_PROJECT_NAME)_agent_state
 
 all: build
 
@@ -167,6 +186,37 @@ docker-push: docker-build
 	docker push $(IMAGE_NAME):$(IMAGE_TAG)
 	docker push $(IMAGE_NAME):latest
 
+# ── Dev rig (docker compose) ──────────────────────────────────────────────────
+
+## gen-certs: Generate dev TLS material in ./shared/certs/ via mkcert (host-side).
+## Pre-flight for `make docker-up`: mints the dev CA root (via
+## mkcert), the certd HTTPS cert, cert-agentd's bootstrap cert, and
+## certd's SSH user CA (certd-signing.key/.pub). Idempotent — re-runs
+## regenerate leaf X.509 certs but preserve the SSH signing key
+## (rotating it would invalidate every cert ever signed).
+gen-certs:
+	@bash shared/certs/gen.sh
+
+## _sync-shared: Tar-pipe ./shared/ into the shared_data named volume.
+## Re-running on every docker-up keeps the volume in sync with the
+## host tree (templates rendered, certs regenerated, scripts touched).
+## Note: this clobbers anything cert-agentd renewed in shared_data, so
+## the rig keeps cert-agentd's renewable state on a separate
+## agent_state volume — _sync-shared never touches that.
+_sync-shared:
+	@if [ ! -f shared/certs/ca.crt ]; then $(MAKE) gen-certs; fi
+	@docker volume create $(SHARED_VOLUME) >/dev/null
+	@tar -cf - -C shared . | docker run --rm -i -v $(SHARED_VOLUME):/shared alpine:3.21 sh -c "tar -xf - -C /shared"
+	@echo "  synced ./shared/ → docker volume $(SHARED_VOLUME)"
+
+## docker-up: Sync shared/ into shared_data and bring up the compose rig.
+docker-up: _sync-shared
+	docker compose up -d --build --wait
+
+## docker-down: Stop the compose rig (preserves shared_data + agent_state + nats-data)
+docker-down:
+	docker compose down
+
 # ── Install / Clean ───────────────────────────────────────────────────────────
 
 ## install: Install certd + cert-agentd to GOPATH/bin
@@ -184,6 +234,16 @@ install-cli:
 ## clean: Remove ./bin/
 clean:
 	rm -rf $(BIN_DIR)
+
+## clean-all: Full reset — wipes ./bin/, generated material under
+## ./shared/certs/, AND the compose-managed named volumes
+## (shared_data, agent_state, nats-data). The next `make docker-up`
+## starts from scratch.
+clean-all: clean
+	docker compose down -v --remove-orphans 2>/dev/null || true
+	docker volume rm $(SHARED_VOLUME) $(AGENT_STATE_VOLUME) 2>/dev/null || true
+	rm -f shared/certs/*.crt shared/certs/*.key shared/certs/*.pub shared/certs/*.srl
+	@echo "  removed shared/certs/*.{crt,key,pub,srl} + named volumes"
 
 # ── Help ──────────────────────────────────────────────────────────────────────
 

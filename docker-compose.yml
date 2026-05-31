@@ -1,0 +1,261 @@
+# docker-compose.yml — local-test rig for certd ↔ cert-agentd
+#
+# Stands up the renewal loop end-to-end:
+#
+#     NATS  ◄────── audit publish ─────  certd  ──── sign-workload ◄──── cert-agentd
+#       ▲
+#       │  inspect / replay
+#       └── natsbox (persistent CLI; `docker compose exec natsbox nats stream view ca_audit`)
+#
+# Useful for exercising the certd HTTP/mTLS surface, the audit
+# publishing path, and the cert-agentd renewal cycle without any
+# external infrastructure.
+#
+# ── Layout ────────────────────────────────────────────────────────────────────
+#
+# Dev material lives under ./shared/ (mirrors the tokyo3-auth layout
+# so future additions — postgres init scripts, traefik configs, etc. —
+# slot into the same tree). On `make docker-up`, the directory is
+# tar-piped into the shared_data named volume, which every read-only
+# consumer mounts at /shared. cert-agentd has its own writeable
+# agent_state volume seeded from shared_data by the cert-agentd-init
+# service — separation is necessary because cert-agentd overwrites
+# its own cert+key on renewal, and we don't want re-running
+# _sync-shared to clobber the renewed cert.
+#
+#   ./shared/
+#     certs/
+#       gen.sh              # mkcert + openssl + ssh-keygen, host-side
+#       ca.crt              # mkcert root (host trust store) + container trust bundle
+#       certd.{crt,key}     # certd HTTPS server cert (mkcert-signed)
+#       cert-agentd.{crt,key}   # bootstrap workload cert
+#       certd-signing.key   # certd CA signing key, PKCS#8 PEM (X.509 + SSH)
+#       certd-signing.key.pub   # OpenSSH-format CA pubkey (TrustedUserCAKeys)
+#
+# ── Pre-flight + quick start ──────────────────────────────────────────────────
+#
+#     make gen-certs       # one-time: mkcert + ssh-keygen → ./shared/certs/
+#     make docker-up       # _sync-shared + docker compose up --build
+#
+#     # auto-run is also fine — docker-up runs gen-certs and _sync-shared
+#     # if they haven't yet:
+#     make docker-up
+#
+# ── Inspect ───────────────────────────────────────────────────────────────────
+#
+#     docker compose logs -f cert-agentd       # renewals every ~70 s (TTL=120 s × 0.6)
+#     docker compose logs -f certd             # sign-workload + audit-publish events
+#     curl https://localhost:8443/healthz      # mkcert root in OS trust → no --cacert
+#     docker compose exec natsbox nats stream view ca_audit
+#                                              # tail the audit stream interactively
+#     docker compose exec natsbox nats stream view app_log
+#                                              # tail certd + cert-agentd operational logs
+#
+# ── Tear down ─────────────────────────────────────────────────────────────────
+#
+#     make docker-down                # preserve volumes
+#     make clean-all                  # nukes ./bin, ./shared/certs/*.{crt,key,pub},
+#                                     # AND the named volumes (full reset)
+
+services:
+
+  nats:
+    image: nats:2-alpine
+    command: ["-js", "-sd", "/data", "-m", "8222"]
+    volumes:
+      - nats_data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8222/healthz"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+      start_period: 3s
+    restart: unless-stopped
+
+  # ── natsbox: stream provisioner + interactive shell ─────────────────────────
+  # Creates two streams on boot, then stays running so the user can:
+  #
+  #     docker compose exec natsbox nats stream view ca_audit
+  #     docker compose exec natsbox nats stream view app_log
+  #     docker compose exec natsbox nats stream info ca_audit
+  #     docker compose exec natsbox sh    # full nats CLI shell
+  #
+  # ca_audit  — compliance audit events (ca.audit.events); immutable,
+  #             long retention (deny-delete/deny-purge).
+  # app_log   — operational log shipping from certd + cert-agentd via
+  #             tokyo3-base/applog (subjects app_log.certd,
+  #             app_log.cert-agentd.<instance>, captured by app_log.>).
+  #             applog uses core nats Publish (fire-and-forget), so
+  #             without this stream the lines are silently dropped.
+  #             Bounded + deletable — ops logs aren't compliance records.
+  natsbox:
+    image: natsio/nats-box:${NATSBOX_VERSION:-0.19.5}
+    depends_on:
+      nats:
+        condition: service_healthy
+    environment:
+      NATS_URL: nats://nats:4222
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        nats stream info ca_audit > /dev/null 2>&1 || \
+          nats stream add ca_audit \
+            --subjects 'ca.audit.events' \
+            --retention limits \
+            --storage file \
+            --max-age 9600h \
+            --deny-delete \
+            --deny-purge \
+            --defaults
+        nats stream info app_log > /dev/null 2>&1 || \
+          nats stream add app_log \
+            --subjects 'app_log.>' \
+            --retention limits \
+            --storage file \
+            --max-age 168h \
+            --max-bytes 268435456 \
+            --discard old \
+            --defaults
+        exec tail -f /dev/null
+    healthcheck:
+      test: ["CMD-SHELL", "nats stream info ca_audit > /dev/null 2>&1 && nats stream info app_log > /dev/null 2>&1"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+      start_period: 3s
+    restart: unless-stopped
+
+  # ── certd: the CA service ────────────────────────────────────────────────────
+  # Permissive mode for the dev rig — no CERTD_OIDC_*, no
+  # CERTD_MTLS_PRINCIPALS_FILE, and CERTD_API_CLIENT_CA deliberately
+  # unset (cert-agentd's bootstrap cert is signed by mkcert's root,
+  # but after first renewal its cert is signed by certd's own signing
+  # key; accepting any client cert at the TLS layer keeps the loop
+  # closed without bundling certd-signing's X.509 chain). App-layer
+  # mTLS auth is disabled; body-groups fallback handles sign requests.
+  # Production wires OIDC + role table on top.
+  certd:
+    build:
+      context: .
+      target: server
+      args:
+        VERSION: ${VERSION:-dev-docker}
+    depends_on:
+      nats:
+        condition: service_healthy
+      natsbox:
+        condition: service_healthy
+    volumes:
+      - shared_data:/shared:ro
+    environment:
+      CERTD_ADDR: ":8443"
+      CERTD_API_CERT: /shared/certs/certd.crt
+      CERTD_API_KEY: /shared/certs/certd.key
+      CERTD_CA_KEY_FILE: /shared/certs/certd-signing.key
+      CERTD_NATS_URL: nats://nats:4222
+      # Debug only (local dev rig): exposes net/http/pprof + a 30s
+      # goroutine/OS-thread stats line in the logs, to chase the
+      # pids.current growth. Never set this in a deployed certd.
+      # CERTD_DEBUG_ADDR: ":6060"
+    ports:
+      - "8443:8443"
+      # - "6060:6060"    # pprof (debug only)
+    healthcheck:
+      # /healthz returns 200 with ca_pubkey_hash + audit_active flag.
+      # busybox wget (Alpine 3.21) supports --no-check-certificate
+      # since 1.36+.
+      test: ["CMD-SHELL", "wget -qO- --no-check-certificate https://127.0.0.1:8443/healthz > /dev/null"]
+      interval: 5s
+      timeout: 3s
+      retries: 6
+      start_period: 5s
+    restart: unless-stopped
+
+  # ── cert-agentd-init: seed the writeable cert-agentd state on first boot ────
+  # cert-agentd overwrites its own cert+key on renewal — incompatible
+  # with shared_data's read-only mount. Solution: copy the bootstrap
+  # material from /shared into a writeable agent_state volume on first
+  # boot, then have cert-agentd point at agent_state. On subsequent
+  # boots, the sentinel check skips the copy so the renewed cert
+  # survives. `make clean-all` wipes agent_state for a fresh demo.
+  cert-agentd-init:
+    image: alpine:3.21
+    depends_on:
+      certd:
+        condition: service_healthy
+    volumes:
+      - shared_data:/shared:ro
+      - agent_state:/state
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        if [ -f /state/cert-agentd.crt ]; then
+          echo "cert-agentd-init: /state already populated, skipping"
+          exit 0
+        fi
+        cp /shared/certs/cert-agentd.crt /state/
+        cp /shared/certs/cert-agentd.key /state/
+        cp /shared/certs/ca.crt          /state/
+        chmod 644 /state/*.crt
+        chmod 600 /state/*.key
+        echo "cert-agentd-init: seeded bootstrap material into agent_state"
+    restart: "no"
+
+  # ── cert-agentd: the per-workload credential agent ───────────────────────────
+  # Mounts agent_state at /certs (writeable) — cert-agentd reads its
+  # bootstrap cert from here on first boot, then renews in place every
+  # ~72 s (60% of TTL_SECONDS=120). The renewal cycle is observable
+  # via `docker compose logs -f cert-agentd`.
+  cert-agentd:
+    build:
+      context: .
+      target: agent
+      args:
+        VERSION: ${VERSION:-dev-docker}
+    depends_on:
+      cert-agentd-init:
+        condition: service_completed_successfully
+    volumes:
+      - agent_state:/certs:rw
+    environment:
+      CERT_AGENTD_CERTD_URL: https://certd:8443
+      CERT_AGENTD_CERT: /certs/cert-agentd.crt
+      CERT_AGENTD_KEY: /certs/cert-agentd.key
+      CERT_AGENTD_CA: /certs/ca.crt
+      CERT_AGENTD_SPIFFE_URI: spiffe://demo/workload/cert-agentd
+      CERT_AGENTD_TTL_SECONDS: "120"
+      CERT_AGENTD_NATS_URL: nats://nats:4222
+    healthcheck:
+      # No HTTP surface — probe via filesystem mtime instead.
+      # Renewals fire every ~72 s; if the cert hasn't been touched in
+      # 150 s, the agent has stalled. start_period gives the first
+      # renewal time to land before any failure is reported.
+      test: ["CMD-SHELL", "test $(( $(date +%s) - $(stat -c %Y /certs/cert-agentd.crt) )) -lt 150"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 90s
+    restart: unless-stopped
+
+volumes:
+  # ── shared_data (external — Makefile-owned) ──────────────────────────────────
+  # Owned by the Makefile, NOT compose: `make _sync-shared` creates this
+  # volume and tar-pipes ./shared/ into it BEFORE `docker compose up`
+  # runs. Declared external so compose mounts that already-populated
+  # volume instead of creating its own empty one — a compose-created
+  # volume left certd reading an empty /shared ("certd-signing.key not
+  # found"). External volumes skip the <project>_ prefix, so `name:`
+  # pins the compose-namespaced name explicitly; ${COMPOSE_PROJECT_NAME}
+  # (exported by the Makefile, defaulting to "ca") keeps it in lockstep
+  # with _sync-shared's SHARED_VOLUME. `make clean-all` removes it.
+  shared_data:
+    external: true
+    name: ${COMPOSE_PROJECT_NAME:-ca}_shared_data
+  # ── agent_state ──────────────────────────────────────────────────────────────
+  # cert-agentd's renewable cert+key. Compose-managed (created + seeded
+  # by cert-agentd-init on first boot); preserved across `docker compose
+  # down`. `make clean-all` wipes it for a fresh bootstrap.
+  agent_state:
+  nats_data:
