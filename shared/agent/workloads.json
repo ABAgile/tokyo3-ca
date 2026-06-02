@@ -1,0 +1,36 @@
+[
+  {
+    "name": "authd-db-app",
+    "spiffe_uri": "spiffe://tokyo3/authd/db-app",
+    "subject_cn": "auth_app",
+    "key_type": "ed25519",
+    "ttl_seconds": 600,
+    "cert_path": "/certs/authd-db-app.crt",
+    "key_path": "/certs/authd-db-app.key"
+  },
+  {
+    "name": "authd-db-admin",
+    "spiffe_uri": "spiffe://tokyo3/authd/db-admin",
+    "subject_cn": "auth_admin",
+    "key_type": "ed25519",
+    "ttl_seconds": 600,
+    "cert_path": "/certs/authd-db-admin.crt",
+    "key_path": "/certs/authd-db-admin.key"
+  },
+  {
+    "name": "authd-nats",
+    "spiffe_uri": "spiffe://tokyo3/authd/nats",
+    "key_type": "ed25519",
+    "ttl_seconds": 600,
+    "cert_path": "/certs/authd-nats.crt",
+    "key_path": "/certs/authd-nats.key"
+  },
+  {
+    "name": "authd-scim",
+    "spiffe_uri": "spiffe://tokyo3/authd/scim",
+    "key_type": "ed25519",
+    "ttl_seconds": 600,
+    "cert_path": "/certs/authd-scim.crt",
+    "key_path": "/certs/authd-scim.key"
+  }
+]

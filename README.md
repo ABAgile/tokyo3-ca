@@ -23,8 +23,10 @@ role-table policy, publishes audit to NATS JetStream, and serves
 the admin portal (roles CRUD, hosts list, sessions + asciinema
 replay, audit tail, revocations). `cert-agentd run` renews the
 workload X.509 cert at 60% TTL with KMS-style abstraction
-support, and optionally renews an SSH user cert + writes an
-ssh_config drop-in.
+support, optionally renews additional client certs for sibling
+processes (`CERT_AGENTD_WORKLOADS_FILE` — per-cert SPIFFE URI, TTL,
+and key type: ecdsa-p256 / ed25519), and optionally
+renews an SSH user cert + writes an ssh_config drop-in.
 
 Phase 7 hardening landed:
 [THREAT_MODEL.md](THREAT_MODEL.md) (per-surface threats +
@@ -107,6 +109,11 @@ shared/
     cert-agentd.{crt,key} # bootstrap workload identity
     certd-signing.key     # CA signing key, PKCS#8 PEM (signs X.509 + SSH)
     certd-signing.key.pub # OpenSSH-format CA pubkey (TrustedUserCAKeys)
+  policy/                 # sample certd policy
+    roles.json            # role table → CERTD_ROLES_FILE
+    principals.json       # mTLS principal map (sample; prod mTLS path)
+  agent/
+    workloads.json        # extra cert-agentd workload certs → CERT_AGENTD_WORKLOADS_FILE
 ```
 
 **Volume model.** `make docker-up` tar-pipes `./shared/` into a
@@ -119,11 +126,29 @@ the rig copies the bootstrap material onto a separate writeable
 boot. That way, re-running `_sync-shared` never clobbers a renewed
 cert.
 
-**Permissive mode.** No `CERTD_OIDC_*`, no
-`CERTD_MTLS_PRINCIPALS_FILE`, no `CERTD_API_CLIENT_CA` — the
-renewal loop works even after cert-agentd switches from its
-mkcert-signed bootstrap cert to a cert signed by certd's own signing
-key. Production wires policy on top of this base.
+**Policy & workloads (sample).** The rig enforces the
+`shared/policy/roles.json` role table (`CERTD_ROLES_FILE`): the
+`authd` group may obtain `spiffe://tokyo3/authd/*` certs (X.509 cap
+`max_x509_cert_ttl_seconds: 86400`). cert-agentd authorises via
+**body-groups** (`CERT_AGENTD_GROUPS=authd`, identity
+`spiffe://tokyo3/authd/agent`) — the dev/test path, so no client-CA
+bootstrap is needed. It provisions authd's four mTLS client certs from
+`shared/agent/workloads.json` (`CERT_AGENTD_WORKLOADS_FILE`), all
+Ed25519, into `/certs`: `db-app` (CN `auth_app`) and `db-admin` (CN
+`auth_admin`) for Postgres cert-auth, plus `nats` and `scim`.
+`shared/policy/principals.json` ships as a sample for the production
+mTLS-principal path (`authd-agent` → `["authd"]`) but is left unwired —
+that path needs verified client certs (`CERTD_API_CLIENT_CA` /
+`CERTD_WORKLOAD_CA`), which the rig doesn't set. OIDC is also off;
+production wires OIDC + mTLS principals on top.
+
+Watch it work:
+
+```sh
+docker compose logs -f cert-agentd      # db-app + db-admin + nats + scim + self renewing
+docker compose exec cert-agentd ls -l /certs   # authd-*.crt/key
+docker compose exec natsbox nats stream view ca_audit  # x509.workload.cert.signed events
+```
 
 **Streams.** `natsbox` provisions two JetStream streams on boot:
 `ca_audit` (compliance audit events, `ca.audit.events`; immutable,

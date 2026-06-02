@@ -1,0 +1,8 @@
+[
+  {
+    "name": "authd-workloads",
+    "group_claim": "authd",
+    "spiffe_patterns": ["spiffe://tokyo3/authd/*"],
+    "max_x509_cert_ttl_seconds": 86400
+  }
+]

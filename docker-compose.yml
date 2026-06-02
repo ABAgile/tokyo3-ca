@@ -31,6 +31,11 @@
 #       cert-agentd.{crt,key}   # bootstrap workload cert
 #       certd-signing.key   # certd CA signing key, PKCS#8 PEM (X.509 + SSH)
 #       certd-signing.key.pub   # OpenSSH-format CA pubkey (TrustedUserCAKeys)
+#     policy/               # sample certd policy (mounted into certd at /shared/policy)
+#       roles.json          # role table — CERTD_ROLES_FILE
+#       principals.json     # mTLS principal map — sample (CERTD_MTLS_PRINCIPALS_FILE)
+#     agent/                # sample cert-agentd config (mounted at /shared/agent)
+#       workloads.json      # extra workload client certs — CERT_AGENTD_WORKLOADS_FILE
 #
 # ── Pre-flight + quick start ──────────────────────────────────────────────────
 #
@@ -156,6 +161,15 @@ services:
       CERTD_API_KEY: /shared/certs/certd.key
       CERTD_CA_KEY_FILE: /shared/certs/certd-signing.key
       CERTD_NATS_URL: nats://nats:4222
+      # Enforce the sample role table: the "authd" group may obtain
+      # spiffe://tokyo3/authd/* certs. cert-agentd authorises via
+      # body-groups (CERT_AGENTD_GROUPS) — the dev/test path.
+      CERTD_ROLES_FILE: /shared/policy/roles.json
+      # Sample principals file is mounted at /shared/policy/principals.json
+      # but left unwired: the mTLS-principal auth path needs verified
+      # client certs (CERTD_API_CLIENT_CA / CERTD_WORKLOAD_CA), which the
+      # rig doesn't set. Enable it for a production-shaped mTLS demo.
+      # CERTD_MTLS_PRINCIPALS_FILE: /shared/policy/principals.json
       # Debug only (local dev rig): exposes net/http/pprof + a 30s
       # goroutine/OS-thread stats line in the logs, to chase the
       # pids.current growth. Never set this in a deployed certd.
@@ -221,13 +235,22 @@ services:
         condition: service_completed_successfully
     volumes:
       - agent_state:/certs:rw
+      # Read-only access to ./shared for the workloads spec file.
+      - shared_data:/shared:ro
     environment:
       CERT_AGENTD_CERTD_URL: https://certd:8443
       CERT_AGENTD_WORKLOAD_CERT: /certs/cert-agentd.crt
       CERT_AGENTD_WORKLOAD_KEY: /certs/cert-agentd.key
       CERT_AGENTD_WORKLOAD_CA: /certs/ca.crt
-      CERT_AGENTD_SPIFFE_URI: spiffe://demo/workload/cert-agentd
+      CERT_AGENTD_SPIFFE_URI: spiffe://tokyo3/authd/agent
       CERT_AGENTD_TTL_SECONDS: "120"
+      # Body-groups sent on every sign request — matches the
+      # "authd-workloads" role in shared/policy/roles.json.
+      CERT_AGENTD_GROUPS: authd
+      # Provision authd's mTLS client certs (db-app, db-admin, nats,
+      # scim — all Ed25519) into /certs alongside the agent's own
+      # identity. The spiffe://tokyo3/authd/* role pattern covers both.
+      CERT_AGENTD_WORKLOADS_FILE: /shared/agent/workloads.json
       CERT_AGENTD_NATS_URL: nats://nats:4222
     healthcheck:
       # No HTTP surface — probe via filesystem mtime instead.
