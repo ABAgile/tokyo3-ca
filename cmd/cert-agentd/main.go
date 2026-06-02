@@ -29,6 +29,18 @@
 //	                         populating it just makes tooling output friendlier.
 //	CERT_AGENTD_TTL_SECONDS  Requested validity window. Zero/unset ⇒ certd's default. Capped by
 //	                         the endpoint's hard max and possibly further by policy.
+//	CERT_AGENTD_GROUPS       Comma-separated caller groups sent on every sign request (the
+//	                         agent's own renewal and all workload certs) for certd's body-groups
+//	                         policy path (dev/test). Empty unless certd enforces a role table;
+//	                         ignored under OIDC / mTLS-principal auth.
+//
+// Optional additional workload client certs:
+//
+//	CERT_AGENTD_WORKLOADS_FILE  JSON array of extra X.509 client certs the agent renews for
+//	                            sibling processes (mTLS to db, nats, …): each {name, spiffe_uri,
+//	                            subject_cn, key_type (ecdsa-p256|ed25519), ttl_seconds,
+//	                            cert_path, key_path}. Separate from the agent's own identity
+//	                            above; certd's role table must permit each spiffe_uri.
 //
 // Optional SSH user cert renewal:
 //
@@ -76,6 +88,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -182,10 +195,22 @@ func runAgent(ctx context.Context) error {
 		ttl = time.Duration(n) * time.Second
 	}
 
+	// Body-groups for certd's policy path (dev/test): the same group set
+	// is sent on the agent's own renewal and every workload cert, since
+	// they all share one identity. Empty unless CERT_AGENTD_GROUPS is set;
+	// certd's permissive / OIDC / mTLS-principal modes ignore it.
+	var groups []string
+	for g := range strings.SplitSeq(os.Getenv("CERT_AGENTD_GROUPS"), ",") {
+		if g = strings.TrimSpace(g); g != "" {
+			groups = append(groups, g)
+		}
+	}
+
 	renewer, err := renew.New(renew.Config{
 		Signer:            certdClient,
 		SPIFFEURI:         spiffeURI,
 		SubjectCommonName: os.Getenv("CERT_AGENTD_SUBJECT_CN"),
+		Groups:            groups,
 		CertOutputPath:    certPath,
 		KeyOutputPath:     keyPath,
 		RequestedTTL:      ttl,
@@ -209,6 +234,14 @@ func runAgent(ctx context.Context) error {
 		return fmt.Errorf("ssh user cert renewer: %w", err)
 	}
 
+	// Additional X.509 client certs (mTLS to db, nats, …) the agent
+	// provisions for sibling processes — distinct from its own identity
+	// above, which authenticates these very requests to certd.
+	workloadRenewers, err := buildWorkloadRenewers(certdClient, groups, log)
+	if err != nil {
+		return fmt.Errorf("workload cert renewers: %w", err)
+	}
+
 	// Optional ssh_config drop-in. Written once at startup with the
 	// snippet pointing at the cert-agentd-managed user cert/key
 	// paths. Atomic + deterministic so a no-op re-render doesn't
@@ -223,22 +256,30 @@ func runAgent(ctx context.Context) error {
 	rootCtx, cancel := context.WithCancel(rt.Ctx)
 	defer cancel()
 
-	// Run the X.509 workload renewer (always) alongside the SSH user
-	// renewer (when configured) and the CA-bundle mtime poller, all
-	// under one ctx. Either component's exit cancels rootCtx so the
-	// others unwind cleanly. The CA poller exiting is not a fatal
-	// condition itself — its return is filtered out below — but we
-	// run it under errCh for uniform shutdown semantics.
-	errCh := make(chan error, 3)
-	expected := 2
-	go func() { errCh <- renewer.Run(rootCtx) }()
-	go func() { errCh <- r.RunPoll(rootCtx, reloader.DefaultPollInterval) }()
+	// Collect every long-lived component into one runnable set: the
+	// agent's own X.509 renewer, the CA-bundle mtime poller, the
+	// optional SSH user renewer, and any additional workload-cert
+	// renewers. They all run under rootCtx; any one's exit cancels it
+	// so the others unwind cleanly. The CA poller exiting is not fatal
+	// itself — its return is filtered out below — but it runs under the
+	// same channel for uniform shutdown semantics.
+	runners := []func(context.Context) error{
+		renewer.Run,
+		func(c context.Context) error { return r.RunPoll(c, reloader.DefaultPollInterval) },
+	}
 	if userRenewer != nil {
-		expected = 3
-		go func() { errCh <- userRenewer.Run(rootCtx) }()
+		runners = append(runners, userRenewer.Run)
+	}
+	for _, wr := range workloadRenewers {
+		runners = append(runners, wr.Run)
+	}
+
+	errCh := make(chan error, len(runners))
+	for _, run := range runners {
+		go func() { errCh <- run(rootCtx) }()
 	}
 	var firstErr error
-	for range expected {
+	for range runners {
 		err := <-errCh
 		if firstErr == nil && err != nil && !errors.Is(err, context.Canceled) {
 			firstErr = err
@@ -250,6 +291,63 @@ func runAgent(ctx context.Context) error {
 	}
 	log.Info("stopped")
 	return nil
+}
+
+// workloadSpec is one entry in the CERT_AGENTD_WORKLOADS_FILE JSON
+// array: an additional X.509 client cert the agent renews for a sibling
+// process to present (mTLS to db, nats, …). Distinct from the agent's
+// own bootstrap identity, which authenticates these requests to certd.
+type workloadSpec struct {
+	Name       string `json:"name"`
+	SPIFFEURI  string `json:"spiffe_uri"`
+	SubjectCN  string `json:"subject_cn"`
+	KeyType    string `json:"key_type"` // ecdsa-p256 | rsa-2048 | ed25519; empty ⇒ ecdsa-p256
+	TTLSeconds int64  `json:"ttl_seconds"`
+	CertPath   string `json:"cert_path"`
+	KeyPath    string `json:"key_path"`
+}
+
+// buildWorkloadRenewers reads CERT_AGENTD_WORKLOADS_FILE (a JSON array
+// of workloadSpec) and returns one renewer per spec, all sharing the
+// certd client. Returns nil when the env var is unset. certd's role
+// table must permit the agent's identity to obtain each spec's
+// spiffe_uri.
+func buildWorkloadRenewers(signer renew.Signer, groups []string, log *slog.Logger) ([]*renew.Renewer, error) {
+	specFile := os.Getenv("CERT_AGENTD_WORKLOADS_FILE")
+	if specFile == "" {
+		return nil, nil
+	}
+	data, err := os.ReadFile(specFile)
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", specFile, err)
+	}
+	var specs []workloadSpec
+	if err := json.Unmarshal(data, &specs); err != nil {
+		return nil, fmt.Errorf("decode %s: %w", specFile, err)
+	}
+	renewers := make([]*renew.Renewer, 0, len(specs))
+	for i, s := range specs {
+		if s.Name == "" {
+			return nil, fmt.Errorf("%s entry %d: name is required", specFile, i)
+		}
+		rn, err := renew.New(renew.Config{
+			Signer:            signer,
+			SPIFFEURI:         s.SPIFFEURI,
+			SubjectCommonName: s.SubjectCN,
+			KeyType:           renew.KeyType(s.KeyType),
+			Groups:            groups,
+			CertOutputPath:    s.CertPath,
+			KeyOutputPath:     s.KeyPath,
+			RequestedTTL:      time.Duration(s.TTLSeconds) * time.Second,
+			Log:               log.With("workload", s.Name),
+		})
+		if err != nil {
+			return nil, fmt.Errorf("%s workload %q: %w", specFile, s.Name, err)
+		}
+		renewers = append(renewers, rn)
+	}
+	log.Info("workload cert renewers configured", "count", len(renewers), "file", specFile)
+	return renewers, nil
 }
 
 // buildUserCertRenewer returns a configured SSH user cert renewer

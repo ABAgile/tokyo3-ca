@@ -56,6 +56,7 @@ func TestNew_RejectsMissingConfig(t *testing.T) {
 		{"no cert path", renew.Config{Signer: &stubSigner{}, SPIFFEURI: "spiffe://td/x", KeyOutputPath: "/k"}, "CertOutputPath is required"},
 		{"no key path", renew.Config{Signer: &stubSigner{}, SPIFFEURI: "spiffe://td/x", CertOutputPath: "/c"}, "KeyOutputPath is required"},
 		{"bad renew fraction", renew.Config{Signer: &stubSigner{}, SPIFFEURI: "spiffe://td/x", CertOutputPath: "/c", KeyOutputPath: "/k", RenewFraction: 1.5}, "RenewFraction must be"},
+		{"bad key type", renew.Config{Signer: &stubSigner{}, SPIFFEURI: "spiffe://td/x", CertOutputPath: "/c", KeyOutputPath: "/k", KeyType: "bogus"}, "unsupported KeyType"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

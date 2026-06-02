@@ -13,7 +13,9 @@ package renew
 
 import (
 	"context"
+	"crypto"
 	"crypto/ecdsa"
+	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/x509"
@@ -36,6 +38,15 @@ type Signer interface {
 	SignWorkloadCert(ctx context.Context, req client.SignWorkloadRequest) (*client.SignWorkloadResponse, error)
 }
 
+// KeyType selects the algorithm for a workload's locally-generated
+// private key. The zero value ("") defaults to ECDSA P-256.
+type KeyType string
+
+const (
+	KeyECDSAP256 KeyType = "ecdsa-p256"
+	KeyEd25519   KeyType = "ed25519"
+)
+
 // Config wires a [Renewer]. Required fields are validated at
 // [New] time; optional knobs default to production-sensible values.
 type Config struct {
@@ -50,6 +61,15 @@ type Config struct {
 	// SubjectCommonName is optional. Modern verifiers ignore CN as
 	// identity; populating it makes tooling output friendlier.
 	SubjectCommonName string
+
+	// KeyType selects the locally-generated private key's algorithm:
+	// "ecdsa-p256" or "ed25519". Empty ⇒ ecdsa-p256.
+	KeyType KeyType
+
+	// Groups are the caller's group memberships sent on each sign
+	// request for certd's body-groups policy path (dev/test). Ignored
+	// by certd when it authenticates via OIDC or mTLS principals.
+	Groups []string
 
 	// CertOutputPath is where the renewed cert PEM is written
 	// atomically. Required.
@@ -115,7 +135,7 @@ type Renewer struct {
 	cfg Config
 
 	keyMu      sync.Mutex
-	privateKey *ecdsa.PrivateKey // lazily loaded/generated on first SignOnce
+	privateKey crypto.Signer // lazily loaded/generated on first SignOnce
 }
 
 // New validates cfg and returns a [Renewer]. Returns an error rather
@@ -132,6 +152,13 @@ func New(cfg Config) (*Renewer, error) {
 	}
 	if cfg.KeyOutputPath == "" {
 		return nil, errors.New("KeyOutputPath is required")
+	}
+	switch cfg.KeyType {
+	case "":
+		cfg.KeyType = KeyECDSAP256
+	case KeyECDSAP256, KeyEd25519:
+	default:
+		return nil, fmt.Errorf("unsupported KeyType %q (want ecdsa-p256 or ed25519)", cfg.KeyType)
 	}
 	if cfg.RenewFraction == 0 {
 		cfg.RenewFraction = DefaultRenewFraction
@@ -155,17 +182,17 @@ func New(cfg Config) (*Renewer, error) {
 }
 
 // SignOnce performs one round-trip: ensures the private key exists
-// (loading from KeyOutputPath or generating + persisting a fresh
-// ECDSA P-256 key), encodes its public half, asks certd for a fresh
-// cert, and writes the cert atomically. Returns the validity envelope
-// so the [Run] loop can schedule the next renewal.
+// (loading from KeyOutputPath or generating + persisting a fresh key
+// of the configured KeyType), encodes its public half, asks certd for
+// a fresh cert, and writes the cert atomically. Returns the validity
+// envelope so the [Run] loop can schedule the next renewal.
 func (r *Renewer) SignOnce(ctx context.Context) (validAfter, validBefore time.Time, err error) {
 	priv, err := r.ensureKey()
 	if err != nil {
 		return time.Time{}, time.Time{}, fmt.Errorf("private key: %w", err)
 	}
 
-	pubPEM, err := marshalPublicKeyPEM(&priv.PublicKey)
+	pubPEM, err := marshalPublicKeyPEM(priv.Public())
 	if err != nil {
 		return time.Time{}, time.Time{}, fmt.Errorf("marshal public key: %w", err)
 	}
@@ -174,6 +201,7 @@ func (r *Renewer) SignOnce(ctx context.Context) (validAfter, validBefore time.Ti
 		PublicKey:         string(pubPEM),
 		SPIFFEURI:         r.cfg.SPIFFEURI,
 		SubjectCommonName: r.cfg.SubjectCommonName,
+		Groups:            r.cfg.Groups,
 	}
 	if r.cfg.RequestedTTL > 0 {
 		req.TTLSeconds = int64(r.cfg.RequestedTTL.Seconds())
@@ -247,7 +275,7 @@ func (r *Renewer) nextRenewalDelay(validAfter, validBefore time.Time) time.Durat
 // first call (or generating + persisting a fresh ECDSA P-256 key when
 // the file doesn't exist). The key is cached in-memory thereafter so
 // subsequent renewals don't re-read it.
-func (r *Renewer) ensureKey() (*ecdsa.PrivateKey, error) {
+func (r *Renewer) ensureKey() (crypto.Signer, error) {
 	r.keyMu.Lock()
 	defer r.keyMu.Unlock()
 	if r.privateKey != nil {
@@ -265,9 +293,9 @@ func (r *Renewer) ensureKey() (*ecdsa.PrivateKey, error) {
 		return nil, fmt.Errorf("read key %s: %w", r.cfg.KeyOutputPath, err)
 	}
 
-	// Generate fresh key and persist with mode 0600 — workload
-	// private keys must not be world-readable.
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	// Generate a fresh key of the configured type and persist with mode
+	// 0600 — workload private keys must not be world-readable.
+	key, err := generateKey(r.cfg.KeyType)
 	if err != nil {
 		return nil, fmt.Errorf("generate key: %w", err)
 	}
@@ -278,14 +306,29 @@ func (r *Renewer) ensureKey() (*ecdsa.PrivateKey, error) {
 	if err := output.WriteAtomic(r.cfg.KeyOutputPath, pemBytes, 0o600); err != nil {
 		return nil, fmt.Errorf("write key %s: %w", r.cfg.KeyOutputPath, err)
 	}
-	r.cfg.Log.Info("workload private key generated", "path", r.cfg.KeyOutputPath)
+	r.cfg.Log.Info("workload private key generated", "path", r.cfg.KeyOutputPath, "key_type", r.cfg.KeyType)
 	r.privateKey = key
 	return key, nil
 }
 
+// generateKey produces a fresh private key of the requested type. Each
+// returned type implements [crypto.Signer]; the renewer uses only its
+// public half (certd does the signing).
+func generateKey(kt KeyType) (crypto.Signer, error) {
+	switch kt {
+	case KeyECDSAP256:
+		return ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	case KeyEd25519:
+		_, priv, err := ed25519.GenerateKey(rand.Reader)
+		return priv, err
+	default:
+		return nil, fmt.Errorf("unsupported key type %q", kt)
+	}
+}
+
 // marshalPublicKeyPEM returns the SubjectPublicKeyInfo-encoded form
 // certd expects in the sign-workload request body.
-func marshalPublicKeyPEM(pub *ecdsa.PublicKey) ([]byte, error) {
+func marshalPublicKeyPEM(pub crypto.PublicKey) ([]byte, error) {
 	der, err := x509.MarshalPKIXPublicKey(pub)
 	if err != nil {
 		return nil, err
@@ -293,9 +336,9 @@ func marshalPublicKeyPEM(pub *ecdsa.PublicKey) ([]byte, error) {
 	return pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: der}), nil
 }
 
-// marshalPrivateKeyPEM returns the PKCS#8-encoded private key PEM
-// the workload's TLS stack reads via tls.LoadX509KeyPair.
-func marshalPrivateKeyPEM(priv *ecdsa.PrivateKey) ([]byte, error) {
+// marshalPrivateKeyPEM returns the PKCS#8-encoded private key PEM the
+// workload's TLS stack reads via tls.LoadX509KeyPair.
+func marshalPrivateKeyPEM(priv crypto.Signer) ([]byte, error) {
 	der, err := x509.MarshalPKCS8PrivateKey(priv)
 	if err != nil {
 		return nil, err
@@ -303,10 +346,10 @@ func marshalPrivateKeyPEM(priv *ecdsa.PrivateKey) ([]byte, error) {
 	return pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der}), nil
 }
 
-// parsePrivateKeyPEM accepts the PKCS#8 PEM shape this package
-// produces. Rejects unsupported key types so we don't silently drift
-// from ECDSA P-256.
-func parsePrivateKeyPEM(b []byte) (*ecdsa.PrivateKey, error) {
+// parsePrivateKeyPEM decodes the PKCS#8 PEM this package writes,
+// accepting any key type that satisfies [crypto.Signer] (ECDSA, RSA,
+// or Ed25519).
+func parsePrivateKeyPEM(b []byte) (crypto.Signer, error) {
 	block, _ := pem.Decode(b)
 	if block == nil {
 		return nil, errors.New("no PEM block")
@@ -315,9 +358,9 @@ func parsePrivateKeyPEM(b []byte) (*ecdsa.PrivateKey, error) {
 	if err != nil {
 		return nil, err
 	}
-	ec, ok := key.(*ecdsa.PrivateKey)
+	signer, ok := key.(crypto.Signer)
 	if !ok {
-		return nil, fmt.Errorf("unsupported key type %T (expected ECDSA)", key)
+		return nil, fmt.Errorf("unsupported key type %T", key)
 	}
-	return ec, nil
+	return signer, nil
 }
