@@ -9,7 +9,10 @@ package x509engine
 
 import (
 	"crypto"
+	"crypto/ecdsa"
+	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/rsa"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"errors"
@@ -61,7 +64,7 @@ type WorkloadCertParams struct {
 //
 // The resulting cert carries:
 //   - One URI SAN (the SPIFFE URI)
-//   - KeyUsage: DigitalSignature + KeyAgreement (mTLS handshake roles)
+//   - KeyUsage per the subject key's algorithm (see [keyUsageFor])
 //   - ExtKeyUsage: clientAuth + serverAuth (workload mTLS is bidirectional)
 //   - Subject CN if set, otherwise the SPIFFE URI string
 func SignWorkloadCert(rnd io.Reader, caSigner signer.Signer, caCert *x509.Certificate, p WorkloadCertParams) (*x509.Certificate, error) {
@@ -84,7 +87,7 @@ func SignWorkloadCert(rnd io.Reader, caSigner signer.Signer, caCert *x509.Certif
 		Subject:               pkix.Name{CommonName: cn},
 		NotBefore:             p.ValidAfter,
 		NotAfter:              p.ValidBefore,
-		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyAgreement,
+		KeyUsage:              keyUsageFor(p.PublicKey),
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth},
 		BasicConstraintsValid: true,
 		IsCA:                  false,
@@ -100,6 +103,33 @@ func SignWorkloadCert(rnd io.Reader, caSigner signer.Signer, caCert *x509.Certif
 		return nil, fmt.Errorf("re-parse signed cert: %w", err)
 	}
 	return cert, nil
+}
+
+// keyUsageFor returns the X.509 KeyUsage bits appropriate to the subject
+// key's algorithm. Every workload cert needs DigitalSignature — that is
+// the bit a TLS leaf uses to sign the handshake (CertificateVerify),
+// which is the only role the key plays in TLS 1.2/1.3 mutual auth. The
+// extra bit is algorithm-specific:
+//
+//   - Ed25519: signature-only. KeyAgreement is meaningless for it (key
+//     agreement is X25519, a separate key), so DigitalSignature alone.
+//   - ECDSA: the key can also perform (static) ECDH key agreement, so
+//     KeyAgreement is valid even though ECDHE TLS never uses it.
+//   - RSA: KeyEncipherment for the legacy RSA key-transport handshake;
+//     RSA cannot do key agreement, so KeyAgreement would be invalid.
+//
+// Unknown key types fall back to DigitalSignature only.
+func keyUsageFor(pub crypto.PublicKey) x509.KeyUsage {
+	switch pub.(type) {
+	case ed25519.PublicKey:
+		return x509.KeyUsageDigitalSignature
+	case *ecdsa.PublicKey:
+		return x509.KeyUsageDigitalSignature | x509.KeyUsageKeyAgreement
+	case *rsa.PublicKey:
+		return x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment
+	default:
+		return x509.KeyUsageDigitalSignature
+	}
 }
 
 // validate enforces required-field invariants on p and caCert before
