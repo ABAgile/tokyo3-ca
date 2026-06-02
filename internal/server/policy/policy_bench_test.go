@@ -14,13 +14,13 @@ import (
 // matched roles and unions their principals.
 func realisticStore() *policy.InMemoryStore {
 	roles := []policy.Role{
-		{Name: "eng-dev", GroupClaim: "eng", AllowedPrincipals: []string{"alice", "bob", "deployer"}, HostPatterns: []string{"*.dev.internal"}, MaxUserCertTTL: 4 * time.Hour},
-		{Name: "eng-prod", GroupClaim: "eng-prod", AllowedPrincipals: []string{"alice", "deployer"}, HostPatterns: []string{"*.prod.internal", "db-*.prod.internal"}, MaxUserCertTTL: time.Hour},
-		{Name: "sre", GroupClaim: "sre", AllowedPrincipals: []string{"root", "deployer"}, HostPatterns: []string{"*"}, MaxUserCertTTL: 2 * time.Hour},
-		{Name: "ops", GroupClaim: "ops", AllowedPrincipals: []string{"ubuntu", "deployer"}, HostPatterns: []string{"*.internal"}, MaxUserCertTTL: 8 * time.Hour},
-		{Name: "data", GroupClaim: "data", AllowedPrincipals: []string{"alice", "data-eng"}, HostPatterns: []string{"*-data*.prod.internal"}, MaxUserCertTTL: 4 * time.Hour},
-		{Name: "audit", GroupClaim: "audit", AllowedPrincipals: []string{"readonly"}, HostPatterns: []string{"*.audit.internal"}, MaxUserCertTTL: 30 * time.Minute},
-		{Name: "qa", GroupClaim: "qa", AllowedPrincipals: []string{"qa-user"}, HostPatterns: []string{"*.qa.internal"}, MaxUserCertTTL: 4 * time.Hour},
+		{Name: "eng-dev", GroupClaim: "eng", AllowedPrincipals: []string{"alice", "bob", "deployer"}, HostPatterns: []string{"*.dev.internal"}, MaxUserCertTTLSeconds: int64((4 * time.Hour).Seconds())},
+		{Name: "eng-prod", GroupClaim: "eng-prod", AllowedPrincipals: []string{"alice", "deployer"}, HostPatterns: []string{"*.prod.internal", "db-*.prod.internal"}, MaxUserCertTTLSeconds: int64((time.Hour).Seconds())},
+		{Name: "sre", GroupClaim: "sre", AllowedPrincipals: []string{"root", "deployer"}, HostPatterns: []string{"*"}, MaxUserCertTTLSeconds: int64((2 * time.Hour).Seconds())},
+		{Name: "ops", GroupClaim: "ops", AllowedPrincipals: []string{"ubuntu", "deployer"}, HostPatterns: []string{"*.internal"}, MaxUserCertTTLSeconds: int64((8 * time.Hour).Seconds())},
+		{Name: "data", GroupClaim: "data", AllowedPrincipals: []string{"alice", "data-eng"}, HostPatterns: []string{"*-data*.prod.internal"}, MaxUserCertTTLSeconds: int64((4 * time.Hour).Seconds())},
+		{Name: "audit", GroupClaim: "audit", AllowedPrincipals: []string{"readonly"}, HostPatterns: []string{"*.audit.internal"}, MaxUserCertTTLSeconds: int64((30 * time.Minute).Seconds())},
+		{Name: "qa", GroupClaim: "qa", AllowedPrincipals: []string{"qa-user"}, HostPatterns: []string{"*.qa.internal"}, MaxUserCertTTLSeconds: int64((4 * time.Hour).Seconds())},
 	}
 	return policy.NewInMemoryStore(roles...)
 }

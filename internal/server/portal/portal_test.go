@@ -208,17 +208,17 @@ func TestPortal_Index_FlipsRolesToReadyWhenRoleStoreWired(t *testing.T) {
 func TestPortal_RolesIndex_ListsConfiguredRoles(t *testing.T) {
 	store := &stubRoleStore{roles: []policy.Role{
 		{
-			Name:              "eng-prod",
-			GroupClaim:        "eng",
-			AllowedPrincipals: []string{"alice", "deployer"},
-			HostPatterns:      []string{"*.prod.internal"},
-			MaxUserCertTTL:    4 * time.Hour,
+			Name:                  "eng-prod",
+			GroupClaim:            "eng",
+			AllowedPrincipals:     []string{"alice", "deployer"},
+			HostPatterns:          []string{"*.prod.internal"},
+			MaxUserCertTTLSeconds: int64((4 * time.Hour).Seconds()),
 		},
 		{
-			Name:           "sre",
-			GroupClaim:     "sre",
-			HostPatterns:   []string{"*.internal"},
-			MaxHostCertTTL: 30 * 24 * time.Hour,
+			Name:                  "sre",
+			GroupClaim:            "sre",
+			HostPatterns:          []string{"*.internal"},
+			MaxHostCertTTLSeconds: int64((30 * 24 * time.Hour).Seconds()),
 		},
 	}}
 	p, _ := portal.New(portal.Config{Version: "v", RoleStore: store, Now: time.Now})
@@ -268,13 +268,13 @@ func TestPortal_RolesIndex_503WhenNoRoleStore(t *testing.T) {
 func TestPortal_RoleDetail_FoundRole(t *testing.T) {
 	store := &stubRoleStore{roles: []policy.Role{
 		{
-			Name:              "eng-prod",
-			GroupClaim:        "eng",
-			AllowedPrincipals: []string{"alice"},
-			HostPatterns:      []string{"*.prod.internal"},
-			SPIFFEPatterns:    []string{"spiffe://corp/svc/*"},
-			MaxUserCertTTL:    4 * time.Hour,
-			DefaultExtensions: map[string]string{"permit-pty": ""},
+			Name:                  "eng-prod",
+			GroupClaim:            "eng",
+			AllowedPrincipals:     []string{"alice"},
+			HostPatterns:          []string{"*.prod.internal"},
+			SPIFFEPatterns:        []string{"spiffe://corp/svc/*"},
+			MaxUserCertTTLSeconds: int64((4 * time.Hour).Seconds()),
+			DefaultExtensions:     map[string]string{"permit-pty": ""},
 		},
 	}}
 	p, _ := portal.New(portal.Config{Version: "v", RoleStore: store, Now: time.Now})
@@ -363,12 +363,12 @@ func TestPortal_RoleCreate_AddsRoleAndRedirects(t *testing.T) {
 	defer srv.Close()
 
 	resp := postForm(t, srv.URL+"/roles/new", url.Values{
-		"name":               {"eng-prod"},
-		"group_claim":        {"eng"},
-		"allowed_principals": {"alice\nbob"},
-		"host_patterns":      {"*.prod.internal"},
-		"max_user_cert_ttl":  {"4h"},
-		"default_extensions": {"permit-pty\npermit-port-forwarding=yes"},
+		"name":                      {"eng-prod"},
+		"group_claim":               {"eng"},
+		"allowed_principals":        {"alice\nbob"},
+		"host_patterns":             {"*.prod.internal"},
+		"max_user_cert_ttl_seconds": {"14400"},
+		"default_extensions":        {"permit-pty\npermit-port-forwarding=yes"},
 	})
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusSeeOther {
@@ -386,8 +386,8 @@ func TestPortal_RoleCreate_AddsRoleAndRedirects(t *testing.T) {
 	if len(r.AllowedPrincipals) != 2 || r.AllowedPrincipals[1] != "bob" {
 		t.Errorf("AllowedPrincipals = %v", r.AllowedPrincipals)
 	}
-	if r.MaxUserCertTTL != 4*time.Hour {
-		t.Errorf("MaxUserCertTTL = %v", r.MaxUserCertTTL)
+	if r.MaxUserCertTTLSeconds != int64((4 * time.Hour).Seconds()) {
+		t.Errorf("MaxUserCertTTLSeconds = %v", r.MaxUserCertTTLSeconds)
 	}
 	if r.DefaultExtensions["permit-pty"] != "" || r.DefaultExtensions["permit-port-forwarding"] != "yes" {
 		t.Errorf("DefaultExtensions = %v", r.DefaultExtensions)
@@ -442,11 +442,11 @@ func TestPortal_RoleCreate_DuplicateName_400(t *testing.T) {
 
 func TestPortal_RoleEditForm_PreFillsFromStore(t *testing.T) {
 	store := policy.NewInMemoryStore(policy.Role{
-		Name:              "eng",
-		GroupClaim:        "eng",
-		AllowedPrincipals: []string{"alice"},
-		MaxUserCertTTL:    4 * time.Hour,
-		DefaultExtensions: map[string]string{"permit-pty": ""},
+		Name:                  "eng",
+		GroupClaim:            "eng",
+		AllowedPrincipals:     []string{"alice"},
+		MaxUserCertTTLSeconds: int64((4 * time.Hour).Seconds()),
+		DefaultExtensions:     map[string]string{"permit-pty": ""},
 	})
 	p, _ := portal.New(portal.Config{Version: "v", RoleStore: store, Now: time.Now})
 	srv := httptest.NewServer(p.Routes())
@@ -457,7 +457,7 @@ func TestPortal_RoleEditForm_PreFillsFromStore(t *testing.T) {
 		`<h1>Edit role: eng</h1>`,
 		`value="eng"`,
 		`>alice<`,
-		`value="4h0m0s"`,
+		`value="14400"`,
 		`>permit-pty<`,
 		`Save changes`,
 	} {
@@ -659,19 +659,19 @@ func TestPortal_RoleUpdate_InvalidTTL_PreservesInputs(t *testing.T) {
 	defer srv.Close()
 
 	resp := postForm(t, srv.URL+"/roles/eng/edit", url.Values{
-		"name":              {"eng"},
-		"group_claim":       {"eng"},
-		"max_user_cert_ttl": {"not-a-duration"},
+		"name":                      {"eng"},
+		"group_claim":               {"eng"},
+		"max_user_cert_ttl_seconds": {"not-a-number"},
 	})
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Errorf("status = %d, want 400", resp.StatusCode)
 	}
 	body := readAll(t, resp)
-	if !strings.Contains(body, "max_user_cert_ttl") {
+	if !strings.Contains(body, "max_user_cert_ttl_seconds") {
 		t.Errorf("body should name the bad field:\n%s", body)
 	}
-	if !strings.Contains(body, `value="not-a-duration"`) {
+	if !strings.Contains(body, `value="not-a-number"`) {
 		t.Errorf("body should preserve invalid input:\n%s", body)
 	}
 }

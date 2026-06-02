@@ -18,6 +18,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -323,15 +324,15 @@ type roleFormData struct {
 // forms can render input values verbatim (and round-trip on
 // validation failure).
 type roleFormFields struct {
-	Name              string
-	GroupClaim        string
-	AllowedPrincipals string // newline-separated
-	HostPatterns      string // newline-separated
-	SPIFFEPatterns    string // newline-separated
-	MaxUserCertTTL    string // e.g., "4h"
-	MaxHostCertTTL    string
-	MaxX509CertTTL    string
-	DefaultExtensions string // "key=value" per line; empty value renders as bare "key"
+	Name                  string
+	GroupClaim            string
+	AllowedPrincipals     string // newline-separated
+	HostPatterns          string // newline-separated
+	SPIFFEPatterns        string // newline-separated
+	MaxUserCertTTLSeconds string // integer seconds, aligned with the workloads spec
+	MaxHostCertTTLSeconds string
+	MaxX509CertTTLSeconds string
+	DefaultExtensions     string // "key=value" per line; empty value renders as bare "key"
 }
 
 func (s *Server) handleRoleNewForm(w http.ResponseWriter, r *http.Request) {
@@ -760,15 +761,15 @@ func parseRoleForm(r *http.Request) (policy.Role, roleFormFields, error) {
 	get := func(k string) string { return strings.TrimSpace(r.PostForm.Get(k)) }
 
 	fields := roleFormFields{
-		Name:              get("name"),
-		GroupClaim:        get("group_claim"),
-		AllowedPrincipals: r.PostForm.Get("allowed_principals"),
-		HostPatterns:      r.PostForm.Get("host_patterns"),
-		SPIFFEPatterns:    r.PostForm.Get("spiffe_patterns"),
-		MaxUserCertTTL:    get("max_user_cert_ttl"),
-		MaxHostCertTTL:    get("max_host_cert_ttl"),
-		MaxX509CertTTL:    get("max_x509_cert_ttl"),
-		DefaultExtensions: r.PostForm.Get("default_extensions"),
+		Name:                  get("name"),
+		GroupClaim:            get("group_claim"),
+		AllowedPrincipals:     r.PostForm.Get("allowed_principals"),
+		HostPatterns:          r.PostForm.Get("host_patterns"),
+		SPIFFEPatterns:        r.PostForm.Get("spiffe_patterns"),
+		MaxUserCertTTLSeconds: get("max_user_cert_ttl_seconds"),
+		MaxHostCertTTLSeconds: get("max_host_cert_ttl_seconds"),
+		MaxX509CertTTLSeconds: get("max_x509_cert_ttl_seconds"),
+		DefaultExtensions:     r.PostForm.Get("default_extensions"),
 	}
 
 	if fields.Name == "" {
@@ -786,26 +787,28 @@ func parseRoleForm(r *http.Request) (policy.Role, roleFormFields, error) {
 		SPIFFEPatterns:    splitLines(fields.SPIFFEPatterns),
 	}
 
+	// All three TTL caps are plain integer seconds, aligned with the
+	// workloads spec's ttl_seconds.
 	for _, tc := range []struct {
 		raw  string
-		dest *time.Duration
+		dest *int64
 		name string
 	}{
-		{fields.MaxUserCertTTL, &role.MaxUserCertTTL, "max_user_cert_ttl"},
-		{fields.MaxHostCertTTL, &role.MaxHostCertTTL, "max_host_cert_ttl"},
-		{fields.MaxX509CertTTL, &role.MaxX509CertTTL, "max_x509_cert_ttl"},
+		{fields.MaxUserCertTTLSeconds, &role.MaxUserCertTTLSeconds, "max_user_cert_ttl_seconds"},
+		{fields.MaxHostCertTTLSeconds, &role.MaxHostCertTTLSeconds, "max_host_cert_ttl_seconds"},
+		{fields.MaxX509CertTTLSeconds, &role.MaxX509CertTTLSeconds, "max_x509_cert_ttl_seconds"},
 	} {
 		if tc.raw == "" {
 			continue
 		}
-		d, err := time.ParseDuration(tc.raw)
+		secs, err := strconv.ParseInt(tc.raw, 10, 64)
 		if err != nil {
 			return policy.Role{}, fields, fmt.Errorf("%s %q: %w", tc.name, tc.raw, err)
 		}
-		if d < 0 {
+		if secs < 0 {
 			return policy.Role{}, fields, fmt.Errorf("%s must be non-negative", tc.name)
 		}
-		*tc.dest = d
+		*tc.dest = secs
 	}
 
 	if exts, err := parseExtensions(fields.DefaultExtensions); err != nil {
@@ -863,23 +866,25 @@ func parseExtensions(raw string) (map[string]string, error) {
 // The inverse of parseRoleForm — used by the edit page.
 func roleToForm(r policy.Role) roleFormFields {
 	return roleFormFields{
-		Name:              r.Name,
-		GroupClaim:        r.GroupClaim,
-		AllowedPrincipals: strings.Join(r.AllowedPrincipals, "\n"),
-		HostPatterns:      strings.Join(r.HostPatterns, "\n"),
-		SPIFFEPatterns:    strings.Join(r.SPIFFEPatterns, "\n"),
-		MaxUserCertTTL:    durString(r.MaxUserCertTTL),
-		MaxHostCertTTL:    durString(r.MaxHostCertTTL),
-		MaxX509CertTTL:    durString(r.MaxX509CertTTL),
-		DefaultExtensions: extensionsToForm(r.DefaultExtensions),
+		Name:                  r.Name,
+		GroupClaim:            r.GroupClaim,
+		AllowedPrincipals:     strings.Join(r.AllowedPrincipals, "\n"),
+		HostPatterns:          strings.Join(r.HostPatterns, "\n"),
+		SPIFFEPatterns:        strings.Join(r.SPIFFEPatterns, "\n"),
+		MaxUserCertTTLSeconds: secsString(r.MaxUserCertTTLSeconds),
+		MaxHostCertTTLSeconds: secsString(r.MaxHostCertTTLSeconds),
+		MaxX509CertTTLSeconds: secsString(r.MaxX509CertTTLSeconds),
+		DefaultExtensions:     extensionsToForm(r.DefaultExtensions),
 	}
 }
 
-func durString(d time.Duration) string {
-	if d == 0 {
+// secsString renders an integer-seconds cap for a form field, blanking
+// the zero value (no per-role cap).
+func secsString(s int64) string {
+	if s == 0 {
 		return ""
 	}
-	return d.String()
+	return strconv.FormatInt(s, 10)
 }
 
 func extensionsToForm(m map[string]string) string {
@@ -931,6 +936,14 @@ func parsePages() (map[string]*template.Template, error) {
 				return "(role default)"
 			}
 			return d.String()
+		},
+		// fmtSeconds renders an integer-seconds cap human-friendly,
+		// matching fmtDuration's zero handling.
+		"fmtSeconds": func(s int64) string {
+			if s == 0 {
+				return "(role default)"
+			}
+			return (time.Duration(s) * time.Second).String()
 		},
 	}
 	pages := map[string]string{
@@ -1074,9 +1087,9 @@ const roleDetailTemplate = `{{define "page"}}{{template "base" .}}{{end}}
 <tr><th>SPIFFE patterns</th><td>
 {{if .Role.SPIFFEPatterns}}{{range $i, $p := .Role.SPIFFEPatterns}}{{if $i}}, {{end}}<code>{{$p}}</code>{{end}}{{else}}<em>none</em>{{end}}
 </td></tr>
-<tr><th>Max user-cert TTL</th><td>{{fmtDuration .Role.MaxUserCertTTL}}</td></tr>
-<tr><th>Max host-cert TTL</th><td>{{fmtDuration .Role.MaxHostCertTTL}}</td></tr>
-<tr><th>Max X.509-cert TTL</th><td>{{fmtDuration .Role.MaxX509CertTTL}}</td></tr>
+<tr><th>Max user-cert TTL</th><td>{{fmtSeconds .Role.MaxUserCertTTLSeconds}}</td></tr>
+<tr><th>Max host-cert TTL</th><td>{{fmtSeconds .Role.MaxHostCertTTLSeconds}}</td></tr>
+<tr><th>Max X.509-cert TTL</th><td>{{fmtSeconds .Role.MaxX509CertTTLSeconds}}</td></tr>
 <tr><th>Default extensions</th><td>
 {{if .Role.DefaultExtensions}}{{range $k, $v := .Role.DefaultExtensions}}<code>{{$k}}{{if $v}}={{$v}}{{end}}</code><br>{{end}}{{else}}<em>none</em>{{end}}
 </td></tr>
@@ -1108,14 +1121,14 @@ const roleFormTemplate = `{{define "page"}}{{template "base" .}}{{end}}
   <label>SPIFFE patterns (one per line)
     <textarea name="spiffe_patterns" rows="4">{{.Form.SPIFFEPatterns}}</textarea>
   </label>
-  <label>Max user-cert TTL (e.g., <code>4h</code>; blank = role default)
-    <input type="text" name="max_user_cert_ttl" value="{{.Form.MaxUserCertTTL}}" autocomplete="off">
+  <label>Max user-cert TTL (seconds, e.g., <code>14400</code>; blank = role default)
+    <input type="text" name="max_user_cert_ttl_seconds" value="{{.Form.MaxUserCertTTLSeconds}}" autocomplete="off">
   </label>
-  <label>Max host-cert TTL
-    <input type="text" name="max_host_cert_ttl" value="{{.Form.MaxHostCertTTL}}" autocomplete="off">
+  <label>Max host-cert TTL (seconds; blank = role default)
+    <input type="text" name="max_host_cert_ttl_seconds" value="{{.Form.MaxHostCertTTLSeconds}}" autocomplete="off">
   </label>
-  <label>Max X.509-cert TTL
-    <input type="text" name="max_x509_cert_ttl" value="{{.Form.MaxX509CertTTL}}" autocomplete="off">
+  <label>Max X.509-cert TTL (seconds, e.g., <code>86400</code>; blank = role default)
+    <input type="text" name="max_x509_cert_ttl_seconds" value="{{.Form.MaxX509CertTTLSeconds}}" autocomplete="off">
   </label>
   <label>Default extensions (one <code>key=value</code> per line; bare keys allowed)
     <textarea name="default_extensions" rows="4">{{.Form.DefaultExtensions}}</textarea>

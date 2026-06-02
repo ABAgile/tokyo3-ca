@@ -56,10 +56,10 @@ func TestInMemoryStore_ReplaceAll(t *testing.T) {
 
 func TestEvaluateUserCert_SingleRoleMatch(t *testing.T) {
 	store := policy.NewInMemoryStore(policy.Role{
-		Name:              "eng",
-		GroupClaim:        "eng",
-		AllowedPrincipals: []string{"deploy", "alice"},
-		MaxUserCertTTL:    4 * time.Hour,
+		Name:                  "eng",
+		GroupClaim:            "eng",
+		AllowedPrincipals:     []string{"deploy", "alice"},
+		MaxUserCertTTLSeconds: int64((4 * time.Hour).Seconds()),
 	})
 	eng := policy.NewEngine(store)
 
@@ -82,8 +82,8 @@ func TestEvaluateUserCert_SingleRoleMatch(t *testing.T) {
 func TestEvaluateUserCert_MultiRoleUnion(t *testing.T) {
 	// eng: deploy, 4h. sre: root + deploy, 12h.
 	store := policy.NewInMemoryStore(
-		policy.Role{Name: "eng", GroupClaim: "eng", AllowedPrincipals: []string{"deploy"}, MaxUserCertTTL: 4 * time.Hour},
-		policy.Role{Name: "sre", GroupClaim: "sre", AllowedPrincipals: []string{"root", "deploy"}, MaxUserCertTTL: 12 * time.Hour},
+		policy.Role{Name: "eng", GroupClaim: "eng", AllowedPrincipals: []string{"deploy"}, MaxUserCertTTLSeconds: int64((4 * time.Hour).Seconds())},
+		policy.Role{Name: "sre", GroupClaim: "sre", AllowedPrincipals: []string{"root", "deploy"}, MaxUserCertTTLSeconds: int64((12 * time.Hour).Seconds())},
 	)
 	eng := policy.NewEngine(store)
 
@@ -170,8 +170,8 @@ func TestEvaluateUserCert_EmptyDecision(t *testing.T) {
 func TestEvaluateUserCert_TTLCappedAtRoleMax(t *testing.T) {
 	store := policy.NewInMemoryStore(policy.Role{
 		Name: "eng", GroupClaim: "eng",
-		AllowedPrincipals: []string{"alice"},
-		MaxUserCertTTL:    2 * time.Hour,
+		AllowedPrincipals:     []string{"alice"},
+		MaxUserCertTTLSeconds: int64((2 * time.Hour).Seconds()),
 	})
 	eng := policy.NewEngine(store)
 
@@ -192,7 +192,7 @@ func TestEvaluateUserCert_ZeroRoleTTLUsesEndpointMax(t *testing.T) {
 	store := policy.NewInMemoryStore(policy.Role{
 		Name: "eng", GroupClaim: "eng",
 		AllowedPrincipals: []string{"alice"},
-		// MaxUserCertTTL unset → 0 → endpoint cap applies.
+		// MaxUserCertTTLSeconds unset → 0 → endpoint cap applies.
 	})
 	eng := policy.NewEngine(store)
 
@@ -243,8 +243,8 @@ func TestEvaluateUserCert_MergesDefaultExtensions(t *testing.T) {
 func TestEvaluateHostCert_GlobMatch(t *testing.T) {
 	store := policy.NewInMemoryStore(policy.Role{
 		Name: "prod-hosts", GroupClaim: "prod-host-admin",
-		HostPatterns:   []string{"db-*.prod.internal", "*.staging"},
-		MaxHostCertTTL: 7 * 24 * time.Hour,
+		HostPatterns:          []string{"db-*.prod.internal", "*.staging"},
+		MaxHostCertTTLSeconds: int64((7 * 24 * time.Hour).Seconds()),
 	})
 	eng := policy.NewEngine(store)
 
@@ -320,8 +320,8 @@ func TestEvaluateHostCert_AllPrincipalsFiltered(t *testing.T) {
 func TestEvaluateHostCert_TTLCapped(t *testing.T) {
 	store := policy.NewInMemoryStore(policy.Role{
 		Name: "x", GroupClaim: "x",
-		HostPatterns:   []string{"*"},
-		MaxHostCertTTL: 3 * 24 * time.Hour, // 3 days
+		HostPatterns:          []string{"*"},
+		MaxHostCertTTLSeconds: int64((3 * 24 * time.Hour).Seconds()), // 3 days
 	})
 	eng := policy.NewEngine(store)
 
@@ -363,8 +363,8 @@ func TestEvaluateHostCert_InvalidPatternErrors(t *testing.T) {
 func TestEvaluateX509Cert_GlobMatch(t *testing.T) {
 	store := policy.NewInMemoryStore(policy.Role{
 		Name: "workloads", GroupClaim: "workload-issuer",
-		SPIFFEPatterns: []string{"spiffe://corp/svc/*"},
-		MaxX509CertTTL: 12 * time.Hour,
+		SPIFFEPatterns:        []string{"spiffe://corp/svc/*"},
+		MaxX509CertTTLSeconds: int64((12 * time.Hour).Seconds()),
 	})
 	eng := policy.NewEngine(store)
 
@@ -424,8 +424,8 @@ func TestEvaluateX509Cert_TTLCapped(t *testing.T) {
 	// the two-segment "svc/billing" tail.
 	store := policy.NewInMemoryStore(policy.Role{
 		Name: "workloads", GroupClaim: "workload-issuer",
-		SPIFFEPatterns: []string{"spiffe://corp/svc/*"},
-		MaxX509CertTTL: 4 * time.Hour,
+		SPIFFEPatterns:        []string{"spiffe://corp/svc/*"},
+		MaxX509CertTTLSeconds: int64((4 * time.Hour).Seconds()),
 	})
 	eng := policy.NewEngine(store)
 
@@ -461,8 +461,8 @@ func TestEvaluateX509Cert_InvalidPatternErrors(t *testing.T) {
 
 func TestEvaluateX509Cert_MultiRoleUnion(t *testing.T) {
 	store := policy.NewInMemoryStore(
-		policy.Role{Name: "a", GroupClaim: "a", SPIFFEPatterns: []string{"spiffe://corp/svc/*"}, MaxX509CertTTL: 1 * time.Hour},
-		policy.Role{Name: "b", GroupClaim: "b", SPIFFEPatterns: []string{"spiffe://other/*"}, MaxX509CertTTL: 6 * time.Hour},
+		policy.Role{Name: "a", GroupClaim: "a", SPIFFEPatterns: []string{"spiffe://corp/svc/*"}, MaxX509CertTTLSeconds: int64((1 * time.Hour).Seconds())},
+		policy.Role{Name: "b", GroupClaim: "b", SPIFFEPatterns: []string{"spiffe://other/*"}, MaxX509CertTTLSeconds: int64((6 * time.Hour).Seconds())},
 	)
 	eng := policy.NewEngine(store)
 

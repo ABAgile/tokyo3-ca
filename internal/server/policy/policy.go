@@ -33,7 +33,7 @@ import (
 // sign request it might match — useful as a deliberate placeholder
 // during config rollout.
 //
-// MaxUserCertTTL / MaxHostCertTTL act as the maximum a single role
+// Max*CertTTLSeconds act as the maximum a single role
 // permits. A value of zero means "no per-role cap; the endpoint-level
 // cap applies." When a caller is in multiple roles, the engine takes
 // the *most permissive* cap across them (union semantics — more roles
@@ -47,11 +47,15 @@ type Role struct {
 	// URI is matched against for X.509 workload-cert issuance. Same
 	// glob syntax as HostPatterns; the URI is matched as a single
 	// string ("spiffe://corp/svc/billing").
-	SPIFFEPatterns    []string          `json:"spiffe_patterns,omitempty"`
-	MaxUserCertTTL    time.Duration     `json:"max_user_cert_ttl,omitempty"`
-	MaxHostCertTTL    time.Duration     `json:"max_host_cert_ttl,omitempty"`
-	MaxX509CertTTL    time.Duration     `json:"max_x509_cert_ttl,omitempty"`
-	DefaultExtensions map[string]string `json:"default_extensions,omitempty"`
+	SPIFFEPatterns []string `json:"spiffe_patterns,omitempty"`
+	// Max*CertTTLSeconds are the per-role TTL caps in SECONDS — aligned
+	// with the workloads spec's ttl_seconds so hand-edited role files use
+	// one friendly unit throughout (rather than Go-duration nanoseconds).
+	// Zero ⇒ no per-role cap; the endpoint-level cap applies.
+	MaxUserCertTTLSeconds int64             `json:"max_user_cert_ttl_seconds,omitempty"`
+	MaxHostCertTTLSeconds int64             `json:"max_host_cert_ttl_seconds,omitempty"`
+	MaxX509CertTTLSeconds int64             `json:"max_x509_cert_ttl_seconds,omitempty"`
+	DefaultExtensions     map[string]string `json:"default_extensions,omitempty"`
 }
 
 // Store backs the role table. The engine consults it on every sign
@@ -323,9 +327,9 @@ func (e *Engine) EvaluateUserCert(groups []string, req UserCertRequest) (UserCer
 			ErrEmptyDecision, req.RequestedPrincipals, sortedKeys(allowed))
 	}
 
-	// TTL: maximum across matching roles' MaxUserCertTTL, then capped
-	// at endpoint max. Zero MaxUserCertTTL means "no per-role cap"; in
-	// that case the endpoint max applies for this role.
+	// TTL: maximum across matching roles' MaxUserCertTTLSeconds, then
+	// capped at endpoint max. Zero means "no per-role cap"; in that case
+	// the endpoint max applies for this role.
 	maxTTL := ttlCap(roles, req.EndpointMaxTTL, userCapField)
 	ttl := min(req.RequestedTTL, maxTTL)
 
@@ -446,11 +450,11 @@ func ttlCap(roles []Role, endpoint time.Duration, field capField) time.Duration 
 		var eff time.Duration
 		switch field {
 		case userCapField:
-			eff = r.MaxUserCertTTL
+			eff = time.Duration(r.MaxUserCertTTLSeconds) * time.Second
 		case hostCapField:
-			eff = r.MaxHostCertTTL
+			eff = time.Duration(r.MaxHostCertTTLSeconds) * time.Second
 		case x509CapField:
-			eff = r.MaxX509CertTTL
+			eff = time.Duration(r.MaxX509CertTTLSeconds) * time.Second
 		}
 		if eff == 0 || eff > endpoint {
 			eff = endpoint

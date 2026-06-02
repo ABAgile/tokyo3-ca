@@ -86,8 +86,8 @@ func TestSignX509Workload_HappyPath(t *testing.T) {
 		stubVerifier{claims: &oidc.Claims{Email: "alice@example.com", Groups: []string{"workload-issuer"}}},
 		policy.Role{
 			Name: "workload-issuer", GroupClaim: "workload-issuer",
-			SPIFFEPatterns: []string{"spiffe://corp/svc/*"},
-			MaxX509CertTTL: 4 * time.Hour,
+			SPIFFEPatterns:        []string{"spiffe://corp/svc/*"},
+			MaxX509CertTTLSeconds: int64((4 * time.Hour).Seconds()),
 		},
 	)
 
@@ -153,8 +153,8 @@ func TestSignX509Workload_TTLCappedByPolicy(t *testing.T) {
 		stubVerifier{claims: &oidc.Claims{Email: "alice@example.com", Groups: []string{"workload-issuer"}}},
 		policy.Role{
 			Name: "workload-issuer", GroupClaim: "workload-issuer",
-			SPIFFEPatterns: []string{"spiffe://corp/svc/*"},
-			MaxX509CertTTL: 30 * time.Minute, // tight cap
+			SPIFFEPatterns:        []string{"spiffe://corp/svc/*"},
+			MaxX509CertTTLSeconds: int64((30 * time.Minute).Seconds()), // tight cap
 		},
 	)
 

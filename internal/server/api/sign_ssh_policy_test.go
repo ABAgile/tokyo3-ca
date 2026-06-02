@@ -50,9 +50,9 @@ func TestPolicy_SignUserCert_HappyPath_FiltersAndCaps(t *testing.T) {
 	srv, subjectAuthKey := newPolicyServer(t,
 		policy.Role{
 			Name: "eng", GroupClaim: "eng",
-			AllowedPrincipals: []string{"deploy"},
-			MaxUserCertTTL:    2 * time.Hour,
-			DefaultExtensions: map[string]string{"permit-pty": ""},
+			AllowedPrincipals:     []string{"deploy"},
+			MaxUserCertTTLSeconds: int64((2 * time.Hour).Seconds()),
+			DefaultExtensions:     map[string]string{"permit-pty": ""},
 		},
 	)
 
@@ -78,7 +78,7 @@ func TestPolicy_SignUserCert_HappyPath_FiltersAndCaps(t *testing.T) {
 	if !slices.Equal(resp.Principals, []string{"deploy"}) {
 		t.Errorf("principals = %v, want [deploy]", resp.Principals)
 	}
-	// TTL capped at 2h (role's MaxUserCertTTL).
+	// TTL capped at 2h (role's MaxUserCertTTLSeconds).
 	if got := resp.ValidBefore.Sub(resp.ValidAfter); got != 2*time.Hour {
 		t.Errorf("validity window = %s, want 2h (capped)", got)
 	}
@@ -190,8 +190,8 @@ func TestPolicy_SignUserCert_ForbiddenWhenAllPrincipalsDenied(t *testing.T) {
 func TestPolicy_SignHostCert_GlobAndTTL(t *testing.T) {
 	srv, subjectAuthKey := newPolicyServer(t, policy.Role{
 		Name: "prod-hosts", GroupClaim: "prod-host-admin",
-		HostPatterns:   []string{"db-*.prod.internal", "*.staging"},
-		MaxHostCertTTL: 24 * time.Hour,
+		HostPatterns:          []string{"db-*.prod.internal", "*.staging"},
+		MaxHostCertTTLSeconds: int64((24 * time.Hour).Seconds()),
 	})
 
 	rec := doJSON(t, srv, http.MethodPost, "/api/v1/ssh/sign-host", map[string]any{
@@ -240,12 +240,12 @@ func TestPolicy_SignHostCert_ForbiddenAllFiltered(t *testing.T) {
 func TestPolicy_MultipleGroupsUnion(t *testing.T) {
 	srv, subjectAuthKey := newPolicyServer(t,
 		policy.Role{Name: "eng", GroupClaim: "eng",
-			AllowedPrincipals: []string{"deploy"},
-			MaxUserCertTTL:    1 * time.Hour,
+			AllowedPrincipals:     []string{"deploy"},
+			MaxUserCertTTLSeconds: int64((1 * time.Hour).Seconds()),
 		},
 		policy.Role{Name: "sre", GroupClaim: "sre",
-			AllowedPrincipals: []string{"root"},
-			MaxUserCertTTL:    8 * time.Hour,
+			AllowedPrincipals:     []string{"root"},
+			MaxUserCertTTLSeconds: int64((8 * time.Hour).Seconds()),
 		},
 	)
 
