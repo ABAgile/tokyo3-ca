@@ -160,6 +160,12 @@ services:
       CERTD_API_CERT: /shared/certs/certd.crt
       CERTD_API_KEY: /shared/certs/certd.key
       CERTD_CA_KEY_FILE: /shared/certs/certd-signing.key
+      # Persistent X.509 issuer cert (self-signed over the signing key).
+      # Without it certd self-generates an EPHEMERAL issuer at boot, so
+      # certd-issued leaves stop chain-validating across a certd restart.
+      # This is the trust anchor workloads verify certd-issued peers against
+      # — distinct from ca.crt (mkcert root, for certd's own HTTPS cert).
+      CERTD_CA_X509_CERT_FILE: /shared/certs/certd-x509-ca.crt
       CERTD_NATS_URL: nats://nats:4222
       # Enforce the sample role table: the "authd" group may obtain
       # spiffe://tokyo3/authd/* certs. cert-agentd authorises via

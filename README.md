@@ -109,6 +109,8 @@ shared/
     cert-agentd.{crt,key} # bootstrap workload identity
     certd-signing.key     # CA signing key, PKCS#8 PEM (signs X.509 + SSH)
     certd-signing.key.pub # OpenSSH-format CA pubkey (TrustedUserCAKeys)
+    certd-x509-ca.crt     # X.509 issuer cert → CERTD_CA_X509_CERT_FILE;
+                          #   trust anchor for certd-issued mTLS leaves
   policy/                 # sample certd policy
     roles.json            # role table → CERTD_ROLES_FILE
     principals.json       # mTLS principal map (sample; prod mTLS path)
@@ -142,12 +144,23 @@ that path needs verified client certs (`CERTD_API_CLIENT_CA` /
 `CERTD_WORKLOAD_CA`), which the rig doesn't set. OIDC is also off;
 production wires OIDC + mTLS principals on top.
 
+**Three CAs, don't conflate them.** The rig has three public
+trust artifacts, each for a different job:
+
+- `ca.crt` — mkcert root. Verifies certd's **HTTPS server cert** and the agent's **bootstrap** cert (`CERT_AGENTD_WORKLOAD_CA`). This is the transport layer; it must stay mkcert.
+- `certd-x509-ca.crt` — certd's **X.509 issuer cert** (`CERTD_CA_X509_CERT_FILE`). The anchor a workload pins to verify a *peer whose leaf certd issued* (the `authd-*` certs above). A real Postgres/NATS consumer would mount this, not `ca.crt`.
+- `certd-signing.key.pub` — OpenSSH-format **SSH CA** pubkey (`TrustedUserCAKeys`). SSH world only; never goes in a TLS trust bundle.
+
 Watch it work:
 
 ```sh
 docker compose logs -f cert-agentd      # db-app + db-admin + nats + scim + self renewing
 docker compose exec cert-agentd ls -l /certs   # authd-*.crt/key
 docker compose exec natsbox nats stream view ca_audit  # x509.workload.cert.signed events
+# Prove a provisioned leaf chains to the issuer cert (end-to-end trust):
+docker compose exec cert-agentd sh -c \
+  'openssl verify -CAfile /shared/certs/certd-x509-ca.crt /certs/authd-db-app.crt'
+#   → /certs/authd-db-app.crt: OK
 ```
 
 **Streams.** `natsbox` provisions two JetStream streams on boot:

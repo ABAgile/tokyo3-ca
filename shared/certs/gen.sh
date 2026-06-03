@@ -106,10 +106,38 @@ if [[ -f "$OUT/certd-signing.key" ]] && grep -q "BEGIN PRIVATE KEY" "$OUT/certd-
   skip "exists (PKCS#8) — delete certd-signing.key to rotate"
 else
   step "certd-signing (CA key, PKCS#8)"
-  rm -f "$OUT/certd-signing.key" "$OUT/certd-signing.key.pub"
+  # Rotating the key invalidates everything it ever signed, including the
+  # X.509 issuer cert below — regenerate that too (rm forces it).
+  rm -f "$OUT/certd-signing.key" "$OUT/certd-signing.key.pub" "$OUT/certd-x509-ca.crt"
   openssl genpkey -algorithm ed25519 -out "$OUT/certd-signing.key" >/dev/null 2>&1
   chmod 600 "$OUT/certd-signing.key"
   echo "$(ssh-keygen -y -f "$OUT/certd-signing.key") certd-user-ca" > "$OUT/certd-signing.key.pub"
+  ok
+fi
+
+# ── certd's X.509 CA issuer cert (CERTD_CA_X509_CERT_FILE) ────────────────────
+# The PUBLIC trust anchor for every X.509/SPIFFE leaf certd issues: a
+# self-signed CA cert over the signing key above. Workloads doing mTLS put
+# THIS cert in their trust bundle to verify a peer whose leaf was issued by
+# certd — it is NOT ca.crt (that's mkcert's root, used only for certd's HTTPS
+# server cert + the agent's bootstrap cert) and NOT certd-signing.key.pub
+# (that's the OpenSSH-format SSH CA key). Same key, three public faces.
+#
+# certd, if started without CERTD_CA_X509_CERT_FILE, self-generates this at
+# boot and never persists it — fine until two certd-issued workloads must
+# verify each other across a certd restart. Persisting it here gives a stable
+# anchor. Generated once; regenerated only when the signing key rotated (the
+# rm above) — a fresh issuer cert over the SAME key still validates existing
+# leaves (chains verify against the key, not the exact cert bytes).
+if [[ -f "$OUT/certd-x509-ca.crt" ]]; then
+  step "certd-x509-ca"
+  skip "exists — delete certd-x509-ca.crt to regenerate"
+else
+  step "certd-x509-ca (issuer cert)"
+  openssl req -x509 -new -key "$OUT/certd-signing.key" -out "$OUT/certd-x509-ca.crt" \
+    -days 3650 -subj "/CN=tokyo3-ca" \
+    -addext "basicConstraints=critical,CA:TRUE,pathlen:0" \
+    -addext "keyUsage=critical,keyCertSign,cRLSign,digitalSignature" >/dev/null 2>&1
   ok
 fi
 
