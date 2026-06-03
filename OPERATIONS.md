@@ -36,10 +36,11 @@ host that needs renewable credentials.
 
 1. **Generate or import the CA key.**
    - Dev: `openssl genpkey -algorithm ed25519 -out ca.key`; `CERTD_CA_KEY_FILE=ca.key`.
-   - Prod: provision an asymmetric SIGN_VERIFY key in your KMS (AWS KMS, GCP KMS, Vault Transit, or HSM); wire it via a `signer.NewRemoteSigner` adapter in your deployment glue.
+   - Prod: provision an asymmetric SIGN_VERIFY key in your KMS (AWS KMS, GCP KMS, Vault Transit, or HSM); wire it via a `signer.NewRemoteSigner` adapter in your deployment glue. See **§2.1 Production CA bootstrap (KMS)** below.
+1b. **Pin a persistent X.509 issuer cert.** Set `CERTD_CA_X509_CERT_FILE` to a stable self-signed CA cert over the signing key. **Do not skip this in production:** when unset, certd self-signs a *fresh, ephemeral* issuer at every boot, so previously-issued leaf certs stop chain-validating after a restart. This cert (not the API server cert, not the SSH CA pubkey) is the trust anchor every workload pins to verify a certd-issued mTLS peer. See §2.1 for minting it with a KMS key.
 2. **Configure mTLS for the API.**
-   - `CERTD_API_CERT` + `CERTD_API_KEY` = the server certificate the workloads validate.
-   - `CERTD_API_CLIENT_CA` = the CA bundle workload certs are signed by.
+   - `CERTD_API_CERT` + `CERTD_API_KEY` = the server certificate the workloads validate (a TLS *server* cert with a DNS SAN — typically from your platform CA / cert-manager, **not** from certd itself).
+   - `CERTD_API_CLIENT_CA` = the CA bundle the *inbound* workload client certs are signed by (i.e. certd's own issuer cert from step 1b, once agents present certd-issued mTLS identities).
 3. **Provision OIDC verification** (humans-and-OIDC path) via `CERTD_OIDC_ISSUER` + matching JWKS reachability.
 4. **Seed the role table.** Write `CERTD_ROLES_FILE` as a JSON array of `policy.Role` objects (see `internal/server/policy/policy.go` for the struct shape).
 5. **Seed the workload registry.** Write `CERTD_MTLS_PRINCIPALS_FILE` as a JSON array of `mtls.Principal` (Name, SAN, Groups).
@@ -51,6 +52,145 @@ host that needs renewable credentials.
 Start the binary, hit `https://certd/healthz` to confirm it bound,
 and follow with `/portal/` to confirm the auth gate behaves as
 expected.
+
+## 2.1 Production CA bootstrap (KMS)
+
+The CA has **two** pieces of key material, and they are not the same
+object:
+
+| Artifact | What it is | Where it lives | Who sees it |
+|---|---|---|---|
+| **CA signing key** | the private key that signs every leaf | **KMS / HSM — never exported** | certd, via the signer abstraction |
+| **X.509 issuer cert** | self-signed CA cert over that key's *public* half | a PEM file (`CERTD_CA_X509_CERT_FILE`) + every workload's trust bundle | everyone (it's public) |
+
+The signing key is secret and stays in KMS; the issuer cert is public
+and is the trust anchor you distribute. Bootstrapping production means:
+provision the key, mint the issuer cert *using* that key (without ever
+extracting it), run certd against both, and publish the issuer cert.
+
+### Step 1 — provision the KMS key
+
+Create an **asymmetric SIGN_VERIFY** key. Match the algorithm to what
+certd's signer expects (Ed25519 today; if your KMS lacks Ed25519, use
+ECDSA P-256 and set the workload `key_type` accordingly — RSA works but
+is slower per-issuance).
+
+```sh
+# AWS
+aws kms create-key --key-spec ECC_NIST_P256 --key-usage SIGN_VERIFY \
+  --description "tokyo3-ca signing key (prod)"
+# → note the KeyId / ARN
+
+# GCP
+gcloud kms keys create tokyo3-ca-signing --location global \
+  --keyring tokyo3-ca --purpose asymmetric-signing \
+  --default-algorithm ec-sign-p256-sha256
+```
+
+Lock the key policy down to certd's runtime principal (IAM role /
+GCP service account / Vault policy): **`Sign` + `GetPublicKey` only** —
+no `Decrypt`, no export, no scheduling-for-deletion from the app role.
+
+### Step 2 — choose the runtime signing model
+
+The shipped `certd` binary's `loadCASigner` reads `CERTD_CA_KEY_FILE`
+(PKCS#8 PEM) or generates an ephemeral key. It does **not** ship a KMS
+env knob — KMS is integrated through the `signer.NewRemoteSigner`
+abstraction. Two honest options:
+
+- **Model A — online KMS signing (recommended).** The key never leaves
+  KMS; every issuance calls KMS `Sign`. Requires a thin certd build
+  whose `loadCASigner` returns a `signer.NewRemoteSigner` instead of the
+  file loader. Skeleton:
+
+  ```go
+  // GetPublicKey once at startup, wrap Sign per-issuance.
+  pub := mustKMSPublicKey(ctx, kms, keyID)         // crypto.PublicKey from KMS GetPublicKey (DER → ParsePKIXPublicKey)
+  caSigner, _ := signer.NewRemoteSigner(signer.RemoteSignerConfig{
+      PublicKey:   pub,
+      Description: "AWS KMS " + keyID,
+      SignTimeout: 5 * time.Second,
+      Sign: func(ctx context.Context, digest []byte) ([]byte, error) {
+          out, err := kms.Sign(ctx, &kms.SignInput{
+              KeyId:            &keyID,
+              Message:          digest,
+              MessageType:      types.MessageTypeDigest,      // ECDSA/RSA: pre-hashed digest
+              SigningAlgorithm: types.SigningAlgorithmSpecEcdsaSha256,
+          })
+          return out.Signature, err   // KMS returns DER ECDSA sig — what crypto/x509 expects
+      },
+  })
+  // hand caSigner to the same api.Config.CASigner field cmd/certd/main.go uses.
+  ```
+
+  Caveats: KMS returns **DER-encoded** ECDSA signatures, which is what
+  `crypto/x509` wants — good. For **Ed25519** the `Sign` digest is the
+  full message (not pre-hashed) and `MessageType=RAW`. Budget for KMS
+  latency + throttling on the issuance hot path (cache nothing
+  signing-related; the public key is the only safe cache).
+
+- **Model B — KMS-wrapped key file (works with the stock binary).**
+  Generate the Ed25519 key, envelope-encrypt it with a KMS *symmetric*
+  key, store the ciphertext in your secret store. At deploy, KMS
+  `Decrypt` it into a tmpfs path and point `CERTD_CA_KEY_FILE` there.
+  The key is protected at rest but is present in process memory / tmpfs
+  at runtime — weaker than Model A. Acceptable when your KMS has no
+  asymmetric signing or you can't run a custom build.
+
+### Step 3 — mint the issuer cert (key stays in KMS)
+
+The issuer cert is just a self-signature over the public key, so the
+signing key performs exactly **one** `Sign` to create it. The
+`certd ca bootstrap` subcommand does this, reusing the same signer seam
+and `x509engine.NewSelfSignedCA` path `serve` uses:
+
+```sh
+# Model B (file key): runs as-is against the shipped binary.
+certd ca bootstrap --key /run/tokyo3-ca/ca.key --cn "tokyo3-ca prod" \
+  --out /etc/tokyo3-ca/issuer.crt
+
+# Model A (KMS): the SAME command, once loadSigner is wired to
+# signer.NewRemoteSigner (the KMS extension point flagged in
+# cmd/certd/ca.go). The key never leaves KMS; this is its one Sign.
+```
+
+Run it once per CA generation and commit the resulting cert to config
+management. It's a one-shot operator action, not a runtime path. (Under
+Model B you can equivalently `openssl req -x509 -new -key <decrypted>.key
+…` exactly as `shared/certs/gen.sh` does for dev — same cert.)
+
+### Step 4 — wire and distribute
+
+1. `CERTD_CA_KEY_FILE` (Model B) **or** your KMS-signer build (Model A).
+2. `CERTD_CA_X509_CERT_FILE=/etc/tokyo3-ca/issuer.crt` — the cert from step 3.
+3. Push `issuer.crt` to **every workload's trust bundle** (`CERT_AGENTD_WORKLOAD_CA` on agents; `AUTH_DB_CA` / `AUTH_NATS_CA` / `AUTH_WORKLOAD_CA` etc. on consumers) so they validate certd-issued peers. This is a *different* file from the bundle that verifies certd's HTTPS server cert.
+4. Verify the chain before going live:
+   ```sh
+   # issue a throwaway workload cert, confirm it chains to the issuer
+   openssl verify -CAfile issuer.crt sample-leaf.crt   # → sample-leaf.crt: OK
+   ```
+
+### Rotation note
+
+Rotating the **issuer cert** over the **same** key is cheap: a new
+self-signed cert with the same public key still validates every
+existing leaf (chains verify against the key, not the cert bytes).
+Re-mint with `certd ca bootstrap --force` and distribute — no bundle,
+no reissuance.
+
+Rotating the **key** is the disruptive operation. `certd ca rotate`
+mints the new issuer cert from the new key and emits an overlap trust
+bundle (old ⊕ new) so consumers trust both while old-key leaves drain:
+
+```sh
+certd ca rotate --key new-ca.key --out issuer-new.crt \
+  --old issuer.crt --bundle-out trust-bundle.crt
+# distribute trust-bundle.crt everywhere BEFORE cutting issuance to new-ca.key;
+# once all old-key leaves have expired, drop the old cert:
+certd ca bundle --out trust-bundle.crt issuer-new.crt
+```
+
+See *Rotate the CA key* below for the full cutover sequence.
 
 ## 3. Common scenarios
 

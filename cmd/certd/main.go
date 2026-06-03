@@ -166,7 +166,7 @@ func rootCmd() *cobra.Command {
 		Use:   appName,
 		Short: "tokyo3-ca certificate authority server",
 	}
-	root.AddCommand(serveCmd(), versionCmd())
+	root.AddCommand(serveCmd(), versionCmd(), caCmd())
 	return root
 }
 
