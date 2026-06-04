@@ -113,8 +113,19 @@
 //	                  AllowedPrincipals, HostPatterns, SPIFFEPatterns, MaxFooCertTTL,
 //	                  DefaultExtensions). When set, role-table policy is applied to every sign
 //	                  request and the portal's /roles page renders the configured roles. Unset
-//	                  leaves certd in permissive mode (existing dev behavior) and the portal
-//	                  page returns 503.
+//	                  (and no CERTD_DATABASE_URL) leaves certd in permissive mode (existing dev
+//	                  behavior) and the portal page returns 503. With CERTD_DATABASE_URL set,
+//	                  this file seeds a fresh (empty) database once via SeedIfEmpty.
+//
+//	CERTD_DATABASE_URL  Persistent store for the role table, the mTLS principal registry, and
+//	                    the SSH revocation list (KRL) — one backend behind all three. A Postgres
+//	                    DSN selects the production backend (mirrors authd's AUTH_DATABASE_URL); a
+//	                    "sqlite:<path>" URL selects the pure-Go SQLite backend for the dev rig
+//	                    (e.g. sqlite:/var/lib/certd/certd.db, or sqlite::memory: for ephemeral).
+//	                    When set, certd applies migrations and serves policy/principals/
+//	                    revocations from the DB; CERTD_ROLES_FILE / CERTD_MTLS_PRINCIPALS_FILE
+//	                    then only SEED a fresh (empty) database. Unset uses the in-memory stores
+//	                    seeded from those files — the dev default.
 package main
 
 import (
@@ -129,6 +140,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/abagile/tokyo3-base/cli"
@@ -148,6 +160,9 @@ import (
 	"github.com/abagile/tokyo3-ca/internal/server/portal"
 	"github.com/abagile/tokyo3-ca/internal/server/signer"
 	"github.com/abagile/tokyo3-ca/internal/server/x509engine"
+	"github.com/abagile/tokyo3-ca/internal/store"
+	pgstore "github.com/abagile/tokyo3-ca/internal/store/postgres"
+	sqlitestore "github.com/abagile/tokyo3-ca/internal/store/sqlite"
 )
 
 const appName = "certd"
@@ -222,7 +237,18 @@ func runServe(ctx context.Context) error {
 		return fmt.Errorf("oidc verifier: %w", err)
 	}
 
-	mtlsStore, err := loadMTLSStore(log)
+	// Persistent backend (Postgres / sqlite) shared across the role,
+	// principal, and revocation tables — one connection, so SQLite works.
+	// nil when CERTD_DATABASE_URL is unset (in-memory/file dev path).
+	db, err := openStore(ctx, log)
+	if err != nil {
+		return fmt.Errorf("open store database: %w", err)
+	}
+	if db != nil {
+		defer envutil.CloseIfCloser(db)
+	}
+
+	mtlsStore, err := loadMTLSStore(db, log)
 	if err != nil {
 		return fmt.Errorf("mtls store: %w", err)
 	}
@@ -232,7 +258,7 @@ func runServe(ctx context.Context) error {
 		return fmt.Errorf("x509 issuer cert: %w", err)
 	}
 
-	roleStore, policyEngine, err := loadRoleStore(log)
+	roleStore, policyEngine, err := loadRoleStore(db, log)
 	if err != nil {
 		return fmt.Errorf("role store: %w", err)
 	}
@@ -284,8 +310,14 @@ func runServe(ctx context.Context) error {
 		return fmt.Errorf("cast store: %w", err)
 	}
 
-	krlStore := krl.NewInMemoryStore()
-	log.Info("revocation store ready (in-memory)")
+	var krlStore krl.Store
+	if db != nil {
+		krlStore = db.Revocations()
+		log.Info("revocation store ready (database)")
+	} else {
+		krlStore = krl.NewInMemoryStore()
+		log.Info("revocation store ready (in-memory)")
+	}
 
 	portalSrv, err := portal.New(portal.Config{
 		Version:         Version,
@@ -480,42 +512,130 @@ func loadOrGenerateX509Issuer(log *slog.Logger, caSigner signer.Signer) (*x509.C
 // unset, disabling the mTLS auth path. Future slice swaps the
 // file-backed implementation for a Postgres-backed Store managed by
 // the admin portal — same interface, no API-layer changes.
-// loadRoleStore reads CERTD_ROLES_FILE (JSON-encoded []policy.Role)
-// and returns a populated [policy.InMemoryStore] alongside a
-// [*policy.Engine] for the API server. When the env var is unset,
-// both returns are nil — certd operates permissively (existing dev
-// behavior preserved) and the portal's roles page returns 503.
+// loadRoleStore builds the role table and its [*policy.Engine]. Backend
+// is chosen by env:
 //
-// The file format is a top-level JSON array; each element matches
-// the [policy.Role] struct shape. TTLs are JSON-encoded durations
-// (e.g., "4h", "30d"-equivalent in nanoseconds; the Go
-// json/encoding library renders time.Duration as int64).
-func loadRoleStore(log *slog.Logger) (*policy.InMemoryStore, *policy.Engine, error) {
-	path := os.Getenv("CERTD_ROLES_FILE")
-	if path == "" {
-		log.Warn("CERTD_ROLES_FILE unset — role table empty; sign endpoints are permissive and the portal roles page returns 503")
+//   - CERTD_DATABASE_URL set → the Postgres-backed store (persistent,
+//     authoritative). CERTD_ROLES_FILE, when also set, seeds a *fresh*
+//     (empty) database via SeedIfEmpty; an already-populated DB is left
+//     as-is (the file is a cold-start seed, not a re-import). The engine
+//     is built over the DB even when empty, so a configured DB means
+//     policy is enforced.
+//   - CERTD_DATABASE_URL unset, CERTD_ROLES_FILE set → the in-memory
+//     store seeded from the file (existing dev behavior).
+//   - both unset → (nil, nil, nil): certd operates permissively and the
+//     portal's roles page returns 503.
+//
+// The returned store may hold a DB handle; the caller closes it via
+// envutil.CloseIfCloser (a no-op for the in-memory store). The file
+// format is a top-level JSON array of [policy.Role] objects.
+func loadRoleStore(db store.Store, log *slog.Logger) (policy.Store, *policy.Engine, error) {
+	rolesFile := os.Getenv("CERTD_ROLES_FILE")
+
+	if db != nil {
+		rs := db.Roles()
+		if rolesFile != "" {
+			roles, err := readRolesFile(rolesFile)
+			if err != nil {
+				return nil, nil, err
+			}
+			seeded, err := rs.SeedRolesIfEmpty(roles)
+			if err != nil {
+				return nil, nil, fmt.Errorf("seed role store: %w", err)
+			}
+			if seeded {
+				log.Info("role store seeded from file", "path", rolesFile, "role_count", len(roles))
+			}
+		}
+		engine := policy.NewEngine(rs)
+		log.Info("role store ready (database)", "role_count", len(rs.All()))
+		return rs, engine, nil
+	}
+
+	if rolesFile == "" {
+		log.Warn("CERTD_ROLES_FILE and CERTD_DATABASE_URL unset — role table empty; sign endpoints are permissive and the portal roles page returns 503")
 		return nil, nil, nil
 	}
+	roles, err := readRolesFile(rolesFile)
+	if err != nil {
+		return nil, nil, err
+	}
+	st := policy.NewInMemoryStore(roles...)
+	engine := policy.NewEngine(st)
+	log.Info("role store loaded", "path", rolesFile, "role_count", len(roles))
+	return st, engine, nil
+}
+
+// openStore opens the persistent backend selected by CERTD_DATABASE_URL: a
+// "sqlite:<path>" URL uses the pure-Go SQLite backend (dev/test; ":memory:"
+// works as "sqlite::memory:"), anything else is a Postgres DSN. Returns
+// (nil, nil) when the env var is unset so callers fall back to the
+// in-memory/file stores. The returned Store fronts the role, principal, and
+// revocation tables over one connection.
+func openStore(ctx context.Context, log *slog.Logger) (store.Store, error) {
+	url := os.Getenv("CERTD_DATABASE_URL")
+	if url == "" {
+		return nil, nil
+	}
+	if path, ok := strings.CutPrefix(url, "sqlite:"); ok {
+		return sqlitestore.Open(ctx, path, log)
+	}
+	// tlsCfg nil for now — DSN sslmode covers TLS; mTLS-to-Postgres using
+	// certd's workload identity can be layered in later (Open takes one).
+	return pgstore.Open(ctx, url, nil, log)
+}
+
+// readRolesFile reads and decodes a CERTD_ROLES_FILE JSON array.
+func readRolesFile(path string) ([]policy.Role, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return nil, nil, fmt.Errorf("read %s: %w", path, err)
+		return nil, fmt.Errorf("read %s: %w", path, err)
 	}
 	var roles []policy.Role
 	if err := json.Unmarshal(data, &roles); err != nil {
-		return nil, nil, fmt.Errorf("decode %s: %w", path, err)
+		return nil, fmt.Errorf("decode %s: %w", path, err)
 	}
-	store := policy.NewInMemoryStore(roles...)
-	engine := policy.NewEngine(store)
-	log.Info("role store loaded", "path", path, "role_count", len(roles))
-	return store, engine, nil
+	return roles, nil
 }
 
-func loadMTLSStore(log *slog.Logger) (mtls.Store, error) {
+func loadMTLSStore(db store.Store, log *slog.Logger) (mtls.Store, error) {
 	path := os.Getenv("CERTD_MTLS_PRINCIPALS_FILE")
+
+	if db != nil {
+		ps := db.Principals()
+		if path != "" {
+			principals, err := readPrincipalsFile(path)
+			if err != nil {
+				return nil, err
+			}
+			seeded, err := ps.SeedPrincipalsIfEmpty(principals)
+			if err != nil {
+				return nil, fmt.Errorf("seed principal store: %w", err)
+			}
+			if seeded {
+				log.Info("principal store seeded from file", "file", path, "principals", len(principals))
+			}
+		}
+		log.Info("mtls store ready (database)", "principals", len(ps.All()))
+		return ps, nil
+	}
+
 	if path == "" {
 		log.Warn("CERTD_MTLS_PRINCIPALS_FILE unset — mTLS caller auth disabled (not for production)")
 		return nil, nil
 	}
+	principals, err := readPrincipalsFile(path)
+	if err != nil {
+		return nil, err
+	}
+	log.Info("mtls store ready", "principals", len(principals), "file", path)
+	return mtls.NewInMemoryStore(principals...), nil
+}
+
+// readPrincipalsFile reads and decodes a CERTD_MTLS_PRINCIPALS_FILE JSON
+// array ({name, san, groups}), mapping each entry's san to the registry
+// key (mtls.Principal.MatchedSAN).
+func readPrincipalsFile(path string) ([]mtls.Principal, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read %s: %w", path, err)
@@ -539,8 +659,7 @@ func loadMTLSStore(log *slog.Logger) (mtls.Store, error) {
 			Groups:     r.Groups,
 		})
 	}
-	log.Info("mtls store ready", "principals", len(principals), "file", path)
-	return mtls.NewInMemoryStore(principals...), nil
+	return principals, nil
 }
 
 // buildServerTLS builds the *tls.Config used for the inbound HTTPS

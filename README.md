@@ -307,16 +307,26 @@ internal/
   portal's `/portal/hosts` page lists every registered workload mTLS
   principal (SAN, name, group claims). Sorted by SAN for stable
   output across refreshes. Read-only: principal management lives in
-  the JSON file for now, with the same restart-to-reload constraint
-  the role table has.
+  the JSON file (restart-to-reload) unless `CERTD_DATABASE_URL` is
+  set, in which case the registry is persisted in the store (seeded
+  once from the file).
 
 - **Role table CRUD.** Set `CERTD_ROLES_FILE` to a JSON file of
   [`policy.Role`] objects and certd loads it as an in-memory
   policy store. The portal pages render the role list at
   `/portal/roles`, a detail view at `/portal/roles/{name}`, and the
   create/edit/delete forms at `/portal/roles/new` and
-  `/portal/roles/{name}/edit|delete`. Writes mutate the in-memory
-  store and survive only until restart unless externally persisted.
+  `/portal/roles/{name}/edit|delete`. With the in-memory store, writes
+  survive only until restart. Set `CERTD_DATABASE_URL` to use the
+  **persistent store** instead — one backend behind the role table,
+  the mTLS principal registry, *and* the SSH revocation list (KRL). A
+  Postgres DSN selects the production backend (mirrors authd's
+  `AUTH_DATABASE_URL`); `sqlite:<path>` (e.g.
+  `sqlite:/var/lib/certd/certd.db`, or `sqlite::memory:`) selects the
+  pure-Go SQLite backend for the dev rig. certd applies migrations on
+  boot and CRUD writes survive restarts; `CERTD_ROLES_FILE` /
+  `CERTD_MTLS_PRINCIPALS_FILE` then only seed a fresh database once.
+  See `internal/store/`.
   CSRF protection on every POST: each GET sets a `certd_csrf`
   cookie (256 bits of entropy, `SameSite=Lax`, `Secure` over HTTPS)
   and the rendered form embeds the matching value as a hidden

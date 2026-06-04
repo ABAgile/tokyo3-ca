@@ -163,8 +163,13 @@ func (s *InMemoryStore) Snapshot() Snapshot {
 // Reason / Revoker fields are emitted as comments adjacent to each
 // directive so the spec stays self-documenting; ssh-keygen ignores
 // them.
-func (s *InMemoryStore) MarshalSpec() string {
-	snap := s.Snapshot()
+func (s *InMemoryStore) MarshalSpec() string { return MarshalSpec(s.Snapshot()) }
+
+// MarshalSpec is the package-level form of [InMemoryStore.MarshalSpec],
+// rendering an arbitrary [Snapshot] as the KRL spec. Exposed so the
+// database-backed revocation store produces byte-identical output without
+// duplicating the formatting.
+func MarshalSpec(snap Snapshot) string {
 	// Partition serials + key_ids and sort each independently. The
 	// snapshot is already deduped + sorted by Revoked time, but
 	// the spec output wants groups + intra-group ordering for
