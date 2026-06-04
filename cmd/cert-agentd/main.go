@@ -33,14 +33,23 @@
 //	                         agent's own renewal and all workload certs) for certd's body-groups
 //	                         policy path (dev/test). Empty unless certd enforces a role table;
 //	                         ignored under OIDC / mTLS-principal auth.
+//	CERT_AGENTD_ROTATE_KEY   When true, the agent's OWN workload key is regenerated on every
+//	                         renewal (fresh key+cert each cycle) instead of a stable key. Safe
+//	                         here because the consumer is the agent's in-process reloader, which
+//	                         verifies the pair. Default false. (Per-workload rotation for the
+//	                         extra certs below is the "rotate_key" field, off by default — leave
+//	                         it off for file-reading servers like Postgres that can't safely
+//	                         reload a rotating pair.)
 //
 // Optional additional workload client certs:
 //
 //	CERT_AGENTD_WORKLOADS_FILE  JSON array of extra X.509 client certs the agent renews for
 //	                            sibling processes (mTLS to db, nats, …): each {name, spiffe_uri,
 //	                            subject_cn, key_type (ecdsa-p256|ed25519), ttl_seconds,
-//	                            cert_path, key_path}. Separate from the agent's own identity
-//	                            above; certd's role table must permit each spiffe_uri.
+//	                            cert_path, key_path, rotate_key}. rotate_key (default false)
+//	                            regenerates the key each renewal — enable only where the
+//	                            consumer tolerates a rotating pair. Separate from the agent's own
+//	                            identity above; certd's role table must permit each spiffe_uri.
 //
 // Optional SSH user cert renewal:
 //
@@ -206,10 +215,15 @@ func runAgent(ctx context.Context) error {
 		}
 	}
 
+	// The agent's own workload cert is consumed by its in-process reloader
+	// (OnRenewed → r.Refresh), which verifies the pair on load, so rotating
+	// its key is safe. Opt-in via CERT_AGENTD_ROTATE_KEY (default false).
+	rotateKey, _ := strconv.ParseBool(os.Getenv("CERT_AGENTD_ROTATE_KEY"))
 	renewer, err := renew.New(renew.Config{
 		Signer:            certdClient,
 		SPIFFEURI:         spiffeURI,
 		SubjectCommonName: os.Getenv("CERT_AGENTD_SUBJECT_CN"),
+		RotateKey:         rotateKey,
 		Groups:            groups,
 		CertOutputPath:    certPath,
 		KeyOutputPath:     keyPath,
@@ -301,10 +315,16 @@ type workloadSpec struct {
 	Name       string `json:"name"`
 	SPIFFEURI  string `json:"spiffe_uri"`
 	SubjectCN  string `json:"subject_cn"`
-	KeyType    string `json:"key_type"` // ecdsa-p256 | rsa-2048 | ed25519; empty ⇒ ecdsa-p256
+	KeyType    string `json:"key_type"` // ecdsa-p256 | ed25519; empty ⇒ ecdsa-p256
 	TTLSeconds int64  `json:"ttl_seconds"`
 	CertPath   string `json:"cert_path"`
 	KeyPath    string `json:"key_path"`
+	// RotateKey regenerates the private key on every renewal (a fresh
+	// key+cert each cycle). Default false keeps the key stable — leave it
+	// off for file-reading servers (e.g. Postgres) that can't safely
+	// reload a rotating cert/key pair; enable only where the consumer
+	// tolerates it.
+	RotateKey bool `json:"rotate_key"`
 }
 
 // buildWorkloadRenewers reads CERT_AGENTD_WORKLOADS_FILE (a JSON array
@@ -335,6 +355,7 @@ func buildWorkloadRenewers(signer renew.Signer, groups []string, log *slog.Logge
 			SPIFFEURI:         s.SPIFFEURI,
 			SubjectCommonName: s.SubjectCN,
 			KeyType:           renew.KeyType(s.KeyType),
+			RotateKey:         s.RotateKey,
 			Groups:            groups,
 			CertOutputPath:    s.CertPath,
 			KeyOutputPath:     s.KeyPath,

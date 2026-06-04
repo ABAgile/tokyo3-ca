@@ -137,7 +137,11 @@ cert.
 bootstrap is needed. It provisions authd's four mTLS client certs from
 `shared/agent/workloads.json` (`CERT_AGENTD_WORKLOADS_FILE`), all
 Ed25519, into `/certs`: `db-app` (CN `auth_app`) and `db-admin` (CN
-`auth_admin`) for Postgres cert-auth, plus `nats` and `scim`.
+`auth_admin`) for Postgres cert-auth, plus `nats` and `scim`. Keys are
+stable by default (cert-only rotation); set a workload's `rotate_key`
+(or `CERT_AGENTD_ROTATE_KEY` for the agent's own cert) to regenerate the
+key each renewal — leave it off for the Postgres certs, which can't
+safely reload a rotating pair.
 `shared/policy/principals.json` ships as a sample for the production
 mTLS-principal path (`authd-agent` → `["authd"]`) but is left unwired —
 that path needs verified client certs (`CERTD_API_CLIENT_CA` /

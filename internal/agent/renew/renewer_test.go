@@ -205,6 +205,40 @@ func TestRenewer_SignOnce_ReusesExistingKey(t *testing.T) {
 	}
 }
 
+func TestRenewer_SignOnce_RotateKey_FreshKeyEachRenewal(t *testing.T) {
+	dir := t.TempDir()
+	certPath := filepath.Join(dir, "c.crt")
+	keyPath := filepath.Join(dir, "c.key")
+
+	signer := &stubSigner{}
+	r, _ := renew.New(renew.Config{
+		Signer:         signer,
+		SPIFFEURI:      "spiffe://td/x",
+		CertOutputPath: certPath,
+		KeyOutputPath:  keyPath,
+		RotateKey:      true,
+	})
+
+	if _, _, err := r.SignOnce(context.Background()); err != nil {
+		t.Fatalf("first SignOnce: %v", err)
+	}
+	firstPub := signer.gotReq.PublicKey
+	firstKey, _ := os.ReadFile(keyPath)
+
+	if _, _, err := r.SignOnce(context.Background()); err != nil {
+		t.Fatalf("second SignOnce: %v", err)
+	}
+	// With RotateKey, the second renewal sends a different public key and
+	// rewrites the key file (fresh keypair each cycle).
+	if signer.gotReq.PublicKey == firstPub {
+		t.Error("public key unchanged with RotateKey (want a fresh key each renewal)")
+	}
+	secondKey, _ := os.ReadFile(keyPath)
+	if string(firstKey) == string(secondKey) {
+		t.Error("key file not rewritten with RotateKey")
+	}
+}
+
 func TestRenewer_SignOnce_LoadsExistingKeyFromDisk(t *testing.T) {
 	// Fresh Renewer pointing at an existing keyfile (written by a
 	// previous run) must load + reuse it rather than generating a
@@ -261,10 +295,11 @@ func TestRenewer_SignOnce_PropagatesSignerError(t *testing.T) {
 	if _, statErr := os.Stat(certPath); !errors.Is(statErr, os.ErrNotExist) {
 		t.Errorf("cert file exists after failed sign: %v", statErr)
 	}
-	// Key WAS persisted — generating it happens before the API call
-	// and is desirable: subsequent retries reuse the same key.
-	if _, statErr := os.Stat(keyPath); statErr != nil {
-		t.Errorf("key not persisted: %v", statErr)
+	// Key is held in memory (so a retry reuses the same key) but NOT yet
+	// on disk: it's persisted only with the first successful cert, as an
+	// atomic bundle, so a sign failure leaves no orphaned key file.
+	if _, statErr := os.Stat(keyPath); !errors.Is(statErr, os.ErrNotExist) {
+		t.Errorf("key file exists after failed first sign (should persist only with the cert): %v", statErr)
 	}
 }
 

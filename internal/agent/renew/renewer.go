@@ -66,6 +66,16 @@ type Config struct {
 	// "ecdsa-p256" or "ed25519". Empty ⇒ ecdsa-p256.
 	KeyType KeyType
 
+	// RotateKey, when true, mints a FRESH private key on every renewal
+	// (a new key+cert each cycle, written together as a bundle) instead
+	// of reusing one stable key. Default false keeps the key stable —
+	// which is what file-reading server consumers that can't verify a
+	// cert/key pair on reload (e.g. Postgres) want, since then only the
+	// cert changes. Enable per-workload only where the consumer tolerates
+	// a rotating pair (a verifying/reloading loader, or a
+	// reload-after-write hook on OnRenewed).
+	RotateKey bool
+
 	// Groups are the caller's group memberships sent on each sign
 	// request for certd's body-groups policy path (dev/test). Ignored
 	// by certd when it authenticates via OIDC or mTLS principals.
@@ -134,8 +144,10 @@ const (
 type Renewer struct {
 	cfg Config
 
-	keyMu      sync.Mutex
-	privateKey crypto.Signer // lazily loaded/generated on first SignOnce
+	keyMu        sync.Mutex
+	privateKey   crypto.Signer // lazily loaded/generated on first SignOnce
+	keyPEM       []byte        // PKCS#8 PEM of privateKey; cached for the bundle write
+	keyPersisted bool          // true once the key is durably on disk (loaded or bundle-written)
 }
 
 // New validates cfg and returns a [Renewer]. Returns an error rather
@@ -187,7 +199,7 @@ func New(cfg Config) (*Renewer, error) {
 // a fresh cert, and writes the cert atomically. Returns the validity
 // envelope so the [Run] loop can schedule the next renewal.
 func (r *Renewer) SignOnce(ctx context.Context) (validAfter, validBefore time.Time, err error) {
-	priv, err := r.ensureKey()
+	priv, keyPEM, writeBundle, err := r.keyForRenewal()
 	if err != nil {
 		return time.Time{}, time.Time{}, fmt.Errorf("private key: %w", err)
 	}
@@ -219,7 +231,25 @@ func (r *Renewer) SignOnce(ctx context.Context) (validAfter, validBefore time.Ti
 		return time.Time{}, time.Time{}, errors.New("certd returned empty certificate")
 	}
 
-	if err := output.WriteAtomic(r.cfg.CertOutputPath, []byte(resp.Certificate), 0o644); err != nil {
+	// When the key isn't yet on disk (first issuance / key generation),
+	// write key+cert together (key-first, cert-last) to minimise the
+	// desync window — see output.WriteBundleAtomic. This is not a
+	// cross-file atomic guarantee; the consumer's loader must verify the
+	// pair and keep the last-known-good on mismatch (base tls.CertLoader /
+	// tls/reloader do). Once the key is persisted, normal renewals rotate
+	// only the cert (the key is stable), so a plain atomic cert write
+	// suffices.
+	if writeBundle {
+		if err := output.WriteBundleAtomic(
+			r.cfg.CertOutputPath, []byte(resp.Certificate), 0o644,
+			r.cfg.KeyOutputPath, keyPEM, 0o600,
+		); err != nil {
+			return time.Time{}, time.Time{}, fmt.Errorf("write cert+key bundle: %w", err)
+		}
+		if !r.cfg.RotateKey {
+			r.markKeyPersisted()
+		}
+	} else if err := output.WriteAtomic(r.cfg.CertOutputPath, []byte(resp.Certificate), 0o644); err != nil {
 		return time.Time{}, time.Time{}, fmt.Errorf("write cert: %w", err)
 	}
 	r.cfg.Log.Info("workload cert renewed",
@@ -276,44 +306,79 @@ func (r *Renewer) nextRenewalDelay(validAfter, validBefore time.Time) time.Durat
 	return wait
 }
 
-// ensureKey returns the workload private key, loading it from disk on
-// first call (or generating + persisting a fresh ECDSA P-256 key when
-// the file doesn't exist). The key is cached in-memory thereafter so
-// subsequent renewals don't re-read it.
-func (r *Renewer) ensureKey() (crypto.Signer, error) {
+// keyForRenewal returns the private key to certify this cycle, its PKCS#8
+// PEM, and whether the key must be written alongside the cert (a bundle
+// write). With [Config.RotateKey] it mints a fresh keypair every call
+// (always bundled, since key+cert change together); otherwise it returns
+// the stable key via [ensureKey] (bundled only on first issuance, then
+// cert-only).
+func (r *Renewer) keyForRenewal() (priv crypto.Signer, keyPEM []byte, writeBundle bool, err error) {
+	if !r.cfg.RotateKey {
+		return r.ensureKey()
+	}
+	key, err := generateKey(r.cfg.KeyType)
+	if err != nil {
+		return nil, nil, false, fmt.Errorf("generate key: %w", err)
+	}
+	pemBytes, err := marshalPrivateKeyPEM(key)
+	if err != nil {
+		return nil, nil, false, fmt.Errorf("marshal generated key: %w", err)
+	}
+	return key, pemBytes, true, nil
+}
+
+// ensureKey returns the workload private key, its PKCS#8 PEM, and whether
+// it still needs persisting to disk. It loads an existing key from
+// KeyOutputPath (already on disk ⇒ needPersist false), or generates a
+// fresh one of the configured type held only in memory (needPersist true)
+// — [SignOnce] then writes it atomically alongside the new cert via
+// [output.WriteBundleAtomic], so a reader never sees a new key without its
+// matching cert. The key is cached so retries (and later renewals) reuse
+// the same key without regenerating; needPersist stays true across retries
+// until a bundle write succeeds.
+func (r *Renewer) ensureKey() (priv crypto.Signer, keyPEM []byte, needPersist bool, err error) {
 	r.keyMu.Lock()
 	defer r.keyMu.Unlock()
 	if r.privateKey != nil {
-		return r.privateKey, nil
+		return r.privateKey, r.keyPEM, !r.keyPersisted, nil
 	}
 
 	if b, err := os.ReadFile(r.cfg.KeyOutputPath); err == nil {
 		key, err := parsePrivateKeyPEM(b)
 		if err != nil {
-			return nil, fmt.Errorf("parse existing key %s: %w", r.cfg.KeyOutputPath, err)
+			return nil, nil, false, fmt.Errorf("parse existing key %s: %w", r.cfg.KeyOutputPath, err)
 		}
 		r.privateKey = key
-		return key, nil
+		r.keyPEM = b
+		r.keyPersisted = true
+		return key, b, false, nil
 	} else if !errors.Is(err, os.ErrNotExist) {
-		return nil, fmt.Errorf("read key %s: %w", r.cfg.KeyOutputPath, err)
+		return nil, nil, false, fmt.Errorf("read key %s: %w", r.cfg.KeyOutputPath, err)
 	}
 
-	// Generate a fresh key of the configured type and persist with mode
-	// 0600 — workload private keys must not be world-readable.
+	// Generate a fresh key of the configured type, held in memory until the
+	// first successful sign persists it with the cert (workload private
+	// keys are written 0600 — never world-readable).
 	key, err := generateKey(r.cfg.KeyType)
 	if err != nil {
-		return nil, fmt.Errorf("generate key: %w", err)
+		return nil, nil, false, fmt.Errorf("generate key: %w", err)
 	}
 	pemBytes, err := marshalPrivateKeyPEM(key)
 	if err != nil {
-		return nil, fmt.Errorf("marshal generated key: %w", err)
+		return nil, nil, false, fmt.Errorf("marshal generated key: %w", err)
 	}
-	if err := output.WriteAtomic(r.cfg.KeyOutputPath, pemBytes, 0o600); err != nil {
-		return nil, fmt.Errorf("write key %s: %w", r.cfg.KeyOutputPath, err)
-	}
-	r.cfg.Log.Info("workload private key generated", "path", r.cfg.KeyOutputPath, "key_type", r.cfg.KeyType)
+	r.cfg.Log.Info("workload private key generated (pending first-cert persist)", "path", r.cfg.KeyOutputPath, "key_type", r.cfg.KeyType)
 	r.privateKey = key
-	return key, nil
+	r.keyPEM = pemBytes
+	r.keyPersisted = false
+	return key, pemBytes, true, nil
+}
+
+// markKeyPersisted records that the key is now durably on disk.
+func (r *Renewer) markKeyPersisted() {
+	r.keyMu.Lock()
+	defer r.keyMu.Unlock()
+	r.keyPersisted = true
 }
 
 // generateKey produces a fresh private key of the requested type. Each
