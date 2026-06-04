@@ -340,11 +340,15 @@ internal/
   clone — is rejected `403` and emits a high-signal
   `x509.workload_cert.rollback_rejected` audit event. cert-agentd
   sends the serial of the cert on disk automatically (stateless across
-  restarts). First issuance (no prior serial / no recorded state) is
-  unguarded; resetting a locked-out identity means clearing its
-  `active_workload_cert` row (re-enroll). Off entirely without a
-  store. Refresh-token-rotation + reuse-detection, applied to certs —
-  see `certd-store-design.md`.
+  restarts). First issuance (no recorded state) is unguarded. **Lockout
+  recovery:** once the recorded cert has *expired*, a renewal that can't
+  present a matching serial (e.g. an agent that lost its cert) is allowed
+  to re-enroll — no valid credential is in the wild, so the guard is moot
+  (caller auth + role policy still apply) — emitting an
+  `x509.workload_cert.reenroll` event; it auto-heals within one cert TTL.
+  An operator can also clear the identity's `active_workload_cert` row to
+  reset immediately. Off entirely without a store. Refresh-token-rotation
+  + reuse-detection, applied to certs — see `certd-store-design.md`.
   CSRF protection on every POST: each GET sets a `certd_csrf`
   cookie (256 bits of entropy, `SameSite=Lax`, `Secure` over HTTPS)
   and the rendered form embeds the matching value as a hidden

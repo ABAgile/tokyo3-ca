@@ -55,6 +55,12 @@ const (
 	// superseded/unknown cert reappearing, i.e. a possible key-pair theft
 	// (the renewal/anti-theft guard). High-signal: alert on it.
 	ActionX509WorkloadCertRollback = "x509.workload_cert.rollback_rejected"
+	// ActionX509WorkloadCertReenroll flags issuance that bypassed the
+	// active-cert serial check because the prior recorded cert had already
+	// expired (no valid credential in the wild ⇒ the anti-theft layer is
+	// moot). Expected after an agent is down longer than a cert TTL;
+	// worth surfacing in case it signals lost agent state.
+	ActionX509WorkloadCertReenroll = "x509.workload_cert.reenroll"
 	ActionSSHCertRevoked           = "ssh.cert.revoked"
 )
 

@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/abagile/tokyo3-ca/internal/audit"
 	"github.com/abagile/tokyo3-ca/internal/server/api"
@@ -154,6 +155,43 @@ func TestSignX509Workload_AntiTheftGuard(t *testing.T) {
 	// 5. Empty serial once state exists → 403 (can't bypass by omission).
 	if r5 := sign(""); r5.Code != http.StatusForbidden {
 		t.Fatalf("empty serial with state: %d, want 403", r5.Code)
+	}
+}
+
+// TestSignX509Workload_ReenrollAfterExpiry: once the recorded cert has
+// expired, a renewal that can't present a matching serial (e.g. an agent
+// that lost its cert and sends empty) is allowed to re-enroll — no valid
+// credential is in the wild, so the anti-theft layer is moot — and the
+// state resets to the new serial with a reenroll audit event.
+func TestSignX509Workload_ReenrollAfterExpiry(t *testing.T) {
+	const uri = "spiffe://corp/svc/billing"
+	guard := &fakeActiveCerts{m: map[string]store.ActiveCert{
+		uri: {Identity: uri, CurrentSerial: "111", CurrentNotAfter: time.Now().Add(-time.Hour)},
+	}}
+	srv, cap := newGuardedServer(t, guard)
+
+	rec := postJSON(srv, "/api/v1/x509/sign-workload", "Bearer x", map[string]any{
+		"public_key": makeSubjectPubKeyPEM(t),
+		"spiffe_uri": uri,
+		// no current_serial: the agent lost its cert
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("re-enroll after expiry: %d %s", rec.Code, rec.Body.String())
+	}
+	if got := guard.current(uri).CurrentSerial; got == "111" {
+		t.Errorf("state not advanced on re-enroll: current=%q", got)
+	}
+	if got := guard.current(uri).PreviousSerial; got != "" {
+		t.Errorf("previous not reset on re-enroll: %q", got)
+	}
+	var sawReenroll bool
+	for _, e := range cap.entries(t) {
+		if e.Action == audit.ActionX509WorkloadCertReenroll {
+			sawReenroll = true
+		}
+	}
+	if !sawReenroll {
+		t.Error("no reenroll audit event emitted")
 	}
 }
 

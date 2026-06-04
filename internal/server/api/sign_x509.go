@@ -135,21 +135,41 @@ func (s *Server) handleSignX509WorkloadCert(w http.ResponseWriter, r *http.Reque
 		}
 		if ok {
 			presented := req.CurrentSerial
-			if presented == "" || (presented != existing.CurrentSerial && presented != existing.PreviousSerial) {
+			// A non-empty serial that is the current or previous one is a
+			// normal rotation. Empty never matches (an empty PreviousSerial
+			// must not let an empty presented slip through).
+			if presented != "" && (presented == existing.CurrentSerial || presented == existing.PreviousSerial) {
+				// Normal rotation: previous := the serial rotated from.
+				prevSerial = presented
+				if presented == existing.CurrentSerial {
+					prevNotAfter = existing.CurrentNotAfter
+				} else {
+					prevNotAfter = existing.PreviousNotAfter
+				}
+			} else if time.Now().After(existing.CurrentNotAfter) {
+				// Re-enroll: the recorded cert has expired, so no valid
+				// credential is in the wild — the anti-theft layer is moot
+				// (caller auth + role policy still gate this request). Reset
+				// the chain (previous cleared) and issue. Auto-heals the
+				// lockout where an agent lost its cert and presents empty.
+				s.emitAudit(r.Context(), audit.ActionX509WorkloadCertReenroll, "workload:"+spiffeURI, caller.Caller, 0, r, map[string]any{
+					"spiffe_uri":        spiffeURI,
+					"presented_serial":  presented,
+					"expired_serial":    existing.CurrentSerial,
+					"expired_not_after": existing.CurrentNotAfter,
+				})
+			} else {
+				// Stale/unknown serial while the recorded cert is still
+				// valid — a superseded or fabricated cert reappearing, i.e.
+				// a possible clone. Reject and alert.
 				s.emitAudit(r.Context(), audit.ActionX509WorkloadCertRollback, "workload:"+spiffeURI, caller.Caller, 0, r, map[string]any{
 					"spiffe_uri":       spiffeURI,
 					"presented_serial": presented,
 					"current_serial":   existing.CurrentSerial,
 					"previous_serial":  existing.PreviousSerial,
 				})
-				writeError(w, http.StatusForbidden, "presented serial is not the current or previous serial for this identity (possible clone); re-enroll via bootstrap to reset")
+				writeError(w, http.StatusForbidden, "presented serial is not the current or previous serial for this identity (possible clone); wait for the active cert to expire to auto re-enroll, or clear the identity's active-cert record")
 				return
-			}
-			prevSerial = presented
-			if presented == existing.CurrentSerial {
-				prevNotAfter = existing.CurrentNotAfter
-			} else {
-				prevNotAfter = existing.PreviousNotAfter
 			}
 		}
 	}
