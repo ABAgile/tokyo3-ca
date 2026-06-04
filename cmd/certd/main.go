@@ -33,9 +33,15 @@
 //
 //	CERTD_CA_KEY_FILE        PKCS#8-encoded Ed25519 private key PEM path — the CA signing key
 //	                         used for BOTH SSH user/host certs and X.509/SPIFFE workload certs
-//	                         (one key: wrapped for SSH, used directly for X.509). When unset,
-//	                         certd generates an ephemeral key at startup — dev only; certs are
-//	                         invalidated on every restart.
+//	                         (one key: wrapped for SSH, used directly for X.509). When unset
+//	                         (and CERTD_CA_KMS_KEY also unset), certd generates an ephemeral key
+//	                         at startup — dev only; certs are invalidated on every restart.
+//	CERTD_CA_KMS_KEY         KMS key reference (ARN / GCP resource name / Vault key path) for a
+//	                         CA key that never leaves the HSM. Takes precedence over
+//	                         CERTD_CA_KEY_FILE. The AWS KMS binding (cmd/certd/kms_aws.go) is
+//	                         compiled in by default, so this works on the stock binary; other
+//	                         backends register via RegisterKMSClientFactory (see
+//	                         internal/server/signer/kms). The same var drives `certd ca`.
 //	CERTD_CA_X509_CERT_FILE  X.509-only issuer cert for the workload/SPIFFE certs signed by that
 //	                         key. SSH needs no issuer cert — clients trust the key's public half
 //	                         via TrustedUserCAKeys. When unset, certd self-signs one at startup
@@ -189,7 +195,7 @@ func runServe(ctx context.Context) error {
 
 	addr := envutil.Or("CERTD_ADDR", ":8443")
 
-	caSigner, err := loadCASigner(log)
+	caSigner, err := loadCASigner(ctx, log)
 	if err != nil {
 		return fmt.Errorf("load CA signer: %w", err)
 	}
@@ -393,15 +399,19 @@ func versionCmd() *cobra.Command {
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
-// loadCASigner returns the CA signing primitive. CERTD_CA_KEY_FILE
-// points at a PKCS#8 Ed25519 PEM file; when unset, certd generates an
-// ephemeral keypair and warns that issued certs won't survive a restart.
-func loadCASigner(log *slog.Logger) (signer.Signer, error) {
-	if path := os.Getenv("CERTD_CA_KEY_FILE"); path != "" {
-		return signer.LoadEd25519FromPEMFile(path)
+// loadCASigner returns the CA signing primitive via the shared signer
+// seam (resolveCASigner): CERTD_CA_KMS_KEY selects a KMS-backed key
+// (needs a KMS-bound build), CERTD_CA_KEY_FILE a PKCS#8 Ed25519 PEM
+// file. When neither is set, certd generates an ephemeral keypair and
+// warns that issued certs won't survive a restart.
+func loadCASigner(ctx context.Context, log *slog.Logger) (signer.Signer, error) {
+	keyPath := os.Getenv("CERTD_CA_KEY_FILE")
+	kmsKey := os.Getenv("CERTD_CA_KMS_KEY")
+	if keyPath == "" && kmsKey == "" {
+		log.Warn("CERTD_CA_KEY_FILE / CERTD_CA_KMS_KEY unset — generating ephemeral CA key (not for production)")
+		return signer.NewEphemeralEd25519()
 	}
-	log.Warn("CERTD_CA_KEY_FILE not set — generating ephemeral CA key (not for production)")
-	return signer.NewEphemeralEd25519()
+	return resolveCASigner(ctx, keyPath, kmsKey)
 }
 
 // loadOIDCVerifier returns a token verifier for inbound bearer tokens

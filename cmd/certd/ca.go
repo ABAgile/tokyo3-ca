@@ -18,7 +18,6 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/abagile/tokyo3-ca/internal/server/signer"
 	"github.com/abagile/tokyo3-ca/internal/server/x509engine"
 )
 
@@ -36,17 +35,17 @@ func caCmd() *cobra.Command {
 // ── certd ca bootstrap ──────────────────────────────────────────────────────
 
 func caBootstrapCmd() *cobra.Command {
-	var keyPath, cn, out string
+	var keyPath, kmsKey, cn, out string
 	var force bool
 	c := &cobra.Command{
 		Use:   "bootstrap",
 		Short: "Mint the X.509 issuer cert (CERTD_CA_X509_CERT_FILE) from the CA signing key",
 		Long: "Self-signs a CA issuer certificate over the signing key's public half — " +
 			"the public trust anchor every workload pins to verify a certd-issued mTLS peer. " +
-			"The signing key never leaves its store; this performs exactly one signature. " +
-			"Run once per CA generation; commit the result to config management.",
-		RunE: func(_ *cobra.Command, _ []string) error {
-			sig, err := loadSigner(keyPath)
+			"The signing key never leaves its store (file or KMS); this performs exactly one " +
+			"signature. Run once per CA generation; commit the result to config management.",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			sig, err := resolveCASigner(cmd.Context(), keyPath, kmsKey)
 			if err != nil {
 				return err
 			}
@@ -58,6 +57,7 @@ func caBootstrapCmd() *cobra.Command {
 		},
 	}
 	c.Flags().StringVar(&keyPath, "key", os.Getenv("CERTD_CA_KEY_FILE"), "CA signing key (PKCS#8 PEM); default $CERTD_CA_KEY_FILE")
+	c.Flags().StringVar(&kmsKey, "kms-key", os.Getenv("CERTD_CA_KMS_KEY"), "KMS key reference (ARN / resource name); default $CERTD_CA_KMS_KEY. Wins over --key")
 	c.Flags().StringVar(&cn, "cn", "tokyo3-ca", "Subject CommonName for the issuer cert")
 	c.Flags().StringVar(&out, "out", os.Getenv("CERTD_CA_X509_CERT_FILE"), "Output path; default $CERTD_CA_X509_CERT_FILE, or stdout if empty")
 	c.Flags().BoolVar(&force, "force", false, "Overwrite --out if it already exists")
@@ -67,27 +67,28 @@ func caBootstrapCmd() *cobra.Command {
 // ── certd ca rotate ─────────────────────────────────────────────────────────
 
 func caRotateCmd() *cobra.Command {
-	var newKeyPath, cn, out, bundleOut string
+	var newKeyPath, newKMSKey, cn, out, bundleOut string
 	var oldCerts []string
 	var force bool
 	c := &cobra.Command{
 		Use:   "rotate",
 		Short: "Mint a new issuer cert from a new signing key and emit an overlap trust bundle",
 		Long: "Key rotation is the disruptive case: leaves signed by the new key only validate " +
-			"against the new issuer cert. Mint the new issuer cert from --key, then write a trust " +
-			"bundle (--bundle-out) concatenating the old issuer cert(s) (--old) with the new one. " +
-			"Distribute the bundle to every consumer BEFORE cutting issuance over to the new key; " +
-			"once all old-key leaves have expired, drop the old cert with `certd ca bundle`.\n\n" +
+			"against the new issuer cert. Mint the new issuer cert from --key or --kms-key, then " +
+			"write a trust bundle (--bundle-out) concatenating the old issuer cert(s) (--old) with " +
+			"the new one. Distribute the bundle to every consumer BEFORE cutting issuance over to " +
+			"the new key; once all old-key leaves have expired, drop the old cert with " +
+			"`certd ca bundle`.\n\n" +
 			"Rotating the issuer cert over the SAME key needs no bundle — `certd ca bootstrap " +
 			"--force` re-mints it and existing leaves still validate (chains verify against the key).",
-		RunE: func(_ *cobra.Command, _ []string) error {
-			if newKeyPath == "" {
-				return errors.New("--key (the new signing key) is required")
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if newKeyPath == "" && newKMSKey == "" {
+				return errors.New("the new signing key is required: pass --key or --kms-key")
 			}
 			if out == "" {
 				return errors.New("--out (the new issuer cert path) is required")
 			}
-			sig, err := loadSigner(newKeyPath)
+			sig, err := resolveCASigner(cmd.Context(), newKeyPath, newKMSKey)
 			if err != nil {
 				return err
 			}
@@ -115,7 +116,8 @@ func caRotateCmd() *cobra.Command {
 			return writeBundle(bundleOut, pemParts, force)
 		},
 	}
-	c.Flags().StringVar(&newKeyPath, "key", "", "New CA signing key (PKCS#8 PEM) to rotate to (required)")
+	c.Flags().StringVar(&newKeyPath, "key", "", "New CA signing key (PKCS#8 PEM) to rotate to (--key or --kms-key required)")
+	c.Flags().StringVar(&newKMSKey, "kms-key", "", "New KMS key reference to rotate to; wins over --key")
 	c.Flags().StringVar(&cn, "cn", "tokyo3-ca", "Subject CommonName for the new issuer cert")
 	c.Flags().StringVar(&out, "out", "", "Output path for the new issuer cert (required)")
 	c.Flags().StringArrayVar(&oldCerts, "old", nil, "Existing issuer cert(s) to keep in the overlap bundle (repeatable)")
@@ -151,25 +153,6 @@ func caBundleCmd() *cobra.Command {
 }
 
 // ── helpers ─────────────────────────────────────────────────────────────────
-
-// loadSigner returns the CA signing primitive for the ca subcommands.
-// Today it loads a PKCS#8 Ed25519 key from disk — the same primitive
-// serve's loadCASigner uses. KMS EXTENSION POINT: to bootstrap/rotate
-// against a key that never leaves KMS, replace this with the
-// signer.NewRemoteSigner construction documented in OPERATIONS.md §2.1
-// (the key never leaves the HSM; minting performs one remote Sign).
-// Keeping it here — the single signer seam — means serve and the ca
-// tooling pick up KMS together.
-func loadSigner(keyPath string) (signer.Signer, error) {
-	if keyPath == "" {
-		return nil, errors.New("no signing key: pass --key or set $CERTD_CA_KEY_FILE")
-	}
-	sig, err := signer.LoadEd25519FromPEMFile(keyPath)
-	if err != nil {
-		return nil, fmt.Errorf("load signing key %s: %w", keyPath, err)
-	}
-	return sig, nil
-}
 
 // readCertFilePEM reads path and returns its normalized CERTIFICATE PEM,
 // erroring if it doesn't contain exactly one parseable certificate.

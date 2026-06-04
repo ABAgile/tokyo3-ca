@@ -42,6 +42,12 @@ RUN go mod download
 COPY cmd/ cmd/
 COPY internal/ internal/
 
+# certd bundles the AWS KMS signer (cmd/certd/kms_aws.go) by default —
+# CERTD_CA_KMS_KEY works out of the box; the server stage ships
+# ca-certificates so certd can verify TLS to the KMS endpoint. Costs
+# ~+4.4 MiB over a non-KMS build. To produce a lean non-KMS image later,
+# add `//go:build awskms` to kms_aws.go and build with `-tags awskms`
+# here. cert-agentd / auth-ssh-creds do not import it and stay SDK-free.
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     go build -ldflags="-s -w -X main.Version=${VERSION}" -o /out/certd ./cmd/certd
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \

@@ -36,7 +36,7 @@ host that needs renewable credentials.
 
 1. **Generate or import the CA key.**
    - Dev: `openssl genpkey -algorithm ed25519 -out ca.key`; `CERTD_CA_KEY_FILE=ca.key`.
-   - Prod: provision an asymmetric SIGN_VERIFY key in your KMS (AWS KMS, GCP KMS, Vault Transit, or HSM); wire it via a `signer.NewRemoteSigner` adapter in your deployment glue. See **§2.1 Production CA bootstrap (KMS)** below.
+   - Prod: provision an asymmetric SIGN_VERIFY key in your KMS (AWS KMS, GCP KMS, Vault Transit, or HSM); set `CERTD_CA_KMS_KEY` (the AWS binding is compiled in by default). See **§2.1 Production CA bootstrap (KMS)** below.
 1b. **Pin a persistent X.509 issuer cert.** Set `CERTD_CA_X509_CERT_FILE` to a stable self-signed CA cert over the signing key. **Do not skip this in production:** when unset, certd self-signs a *fresh, ephemeral* issuer at every boot, so previously-issued leaf certs stop chain-validating after a restart. This cert (not the API server cert, not the SSH CA pubkey) is the trust anchor every workload pins to verify a certd-issued mTLS peer. See §2.1 for minting it with a KMS key.
 2. **Configure mTLS for the API.**
    - `CERTD_API_CERT` + `CERTD_API_KEY` = the server certificate the workloads validate (a TLS *server* cert with a DNS SAN — typically from your platform CA / cert-manager, **not** from certd itself).
@@ -71,17 +71,27 @@ extracting it), run certd against both, and publish the issuer cert.
 ### Step 1 — provision the KMS key
 
 Create an **asymmetric SIGN_VERIFY** key. Match the algorithm to what
-certd's signer expects (Ed25519 today; if your KMS lacks Ed25519, use
-ECDSA P-256 and set the workload `key_type` accordingly — RSA works but
-is slower per-issuance).
+certd's signer expects: Ed25519 is certd's default, and AWS KMS supports
+it (`ECC_NIST_EDWARDS25519`, since 2025-11), so the key type carries
+over unchanged. ECDSA P-256 is the portable fallback (GCP KMS has no
+Ed25519); RSA works but is slower per-issuance.
 
 ```sh
-# AWS
-aws kms create-key --key-spec ECC_NIST_P256 --key-usage SIGN_VERIFY \
-  --description "tokyo3-ca signing key (prod)"
-# → note the KeyId / ARN
+# AWS — Ed25519 (matches certd's default CA key)
+keyid=$(aws kms create-key --key-spec ECC_NIST_EDWARDS25519 \
+  --key-usage SIGN_VERIFY \
+  --description "tokyo3-ca signing key (prod, ed25519)" \
+  --query KeyMetadata.KeyId --output text)
+aws kms create-alias --alias-name alias/tokyo3-ca-signing \
+  --target-key-id "$keyid"
+# Use the alias ARN as CERTD_CA_KMS_KEY so key rotation doesn't churn config:
+#   arn:aws:kms:<region>:<acct>:alias/tokyo3-ca-signing
 
-# GCP
+# AWS — ECDSA P-256 (portable fallback; also set workload key_type=ecdsa-p256)
+aws kms create-key --key-spec ECC_NIST_P256 --key-usage SIGN_VERIFY \
+  --description "tokyo3-ca signing key (prod, ecdsa-p256)"
+
+# GCP — no Ed25519; use ECDSA P-256
 gcloud kms keys create tokyo3-ca-signing --location global \
   --keyring tokyo3-ca --purpose asymmetric-signing \
   --default-algorithm ec-sign-p256-sha256
@@ -93,43 +103,35 @@ no `Decrypt`, no export, no scheduling-for-deletion from the app role.
 
 ### Step 2 — choose the runtime signing model
 
-The shipped `certd` binary's `loadCASigner` reads `CERTD_CA_KEY_FILE`
-(PKCS#8 PEM) or generates an ephemeral key. It does **not** ship a KMS
-env knob — KMS is integrated through the `signer.NewRemoteSigner`
-abstraction. Two honest options:
+Both `certd serve` and `certd ca` resolve the CA key through one seam
+(`resolveCASigner`): `CERTD_CA_KMS_KEY` selects a KMS key,
+`CERTD_CA_KEY_FILE` a PKCS#8 file, neither ⇒ ephemeral (dev). Two
+options:
 
 - **Model A — online KMS signing (recommended).** The key never leaves
-  KMS; every issuance calls KMS `Sign`. Requires a thin certd build
-  whose `loadCASigner` returns a `signer.NewRemoteSigner` instead of the
-  file loader. Skeleton:
+  KMS; every issuance calls KMS `Sign`. The AWS KMS binding ships in-repo
+  (`cmd/certd/kms_aws.go`) and is **compiled in by default** — no flag,
+  no operator Go code:
 
-  ```go
-  // GetPublicKey once at startup, wrap Sign per-issuance.
-  pub := mustKMSPublicKey(ctx, kms, keyID)         // crypto.PublicKey from KMS GetPublicKey (DER → ParsePKIXPublicKey)
-  caSigner, _ := signer.NewRemoteSigner(signer.RemoteSignerConfig{
-      PublicKey:   pub,
-      Description: "AWS KMS " + keyID,
-      SignTimeout: 5 * time.Second,
-      Sign: func(ctx context.Context, digest []byte) ([]byte, error) {
-          out, err := kms.Sign(ctx, &kms.SignInput{
-              KeyId:            &keyID,
-              Message:          digest,
-              MessageType:      types.MessageTypeDigest,      // ECDSA/RSA: pre-hashed digest
-              SigningAlgorithm: types.SigningAlgorithmSpecEcdsaSha256,
-          })
-          return out.Signature, err   // KMS returns DER ECDSA sig — what crypto/x509 expects
-      },
-  })
-  // hand caSigner to the same api.Config.CASigner field cmd/certd/main.go uses.
+  ```sh
+  export CERTD_CA_KMS_KEY=arn:aws:kms:us-east-1:111:key/abc
+  certd serve                              # serve + ca sign through KMS
   ```
 
-  Caveats: KMS returns **DER-encoded** ECDSA signatures, which is what
-  `crypto/x509` wants — good. For **Ed25519** the `Sign` digest is the
-  full message (not pre-hashed) and `MessageType=RAW`. Budget for KMS
-  latency + throttling on the issuance hot path (cache nothing
-  signing-related; the public key is the only safe cache).
+  The adapter handles pubkey parse, algorithm/message-type selection, and
+  ctx/timeout. Standard AWS credential resolution applies (IRSA / env /
+  profile / IMDS). Cost: ~+4.4 MiB of binary for the SDK; a future
+  `-tags` split can make it optional for non-KMS deployments. Key spec:
+  AWS KMS supports **Ed25519** (`ECC_NIST_EDWARDS25519`, since 2025-11 —
+  certd's default, so the CA key type carries over unchanged), plus
+  `ECC_NIST_P256` and RSA. GCP KMS lacks Ed25519 — use ECDSA P-256 there. Budget for KMS latency + throttling on the issuance hot
+  path (only the public key is cached, which the adapter does).
 
-- **Model B — KMS-wrapped key file (works with the stock binary).**
+  Other backends (GCP KMS, Vault Transit, PKCS#11 HSM): implement the
+  two-method `kms.Client` and register it the same way — see
+  `internal/server/signer/kms/doc.go`.
+
+- **Model B — KMS-wrapped key file (works with the default binary).**
   Generate the Ed25519 key, envelope-encrypt it with a KMS *symmetric*
   key, store the ciphertext in your secret store. At deploy, KMS
   `Decrypt` it into a tmpfs path and point `CERTD_CA_KEY_FILE` there.
@@ -149,9 +151,10 @@ and `x509engine.NewSelfSignedCA` path `serve` uses:
 certd ca bootstrap --key /run/tokyo3-ca/ca.key --cn "tokyo3-ca prod" \
   --out /etc/tokyo3-ca/issuer.crt
 
-# Model A (KMS): the SAME command, once loadSigner is wired to
-# signer.NewRemoteSigner (the KMS extension point flagged in
-# cmd/certd/ca.go). The key never leaves KMS; this is its one Sign.
+# Model A (KMS): the SAME command on a KMS-bound build. The key never
+# leaves KMS; this is its one Sign.
+certd ca bootstrap --kms-key arn:aws:kms:us-east-1:111:key/abc \
+  --cn "tokyo3-ca prod" --out /etc/tokyo3-ca/issuer.crt
 ```
 
 Run it once per CA generation and commit the resulting cert to config
@@ -161,7 +164,7 @@ Model B you can equivalently `openssl req -x509 -new -key <decrypted>.key
 
 ### Step 4 — wire and distribute
 
-1. `CERTD_CA_KEY_FILE` (Model B) **or** your KMS-signer build (Model A).
+1. `CERTD_CA_KEY_FILE` (Model B) **or** `CERTD_CA_KMS_KEY` on a KMS-bound build (Model A).
 2. `CERTD_CA_X509_CERT_FILE=/etc/tokyo3-ca/issuer.crt` — the cert from step 3.
 3. Push `issuer.crt` to **every workload's trust bundle** (`CERT_AGENTD_WORKLOAD_CA` on agents; `AUTH_DB_CA` / `AUTH_NATS_CA` / `AUTH_WORKLOAD_CA` etc. on consumers) so they validate certd-issued peers. This is a *different* file from the bundle that verifies certd's HTTPS server cert.
 4. Verify the chain before going live:
