@@ -396,8 +396,6 @@ func generateKey(kt KeyType) (crypto.Signer, error) {
 	}
 }
 
-// marshalPublicKeyPEM returns the SubjectPublicKeyInfo-encoded form
-// certd expects in the sign-workload request body.
 // readCurrentSerial returns the decimal serial of the cert currently at
 // path, or "" when it's absent or unparseable (first issuance / fresh
 // bootstrap). Reading from disk keeps the renewer stateless across
@@ -418,6 +416,8 @@ func readCurrentSerial(path string) string {
 	return cert.SerialNumber.String()
 }
 
+// marshalPublicKeyPEM returns the SubjectPublicKeyInfo-encoded form
+// certd expects in the sign-workload request body.
 func marshalPublicKeyPEM(pub crypto.PublicKey) ([]byte, error) {
 	der, err := x509.MarshalPKIXPublicKey(pub)
 	if err != nil {

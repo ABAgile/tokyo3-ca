@@ -83,10 +83,15 @@ mkc_server "certd"        certd  localhost  127.0.0.1
 # signing key (not mkcert's root), which is why the rig leaves
 # CERTD_API_CLIENT_CA unset in docker-compose.yml.
 #
-# -ecdsa is required: the agent's renewer is hardcoded to ECDSA P-256
-# (renewer.go's parsePrivateKeyPEM loads the bootstrap key and rejects
-# any non-ECDSA type), so the bootstrap key must be ECDSA — NOT mkcert's
-# default RSA, which fails with "unsupported key type *rsa.PrivateKey".
+# -ecdsa keeps the bootstrap key EC, not mkcert's default RSA. The agent
+# reuses this key as its workload key (renewer.go ensureKey loads it from
+# disk on first sign), so an RSA bootstrap key would mean RSA workload mTLS
+# handshakes — the cost RSA was dropped from the renewer's key *generation*
+# to avoid. The loader (parsePrivateKeyPEM) actually accepts any
+# crypto.Signer incl. RSA, so this is a throughput/consistency choice, not a
+# hard parse requirement; mkcert can't emit Ed25519, so ECDSA is the EC
+# option. (Set the agent's CERT_AGENTD_ROTATE_KEY to stop reusing the
+# bootstrap key — it then mints a fresh workload key each renewal.)
 mkc_client "cert-agentd"  -ecdsa  spiffe://demo/workload/cert-agentd  cert-agentd
 
 # ── certd's CA signing key (X.509 + SSH) ─────────────────────────────────────
