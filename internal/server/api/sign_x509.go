@@ -11,6 +11,7 @@ import (
 	"github.com/abagile/tokyo3-ca/internal/audit"
 	"github.com/abagile/tokyo3-ca/internal/server/policy"
 	"github.com/abagile/tokyo3-ca/internal/server/x509engine"
+	"github.com/abagile/tokyo3-ca/internal/store"
 )
 
 // X.509 TTL bounds. Same shape as the SSH endpoint constants — role
@@ -39,6 +40,11 @@ type signX509Request struct {
 	// [defaultX509CertTTL] when omitted; capped at [maxX509CertTTL]
 	// and possibly further by role policy.
 	TTLSeconds int64 `json:"ttl_seconds,omitempty"`
+	// CurrentSerial is the decimal serial of the cert the workload is
+	// rotating from (empty on first issuance). Consulted only when the
+	// renewal/anti-theft guard is active (an ActiveCertStore is wired):
+	// it must equal the identity's current or one-step-previous serial.
+	CurrentSerial string `json:"current_serial,omitempty"`
 }
 
 // signX509Response is the JSON reply body. Certificate is PEM-encoded.
@@ -112,6 +118,42 @@ func (s *Server) handleSignX509WorkloadCert(w http.ResponseWriter, r *http.Reque
 		ttl = decision.TTL
 	}
 
+	// Renewal/anti-theft guard: when a persistent active-cert store is
+	// wired, a renewal must present its identity's current or one-step-
+	// previous serial. A stale/unknown serial — a superseded or fabricated
+	// cert reappearing — is rejected as a possible clone and alerted on.
+	// prevSerial/prevNotAfter carry the serial being rotated *from* into
+	// the post-issue record (the one-step grace).
+	var prevSerial string
+	var prevNotAfter time.Time
+	if s.activeCerts != nil {
+		existing, ok, err := s.activeCerts.Get(spiffeURI)
+		if err != nil {
+			s.log.Error("active-cert guard: get failed; denying", "spiffe_uri", spiffeURI, "err", err)
+			writeError(w, http.StatusServiceUnavailable, "active-cert store unavailable")
+			return
+		}
+		if ok {
+			presented := req.CurrentSerial
+			if presented == "" || (presented != existing.CurrentSerial && presented != existing.PreviousSerial) {
+				s.emitAudit(r.Context(), audit.ActionX509WorkloadCertRollback, "workload:"+spiffeURI, caller.Caller, 0, r, map[string]any{
+					"spiffe_uri":       spiffeURI,
+					"presented_serial": presented,
+					"current_serial":   existing.CurrentSerial,
+					"previous_serial":  existing.PreviousSerial,
+				})
+				writeError(w, http.StatusForbidden, "presented serial is not the current or previous serial for this identity (possible clone); re-enroll via bootstrap to reset")
+				return
+			}
+			prevSerial = presented
+			if presented == existing.CurrentSerial {
+				prevNotAfter = existing.CurrentNotAfter
+			} else {
+				prevNotAfter = existing.PreviousNotAfter
+			}
+		}
+	}
+
 	serial, err := x509engine.RandomSerial(rand.Reader)
 	if err != nil {
 		s.log.Error("x509 serial", "err", err)
@@ -131,6 +173,26 @@ func (s *Server) handleSignX509WorkloadCert(w http.ResponseWriter, r *http.Reque
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
+	}
+
+	// Record the rotation so the next renewal can be guarded: current =
+	// the cert just minted, previous = the serial it rotated from (the
+	// one-step grace). Fail the request on a write error — the cert is
+	// minted but unrecorded, and serving it without recording would let a
+	// later rollback slip past the guard; the agent keeps its prior cert
+	// and retries, so state stays consistent.
+	if s.activeCerts != nil {
+		if err := s.activeCerts.Upsert(store.ActiveCert{
+			Identity:         spiffeURI,
+			CurrentSerial:    cert.SerialNumber.String(),
+			CurrentNotAfter:  cert.NotAfter.UTC(),
+			PreviousSerial:   prevSerial,
+			PreviousNotAfter: prevNotAfter,
+		}); err != nil {
+			s.log.Error("active-cert guard: record failed", "spiffe_uri", spiffeURI, "err", err)
+			writeError(w, http.StatusInternalServerError, "failed to record cert issuance")
+			return
+		}
 	}
 
 	s.emitAudit(r.Context(), audit.ActionX509WorkloadCertSigned, "workload:"+spiffeURI, caller.Caller, 0, r, map[string]any{

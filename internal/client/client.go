@@ -68,6 +68,12 @@ type SignWorkloadRequest struct {
 	// default. Capped by the endpoint's hard max and possibly
 	// further by role policy.
 	TTLSeconds int64 `json:"ttl_seconds,omitempty"`
+	// CurrentSerial is the decimal serial of the cert the workload is
+	// rotating from (empty on first issuance). certd's renewal/anti-theft
+	// guard accepts it only when it is the identity's current or
+	// one-step-previous serial; a stale/unknown serial is rejected as a
+	// possible clone. Ignored when the guard is off (no persistent store).
+	CurrentSerial string `json:"current_serial,omitempty"`
 }
 
 // SignWorkloadResponse mirrors certd's reply shape. Certificate is

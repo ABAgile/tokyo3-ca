@@ -70,6 +70,9 @@ func (d *DB) Principals() store.PrincipalStore { return &principalStore{db: d.db
 // Revocations returns the SSH KRL store.
 func (d *DB) Revocations() store.RevocationStore { return &revocationStore{db: d.db, log: d.log} }
 
+// ActiveCerts returns the X.509 workload-cert rotation store.
+func (d *DB) ActiveCerts() store.ActiveCertStore { return &activeCertStore{db: d.db, log: d.log} }
+
 type roleStore struct {
 	db  *sql.DB
 	log *slog.Logger
@@ -85,10 +88,16 @@ type revocationStore struct {
 	log *slog.Logger
 }
 
+type activeCertStore struct {
+	db  *sql.DB
+	log *slog.Logger
+}
+
 var (
 	_ store.RoleStore       = (*roleStore)(nil)
 	_ store.PrincipalStore  = (*principalStore)(nil)
 	_ store.RevocationStore = (*revocationStore)(nil)
+	_ store.ActiveCertStore = (*activeCertStore)(nil)
 )
 
 func nowRFC3339() string { return time.Now().UTC().Format(time.RFC3339) }

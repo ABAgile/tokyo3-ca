@@ -33,3 +33,7 @@ func TestPrincipalStore(t *testing.T) {
 func TestRevocationStore(t *testing.T) {
 	storetest.RunRevocationStoreSuite(t, func(t *testing.T) store.RevocationStore { return open(t).Revocations() })
 }
+
+func TestActiveCertStore(t *testing.T) {
+	storetest.RunActiveCertStoreSuite(t, func(t *testing.T) store.ActiveCertStore { return open(t).ActiveCerts() })
+}

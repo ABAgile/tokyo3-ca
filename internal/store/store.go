@@ -38,6 +38,7 @@ type Store interface {
 	Roles() RoleStore
 	Principals() PrincipalStore
 	Revocations() RevocationStore
+	ActiveCerts() ActiveCertStore
 	io.Closer
 }
 
@@ -70,6 +71,30 @@ type PrincipalStore interface {
 type RevocationStore interface {
 	krl.Store // Revoke; Snapshot; IsRevoked
 	MarshalSpec() string
+}
+
+// ActiveCert is the per-identity X.509 workload-cert rotation state that
+// backs the renewal/anti-theft guard (see certd-store-design.md): the
+// currently-valid serial plus a one-step grace (previous) covering the
+// crash/rotation window. Serials are decimal big-int strings (X.509 serials
+// exceed uint64). PreviousSerial == "" means the state has collapsed to a
+// single live serial.
+type ActiveCert struct {
+	Identity         string // SPIFFE URI
+	CurrentSerial    string
+	CurrentNotAfter  time.Time
+	PreviousSerial   string
+	PreviousNotAfter time.Time
+}
+
+// ActiveCertStore persists [ActiveCert] rows. The equality guard + reuse
+// detection live in the X.509 sign path; this is the data layer it reads
+// and writes. Get returns an error (not a swallowed miss) so the sign path
+// can fail closed on a real query failure.
+type ActiveCertStore interface {
+	Get(identity string) (ActiveCert, bool, error)
+	Upsert(ac ActiveCert) error
+	Delete(identity string) error
 }
 
 // ── roles ──────────────────────────────────────────────────────────────
@@ -258,6 +283,60 @@ func RevocationInsertArgs(r krl.Revocation) []any {
 		keyID = r.KeyID
 	}
 	return []any{serial, keyID, r.Reason, r.Revoker, r.Revoked.UTC().Format(time.RFC3339Nano)}
+}
+
+// ── active workload certs ────────────────────────────────────────────────
+
+// ActiveCertColumns is the shared column list for the active_workload_cert
+// table (excluding updated_at). Order matches [ScanActiveCert].
+const ActiveCertColumns = `identity, current_serial, current_not_after, previous_serial, previous_not_after`
+
+// ScanActiveCert reads one row into an [ActiveCert]. previous_* are NULL
+// when the state has collapsed to a single live serial.
+func ScanActiveCert(sc RowScanner) (ActiveCert, error) {
+	var (
+		ac           ActiveCert
+		curNotAfter  string
+		prevSerial   sql.NullString
+		prevNotAfter sql.NullString
+	)
+	if err := sc.Scan(&ac.Identity, &ac.CurrentSerial, &curNotAfter, &prevSerial, &prevNotAfter); err != nil {
+		return ActiveCert{}, err
+	}
+	t, err := time.Parse(time.RFC3339Nano, curNotAfter)
+	if err != nil {
+		return ActiveCert{}, err
+	}
+	ac.CurrentNotAfter = t
+	if prevSerial.Valid {
+		ac.PreviousSerial = prevSerial.String
+	}
+	if prevNotAfter.Valid && prevNotAfter.String != "" {
+		t, err := time.Parse(time.RFC3339Nano, prevNotAfter.String)
+		if err != nil {
+			return ActiveCert{}, err
+		}
+		ac.PreviousNotAfter = t
+	}
+	return ac, nil
+}
+
+// ActiveCertUpsertArgs returns positional args for an upsert over
+// [ActiveCertColumns] plus a trailing updated_at. A zero previous collapses
+// to NULL columns.
+func ActiveCertUpsertArgs(ac ActiveCert, updatedAt string) []any {
+	var prevSerial any
+	if ac.PreviousSerial != "" {
+		prevSerial = ac.PreviousSerial
+	}
+	var prevNotAfter any
+	if !ac.PreviousNotAfter.IsZero() {
+		prevNotAfter = ac.PreviousNotAfter.UTC().Format(time.RFC3339Nano)
+	}
+	return []any{
+		ac.Identity, ac.CurrentSerial, ac.CurrentNotAfter.UTC().Format(time.RFC3339Nano),
+		prevSerial, prevNotAfter, updatedAt,
+	}
 }
 
 // ── JSON helpers ─────────────────────────────────────────────────────────

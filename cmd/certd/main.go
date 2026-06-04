@@ -319,6 +319,14 @@ func runServe(ctx context.Context) error {
 		log.Info("revocation store ready (in-memory)")
 	}
 
+	// The X.509 renewal/anti-theft guard is opt-in with the persistent
+	// store: nil (no DB) leaves the sign-workload endpoint unguarded.
+	var activeCerts store.ActiveCertStore
+	if db != nil {
+		activeCerts = db.ActiveCerts()
+		log.Info("x509 renewal/anti-theft guard active")
+	}
+
 	portalSrv, err := portal.New(portal.Config{
 		Version:         Version,
 		Log:             log,
@@ -339,17 +347,18 @@ func runServe(ctx context.Context) error {
 	}
 
 	srv, err := api.New(api.Config{
-		Log:            log,
-		CASigner:       caSigner,
-		X509IssuerCert: x509IssuerCert,
-		Policy:         policyEngine,
-		OIDCVerifier:   oidcVerifier,
-		MTLSStore:      mtlsStore,
-		Audit:          auditSink,
-		AuditSource:    auditSrc,
-		Portal:         portalSrv,
-		KRL:            krlStore,
-		Version:        Version,
+		Log:             log,
+		CASigner:        caSigner,
+		X509IssuerCert:  x509IssuerCert,
+		Policy:          policyEngine,
+		OIDCVerifier:    oidcVerifier,
+		MTLSStore:       mtlsStore,
+		Audit:           auditSink,
+		AuditSource:     auditSrc,
+		Portal:          portalSrv,
+		KRL:             krlStore,
+		ActiveCertStore: activeCerts,
+		Version:         Version,
 	})
 	if err != nil {
 		return fmt.Errorf("api server: %w", err)

@@ -37,7 +37,7 @@ func TestStores(t *testing.T) {
 	t.Cleanup(func() { _ = raw.Close() })
 	reset := func(t *testing.T) {
 		t.Helper()
-		if _, err := raw.Exec(`TRUNCATE roles, principals, ssh_revocations`); err != nil {
+		if _, err := raw.Exec(`TRUNCATE roles, principals, ssh_revocations, active_workload_cert`); err != nil {
 			t.Fatalf("truncate: %v", err)
 		}
 	}
@@ -45,4 +45,5 @@ func TestStores(t *testing.T) {
 	storetest.RunRoleStoreSuite(t, func(t *testing.T) store.RoleStore { reset(t); return db.Roles() })
 	storetest.RunPrincipalStoreSuite(t, func(t *testing.T) store.PrincipalStore { reset(t); return db.Principals() })
 	storetest.RunRevocationStoreSuite(t, func(t *testing.T) store.RevocationStore { reset(t); return db.Revocations() })
+	storetest.RunActiveCertStoreSuite(t, func(t *testing.T) store.ActiveCertStore { reset(t); return db.ActiveCerts() })
 }

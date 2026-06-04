@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/abagile/tokyo3-ca/internal/server/krl"
 	"github.com/abagile/tokyo3-ca/internal/server/mtls"
@@ -256,6 +257,72 @@ func RunRevocationStoreSuite(t *testing.T, newStore func(t *testing.T) store.Rev
 		}
 		if !strings.Contains(spec, "id: user:alice") {
 			t.Errorf("spec missing id line:\n%s", spec)
+		}
+	})
+}
+
+// ── active workload certs ────────────────────────────────────────────────
+
+// RunActiveCertStoreSuite runs the full ActiveCertStore contract.
+func RunActiveCertStoreSuite(t *testing.T, newStore func(t *testing.T) store.ActiveCertStore) {
+	cur := time.Date(2026, 6, 4, 12, 0, 0, 0, time.UTC)
+	prev := cur.Add(-10 * time.Minute)
+
+	t.Run("UpsertGet", func(t *testing.T) {
+		as := newStore(t)
+		if _, ok, err := as.Get("spiffe://demo/x"); err != nil || ok {
+			t.Fatalf("empty Get: ok=%v err=%v, want false/nil", ok, err)
+		}
+		want := store.ActiveCert{
+			Identity: "spiffe://demo/x", CurrentSerial: "123", CurrentNotAfter: cur,
+			PreviousSerial: "122", PreviousNotAfter: prev,
+		}
+		if err := as.Upsert(want); err != nil {
+			t.Fatalf("Upsert: %v", err)
+		}
+		got, ok, err := as.Get("spiffe://demo/x")
+		if err != nil || !ok {
+			t.Fatalf("Get after upsert: ok=%v err=%v", ok, err)
+		}
+		if got.CurrentSerial != "123" || got.PreviousSerial != "122" {
+			t.Errorf("serials = %q/%q, want 123/122", got.CurrentSerial, got.PreviousSerial)
+		}
+		if !got.CurrentNotAfter.Equal(cur) || !got.PreviousNotAfter.Equal(prev) {
+			t.Errorf("not_after round-trip mismatch: %v / %v", got.CurrentNotAfter, got.PreviousNotAfter)
+		}
+	})
+
+	t.Run("CollapsePrevious", func(t *testing.T) {
+		as := newStore(t)
+		if err := as.Upsert(store.ActiveCert{Identity: "id", CurrentSerial: "9", CurrentNotAfter: cur, PreviousSerial: "8", PreviousNotAfter: prev}); err != nil {
+			t.Fatal(err)
+		}
+		// Adopt: rewrite with no previous → collapses to a single serial.
+		if err := as.Upsert(store.ActiveCert{Identity: "id", CurrentSerial: "9", CurrentNotAfter: cur}); err != nil {
+			t.Fatal(err)
+		}
+		got, ok, err := as.Get("id")
+		if err != nil || !ok {
+			t.Fatalf("Get: ok=%v err=%v", ok, err)
+		}
+		if got.PreviousSerial != "" || !got.PreviousNotAfter.IsZero() {
+			t.Errorf("previous not collapsed: serial=%q not_after=%v", got.PreviousSerial, got.PreviousNotAfter)
+		}
+	})
+
+	t.Run("Delete", func(t *testing.T) {
+		as := newStore(t)
+		if err := as.Upsert(store.ActiveCert{Identity: "doomed", CurrentSerial: "1", CurrentNotAfter: cur}); err != nil {
+			t.Fatal(err)
+		}
+		if err := as.Delete("doomed"); err != nil {
+			t.Fatalf("Delete: %v", err)
+		}
+		if _, ok, _ := as.Get("doomed"); ok {
+			t.Error("row present after Delete")
+		}
+		if err := as.Delete("doomed"); err != nil {
+			t.Errorf("Delete absent: %v, want nil (idempotent)", err)
 		}
 	})
 }

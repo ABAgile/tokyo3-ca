@@ -123,8 +123,8 @@ Threats:
 ## Residual risks (known + tracked)
 
 1. **No rate limiting on the API** — leans on the operator's edge.
-2. **In-memory revocation store** — non-persistent, no DB backend yet.
-3. **No KMS-key health probe** — `RemoteSigner.Description` surfaces config but doesn't actively confirm the KMS key is still accessible until the first cert request.
+2. **In-memory revocation store (default)** — non-persistent; a Postgres/SQLite backend is available opt-in via `CERTD_DATABASE_URL` (`internal/store`), so revocations survive restart when configured.
+3. **No periodic KMS-key liveness probe** — the bundled KMS path fetches the CA public key at startup (a missing or inaccessible key fails boot, not the first sign), but there is no recurring re-check of continued accessibility while running.
 4. **Portal Basic auth is single-tenant** — multi-user RBAC for the portal needs OIDC integration (out of scope for v1).
 5. **The audit-log loss-tolerance is deliberate** but is a residual risk if the broker is offline during a malicious sign attempt.
 

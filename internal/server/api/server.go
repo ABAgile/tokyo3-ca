@@ -22,6 +22,7 @@ import (
 	"github.com/abagile/tokyo3-ca/internal/server/policy"
 	"github.com/abagile/tokyo3-ca/internal/server/portal"
 	"github.com/abagile/tokyo3-ca/internal/server/signer"
+	"github.com/abagile/tokyo3-ca/internal/store"
 )
 
 // Server holds all dependencies for the HTTP API. Pure value — safe to
@@ -29,15 +30,16 @@ import (
 type Server struct {
 	log            *slog.Logger
 	caSigner       signer.Signer
-	x509IssuerCert *x509.Certificate  // CA cert used as issuer for X.509 issuance; nil disables /x509/* routes.
-	policy         *policy.Engine     // Role-table enforcer; nil = permissive (pre-auth wiring).
-	oidc           oidc.TokenVerifier // Bearer-token verifier; nil = no OIDC auth.
-	mtls           mtls.Store         // Cert-principal registry; nil = no mTLS auth.
-	audit          audit.Sink         // JetStream publisher; NoopSink when CERTD_NATS_URL is unset.
-	auditSrc       journal.Source     // JetStream reader for the portal audit page; NoopSource when CERTD_NATS_URL is unset.
-	portal         *portal.Server     // Admin web UI; nil disables /portal/* routes.
-	krl            krl.Store          // Revocation registry; nil disables /api/v1/ssh/revoke + /revocations.
-	version        string             // build-time version string, surfaced in /healthz; empty allowed.
+	x509IssuerCert *x509.Certificate     // CA cert used as issuer for X.509 issuance; nil disables /x509/* routes.
+	policy         *policy.Engine        // Role-table enforcer; nil = permissive (pre-auth wiring).
+	oidc           oidc.TokenVerifier    // Bearer-token verifier; nil = no OIDC auth.
+	mtls           mtls.Store            // Cert-principal registry; nil = no mTLS auth.
+	audit          audit.Sink            // JetStream publisher; NoopSink when CERTD_NATS_URL is unset.
+	auditSrc       journal.Source        // JetStream reader for the portal audit page; NoopSource when CERTD_NATS_URL is unset.
+	portal         *portal.Server        // Admin web UI; nil disables /portal/* routes.
+	krl            krl.Store             // Revocation registry; nil disables /api/v1/ssh/revoke + /revocations.
+	activeCerts    store.ActiveCertStore // X.509 renewal/anti-theft guard state; nil disables the guard.
+	version        string                // build-time version string, surfaced in /healthz; empty allowed.
 }
 
 // Config is the constructor argument for [New].
@@ -92,6 +94,11 @@ type Config struct {
 	// passed to ssh-proxyd so its IsRevoked callback uses the
 	// authoritative set.
 	KRL krl.Store
+	// ActiveCertStore enables the X.509 renewal/anti-theft guard on the
+	// sign-workload endpoint: a renewal must present its identity's
+	// current (or one-step-previous) serial. nil disables the guard — the
+	// opt-in default without a persistent store. Wire db.ActiveCerts().
+	ActiveCertStore store.ActiveCertStore
 	// Version is the build-time semver / commit identifier surfaced in
 	// /healthz. Empty acceptable but discouraged in deployed builds.
 	Version string
@@ -125,6 +132,7 @@ func New(cfg Config) (*Server, error) {
 		auditSrc:       auditSrc,
 		portal:         cfg.Portal,
 		krl:            cfg.KRL,
+		activeCerts:    cfg.ActiveCertStore,
 		version:        cfg.Version,
 	}, nil
 }

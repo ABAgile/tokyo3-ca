@@ -202,6 +202,11 @@ func (r *Renewer) SignOnce(ctx context.Context) (validAfter, validBefore time.Ti
 		SPIFFEURI:         r.cfg.SPIFFEURI,
 		SubjectCommonName: r.cfg.SubjectCommonName,
 		Groups:            r.cfg.Groups,
+		// Serial of the cert we're rotating from, read from disk so it
+		// survives restarts without extra state. Empty on first issuance
+		// (or after a fresh bootstrap). certd's anti-theft guard, when
+		// active, accepts only the current or one-step-previous serial.
+		CurrentSerial: readCurrentSerial(r.cfg.CertOutputPath),
 	}
 	if r.cfg.RequestedTTL > 0 {
 		req.TTLSeconds = int64(r.cfg.RequestedTTL.Seconds())
@@ -328,6 +333,26 @@ func generateKey(kt KeyType) (crypto.Signer, error) {
 
 // marshalPublicKeyPEM returns the SubjectPublicKeyInfo-encoded form
 // certd expects in the sign-workload request body.
+// readCurrentSerial returns the decimal serial of the cert currently at
+// path, or "" when it's absent or unparseable (first issuance / fresh
+// bootstrap). Reading from disk keeps the renewer stateless across
+// restarts — the cert it holds IS its current serial.
+func readCurrentSerial(path string) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	block, _ := pem.Decode(data)
+	if block == nil {
+		return ""
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return ""
+	}
+	return cert.SerialNumber.String()
+}
+
 func marshalPublicKeyPEM(pub crypto.PublicKey) ([]byte, error) {
 	der, err := x509.MarshalPKIXPublicKey(pub)
 	if err != nil {

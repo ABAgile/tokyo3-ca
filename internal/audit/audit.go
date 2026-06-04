@@ -50,7 +50,12 @@ const (
 	ActionSSHHostCertDenied      = "ssh.host_cert.denied"
 	ActionX509WorkloadCertSigned = "x509.workload_cert.signed"
 	ActionX509WorkloadCertDenied = "x509.workload_cert.denied"
-	ActionSSHCertRevoked         = "ssh.cert.revoked"
+	// ActionX509WorkloadCertRollback flags a renewal that presented a
+	// serial outside the {current, previous} window for its identity — a
+	// superseded/unknown cert reappearing, i.e. a possible key-pair theft
+	// (the renewal/anti-theft guard). High-signal: alert on it.
+	ActionX509WorkloadCertRollback = "x509.workload_cert.rollback_rejected"
+	ActionSSHCertRevoked           = "ssh.cert.revoked"
 )
 
 // Caller-identity prefix scheme used in [Entry.Caller]:

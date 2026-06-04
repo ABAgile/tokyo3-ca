@@ -327,6 +327,20 @@ internal/
   boot and CRUD writes survive restarts; `CERTD_ROLES_FILE` /
   `CERTD_MTLS_PRINCIPALS_FILE` then only seed a fresh database once.
   See `internal/store/`.
+
+- **X.509 renewal anti-theft guard.** Active whenever the persistent
+  store is configured: each workload-cert renewal must present its
+  identity's *current* (or one-step-*previous*, the crash/rotation
+  grace) serial via `current_serial`. A stale or unknown serial — a
+  superseded or fabricated cert reappearing, i.e. a possible key-pair
+  clone — is rejected `403` and emits a high-signal
+  `x509.workload_cert.rollback_rejected` audit event. cert-agentd
+  sends the serial of the cert on disk automatically (stateless across
+  restarts). First issuance (no prior serial / no recorded state) is
+  unguarded; resetting a locked-out identity means clearing its
+  `active_workload_cert` row (re-enroll). Off entirely without a
+  store. Refresh-token-rotation + reuse-detection, applied to certs —
+  see `certd-store-design.md`.
   CSRF protection on every POST: each GET sets a `certd_csrf`
   cookie (256 bits of entropy, `SameSite=Lax`, `Secure` over HTTPS)
   and the rendered form embeds the matching value as a hidden
