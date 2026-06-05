@@ -1,9 +1,9 @@
 module github.com/abagile/tokyo3-ca
 
-go 1.26.3
+go 1.26.4
 
 require (
-	github.com/abagile/tokyo3-base v0.6.0
+	github.com/abagile/tokyo3-base v0.6.1
 	github.com/aws/aws-sdk-go-v2/config v1.32.22
 	github.com/aws/aws-sdk-go-v2/service/kms v1.53.2
 	github.com/coreos/go-oidc/v3 v3.18.0
@@ -44,7 +44,7 @@ require (
 	github.com/phuslu/log v1.0.124 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
 	github.com/spf13/pflag v1.0.9 // indirect
-	golang.org/x/net v0.54.0 // indirect
+	golang.org/x/net v0.55.0 // indirect
 	golang.org/x/oauth2 v0.36.0 // indirect
 	golang.org/x/sync v0.20.0 // indirect
 	golang.org/x/sys v0.45.0 // indirect
