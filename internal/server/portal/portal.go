@@ -1,21 +1,19 @@
 // Package portal serves the certd admin web UI — role-table CRUD,
-// host registry browser, session list with asciinema-player replay,
-// and audit viewer. Server-rendered HTML, no client-side framework;
-// pages render fully on the server and submit via standard form
-// posts.
+// host registry browser, audit viewer, and revocations. Server-rendered
+// HTML, no client-side framework; pages render fully on the server and
+// submit via standard form posts.
 //
 // The portal is mounted by [Server.Routes] at /portal/. Each page is
 // a single template inheriting from [baseTemplate] so the nav and
-// chrome stay consistent. This first slice ships only the scaffold +
-// a landing page that lists what the portal will eventually do —
-// later slices fill in role-table, sessions, hosts, and audit pages.
+// chrome stay consistent. (Recorded-session list + asciinema replay
+// lives in ssh-proxyd's own portal — it produces the recordings — not
+// here in the CA.)
 package portal
 
 import (
 	"errors"
 	"fmt"
 	"html/template"
-	"io"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -106,20 +104,10 @@ type Config struct {
 	// principals). When nil, /hosts returns 503.
 	HostStore HostStore
 
-	// SessionStore powers the /sessions page (recent recording.completed
-	// events on the ssh_audit JetStream stream). When nil, /sessions
-	// returns 503.
-	SessionStore SessionStore
-
 	// AuditStore powers the /audit page (live tail of every audit
 	// stream the operator wires up — certd's own + ssh-proxyd's).
 	// When nil, /audit returns 503.
 	AuditStore AuditStore
-
-	// CastStore opens the asciinema cast files referenced by
-	// /portal/sessions/{id}/cast. When nil, the cast endpoint
-	// returns 503 and the session-detail page hides its embed.
-	CastStore CastStore
 
 	// RevocationStore powers the /portal/revocations page and the
 	// revoke form. When nil, the page returns 503. Same store
@@ -185,9 +173,6 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /roles/{name}/edit", s.handleRoleUpdate)
 	mux.HandleFunc("POST /roles/{name}/delete", s.handleRoleDelete)
 	mux.HandleFunc("GET /hosts", s.handleHostsIndex)
-	mux.HandleFunc("GET /sessions", s.handleSessionsIndex)
-	mux.HandleFunc("GET /sessions/{id}", s.handleSessionDetail)
-	mux.HandleFunc("GET /sessions/{id}/cast", s.handleSessionCast)
 	mux.HandleFunc("GET /audit", s.handleAuditIndex)
 	mux.HandleFunc("GET /revocations", s.handleRevocationsIndex)
 	mux.HandleFunc("POST /revocations", s.handleRevocationsCreate)
@@ -231,7 +216,6 @@ func (s *Server) landingPages() []pageEntry {
 	return []pageEntry{
 		{Name: "Roles", Path: "/roles", Description: "Role-table viewer: group → principals + host patterns", Status: status(s.cfg.RoleStore != nil)},
 		{Name: "Hosts", Path: "/hosts", Description: "Registered workload mTLS principals (SPIFFE / email SANs → group claims)", Status: status(s.cfg.HostStore != nil)},
-		{Name: "Sessions", Path: "/sessions", Description: "Recent recording.completed events from ssh-proxyd", Status: status(s.cfg.SessionStore != nil)},
 		{Name: "Audit", Path: "/audit", Description: "Live audit-event viewer (NATS JetStream tail)", Status: status(s.cfg.AuditStore != nil)},
 		{Name: "Revocations", Path: "/revocations", Description: "Revoked SSH certs (ssh-proxyd polls this set to refuse handshakes)", Status: status(s.cfg.RevocationStore != nil)},
 	}
@@ -483,119 +467,6 @@ func (s *Server) handleHostsIndex(w http.ResponseWriter, _ *http.Request) {
 		RenderedAt: s.cfg.Now(),
 		Hosts:      hosts,
 	})
-}
-
-// sessionsIndexData is the model for the sessions list page.
-type sessionsIndexData struct {
-	Version    string
-	RenderedAt time.Time
-	Sessions   []Session
-}
-
-func (s *Server) handleSessionsIndex(w http.ResponseWriter, _ *http.Request) {
-	if s.cfg.SessionStore == nil {
-		http.Error(w, "session store not configured", http.StatusServiceUnavailable)
-		return
-	}
-	s.render(w, "sessions", sessionsIndexData{
-		Version:    s.cfg.Version,
-		RenderedAt: s.cfg.Now(),
-		Sessions:   s.cfg.SessionStore.Sessions(),
-	})
-}
-
-// sessionDetailData is the model for the single-session page.
-type sessionDetailData struct {
-	Version    string
-	RenderedAt time.Time
-	ID         string
-	Session    Session
-	Found      bool
-	// CastAvailable indicates whether a CastStore is wired AND the
-	// session has a RecordingPath. Drives the player embed.
-	CastAvailable bool
-}
-
-func (s *Server) handleSessionDetail(w http.ResponseWriter, r *http.Request) {
-	if s.cfg.SessionStore == nil {
-		http.Error(w, "session store not configured", http.StatusServiceUnavailable)
-		return
-	}
-	id := r.PathValue("id")
-	data := sessionDetailData{
-		Version:    s.cfg.Version,
-		RenderedAt: s.cfg.Now(),
-		ID:         id,
-	}
-	for _, sess := range s.cfg.SessionStore.Sessions() {
-		if sess.SessionID == id {
-			data.Session = sess
-			data.Found = true
-			data.CastAvailable = s.cfg.CastStore != nil && sess.RecordingPath != ""
-			break
-		}
-	}
-	if !data.Found {
-		w.WriteHeader(http.StatusNotFound)
-	}
-	s.render(w, "session_detail", data)
-}
-
-// handleSessionCast streams the raw cast bytes for {id}. The session
-// is resolved through SessionStore; the CastStore is asked to open
-// the file at the session's RecordingPath (the store enforces the
-// path-root guard). Content-Type is "text/plain" since the cast
-// format is asciinema's NDJSON — letting browsers preview it
-// directly is fine and aligns with what asciinema-player loads.
-func (s *Server) handleSessionCast(w http.ResponseWriter, r *http.Request) {
-	if s.cfg.SessionStore == nil {
-		http.Error(w, "session store not configured", http.StatusServiceUnavailable)
-		return
-	}
-	if s.cfg.CastStore == nil {
-		http.Error(w, "cast store not configured", http.StatusServiceUnavailable)
-		return
-	}
-	id := r.PathValue("id")
-	var sess Session
-	var found bool
-	for _, candidate := range s.cfg.SessionStore.Sessions() {
-		if candidate.SessionID == id {
-			sess = candidate
-			found = true
-			break
-		}
-	}
-	if !found {
-		http.Error(w, "session not found", http.StatusNotFound)
-		return
-	}
-	if sess.RecordingPath == "" {
-		http.Error(w, "session has no recording", http.StatusNotFound)
-		return
-	}
-	rc, size, err := s.cfg.CastStore.Open(sess.RecordingPath)
-	if err != nil {
-		switch {
-		case errors.Is(err, ErrCastNotFound):
-			http.Error(w, "cast file not found", http.StatusNotFound)
-		case errors.Is(err, ErrCastOutsideRoot):
-			s.cfg.Log.Warn("portal: cast path outside configured root — refusing to serve",
-				"session_id", id, "path", sess.RecordingPath)
-			http.Error(w, "cast outside allowed root", http.StatusForbidden)
-		default:
-			s.cfg.Log.Error("portal: open cast", "session_id", id, "err", err)
-			http.Error(w, "cast open failed", http.StatusInternalServerError)
-		}
-		return
-	}
-	defer rc.Close()
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	if size > 0 {
-		w.Header().Set("Content-Length", fmt.Sprintf("%d", size))
-	}
-	w.Header().Set("Cache-Control", "no-store")
-	_, _ = io.Copy(w, rc)
 }
 
 // revocationsIndexData is the model for the revocations list +
@@ -931,14 +802,8 @@ func parsePages() (map[string]*template.Template, error) {
 		"fmtTime": func(t time.Time) string {
 			return t.UTC().Format(time.RFC3339)
 		},
-		"fmtDuration": func(d time.Duration) string {
-			if d == 0 {
-				return "(role default)"
-			}
-			return d.String()
-		},
 		// fmtSeconds renders an integer-seconds cap human-friendly,
-		// matching fmtDuration's zero handling.
+		// with zero meaning "fall back to the role default".
 		"fmtSeconds": func(s int64) string {
 			if s == 0 {
 				return "(role default)"
@@ -947,15 +812,13 @@ func parsePages() (map[string]*template.Template, error) {
 		},
 	}
 	pages := map[string]string{
-		"index":          indexTemplate,
-		"roles":          rolesTemplate,
-		"role_detail":    roleDetailTemplate,
-		"role_form":      roleFormTemplate,
-		"hosts":          hostsTemplate,
-		"sessions":       sessionsTemplate,
-		"session_detail": sessionDetailTemplate,
-		"audit":          auditTemplate,
-		"revocations":    revocationsTemplate,
+		"index":       indexTemplate,
+		"roles":       rolesTemplate,
+		"role_detail": roleDetailTemplate,
+		"role_form":   roleFormTemplate,
+		"hosts":       hostsTemplate,
+		"audit":       auditTemplate,
+		"revocations": revocationsTemplate,
 	}
 	out := make(map[string]*template.Template, len(pages))
 	for name, body := range pages {
@@ -1170,103 +1033,20 @@ every signing request that traverses the mTLS path.</p>
 {{end}}
 {{end}}`
 
-const sessionsTemplate = `{{define "page"}}{{template "base" .}}{{end}}
-{{define "title"}}sessions{{end}}
-{{define "body"}}
-<p><a href="/">&larr; home</a></p>
-<h1>Sessions</h1>
-<p>Recent SSH sessions ssh-proxyd has finished recording. Hydrated
-from the <code>recording.completed</code> audit events on the
-<code>ssh_audit</code> JetStream stream — order is newest-first.
-asciinema-player embed lands in a follow-up slice; for now the
-RecordingPath column points at the cast file on the proxy's disk.</p>
-{{if .Sessions}}
-<table>
-<thead>
-<tr>
-  <th>Completed at</th>
-  <th>User</th>
-  <th>Target</th>
-  <th>Remote user</th>
-  <th>Duration</th>
-  <th>Recording</th>
-  <th>Session ID</th>
-</tr>
-</thead>
-<tbody>
-{{range .Sessions}}
-<tr>
-  <td>{{fmtTime .CompletedAt}}</td>
-  <td>{{if .User}}<code>{{.User}}</code>{{else}}<em>-</em>{{end}}</td>
-  <td>{{if .Target}}<code>{{.Target}}</code>{{else}}<em>-</em>{{end}}</td>
-  <td>{{if .RemoteUser}}<code>{{.RemoteUser}}</code>{{else}}<em>-</em>{{end}}</td>
-  <td>{{fmtDuration .Duration}}</td>
-  <td>{{if .RecordingPath}}<code>{{.RecordingPath}}</code>{{else}}<em>-</em>{{end}}</td>
-  <td><a href="/sessions/{{.SessionID}}"><code>{{.SessionID}}</code></a></td>
-</tr>
-{{end}}
-</tbody>
-</table>
-{{else}}
-<p><em>No recorded sessions yet. Hold tight — recording.completed events arrive when ssh-proxyd finishes a PTY session.</em></p>
-{{end}}
-{{end}}`
-
-const sessionDetailTemplate = `{{define "page"}}{{template "base" .}}{{end}}
-{{define "title"}}session · {{.ID}}{{end}}
-{{define "body"}}
-<p><a href="/sessions">&larr; sessions</a></p>
-{{if not .Found}}
-<h1>Not found</h1>
-<p>No session with ID <code>{{.ID}}</code> is in the recent buffer.
-Older sessions may have aged out of the in-memory ring; query
-JetStream directly to find them.</p>
-{{else}}
-<h1>Session <code>{{.Session.SessionID}}</code></h1>
-<table>
-<tbody>
-<tr><th>Completed at</th><td>{{fmtTime .Session.CompletedAt}}</td></tr>
-<tr><th>Duration</th><td>{{fmtDuration .Session.Duration}}</td></tr>
-<tr><th>User</th><td>{{if .Session.User}}<code>{{.Session.User}}</code>{{else}}<em>-</em>{{end}}</td></tr>
-<tr><th>Target</th><td>{{if .Session.Target}}<code>{{.Session.Target}}</code>{{else}}<em>-</em>{{end}}</td></tr>
-<tr><th>Remote user</th><td>{{if .Session.RemoteUser}}<code>{{.Session.RemoteUser}}</code>{{else}}<em>-</em>{{end}}</td></tr>
-<tr><th>Principals</th><td>{{if .Session.Principals}}<code>{{.Session.Principals}}</code>{{else}}<em>-</em>{{end}}</td></tr>
-<tr><th>Client IP</th><td>{{if .Session.ClientIP}}<code>{{.Session.ClientIP}}</code>{{else}}<em>-</em>{{end}}</td></tr>
-<tr><th>Recording path</th><td>{{if .Session.RecordingPath}}<code>{{.Session.RecordingPath}}</code>{{else}}<em>-</em>{{end}}</td></tr>
-</tbody>
-</table>
-{{if .CastAvailable}}
-<h2>Replay</h2>
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/asciinema-player@3.10.0/dist/bundle/asciinema-player.css">
-<div id="asciinema-player"></div>
-<script src="https://cdn.jsdelivr.net/npm/asciinema-player@3.10.0/dist/bundle/asciinema-player.min.js"></script>
-<script>
-AsciinemaPlayer.create('/sessions/{{.Session.SessionID}}/cast',
-  document.getElementById('asciinema-player'),
-  {fit: 'width', terminalLineHeight: 1.2});
-</script>
-<p><a href="/sessions/{{.Session.SessionID}}/cast">Download raw cast</a></p>
-{{else}}
-<p><em>No replay available — </em>{{if not .Session.RecordingPath}}the session was not PTY-recorded.{{else}}cast store is not configured on this certd.{{end}}</p>
-{{end}}
-{{end}}
-{{end}}`
-
 const auditTemplate = `{{define "page"}}{{template "base" .}}{{end}}
 {{define "title"}}audit{{end}}
 {{define "body"}}
 <p><a href="/">&larr; home</a></p>
 <h1>Audit</h1>
-<p>Live tail of every audit stream wired into certd — certd's own
-cert issuance + ssh-proxyd's session lifecycle events. Newest first.
-The buffer caps at the tracker's MaxEvents (default 500); to dig
-deeper, query JetStream directly.</p>
+<p>Live tail of certd's own audit stream — cert issuance, denial, and
+revocation events. Newest first. The buffer caps at the tracker's
+MaxEvents (default 500); to dig deeper, query JetStream directly.
+(SSH session/access events live in ssh-proxyd's own portal.)</p>
 {{if .Events}}
 <table>
 <thead>
 <tr>
   <th>Time</th>
-  <th>Source</th>
   <th>Action</th>
   <th>Actor</th>
   <th>Subject</th>
@@ -1278,18 +1058,17 @@ deeper, query JetStream directly.</p>
 {{range .Events}}
 <tr>
   <td>{{fmtTime .OccurredAt}}</td>
-  <td><code>{{.Source}}</code></td>
   <td><code>{{.Action}}</code></td>
   <td>{{if .Actor}}<code>{{.Actor}}</code>{{else}}<em>-</em>{{end}}</td>
   <td>{{if .Subject}}<code>{{.Subject}}</code>{{else}}<em>-</em>{{end}}</td>
   <td>{{if .IP}}<code>{{.IP}}</code>{{else}}<em>-</em>{{end}}</td>
-  <td>{{if .Reason}}<em>{{.Reason}}</em>{{else if .Detail}}<details><summary>view</summary><pre>{{.Detail}}</pre></details>{{else}}<em>-</em>{{end}}</td>
+  <td>{{if .Detail}}<details><summary>view</summary><pre>{{.Detail}}</pre></details>{{else}}<em>-</em>{{end}}</td>
 </tr>
 {{end}}
 </tbody>
 </table>
 {{else}}
-<p><em>No audit events yet. Events appear here once the wired streams start emitting.</em></p>
+<p><em>No audit events yet. Events appear here once certd starts emitting.</em></p>
 {{end}}
 {{end}}`
 

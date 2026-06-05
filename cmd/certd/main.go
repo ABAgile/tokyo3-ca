@@ -95,19 +95,6 @@
 //	CERTD_PORTAL_REALM          Optional Basic-auth realm shown in the browser prompt. Default
 //	                            "certd portal".
 //
-//	CERTD_CAST_DIR  Directory containing the asciinema cast files referenced by
-//	                recording.completed events (typically the same path ssh-proxyd writes to,
-//	                mounted into the certd container). Required for the portal's session-replay
-//	                embed and the /sessions/{id}/cast endpoint; unset leaves the player hidden.
-//	                Paths outside this directory are rejected with 403.
-//
-//	CERTD_SSH_AUDIT_URL  NATS URL for the ssh_audit stream ssh-proxyd publishes
-//	                     recording.completed events to. When set, certd subscribes, decodes the
-//	                     events, and powers the portal's /sessions page. Falls back to
-//	                     CERTD_NATS_URL when unset; truly empty means "no sessions page". TLS
-//	                     material comes from CERTD_SSH_AUDIT_CERT/_KEY/_CA with the same
-//	                     CERTD_NATS_* fallback chain.
-//
 //	CERTD_ROLES_FILE  Path to a JSON file holding the role table — top-level array of role
 //	                  objects matching the [policy.Role] shape (Name, GroupClaim,
 //	                  AllowedPrincipals, HostPatterns, SPIFFEPatterns, MaxFooCertTTL,
@@ -146,7 +133,6 @@ import (
 	"github.com/abagile/tokyo3-base/cli"
 	"github.com/abagile/tokyo3-base/envutil"
 	"github.com/abagile/tokyo3-base/journal"
-	"github.com/abagile/tokyo3-base/journal/jetstream"
 	btls "github.com/abagile/tokyo3-base/tls"
 	"github.com/abagile/tokyo3-base/version"
 	"github.com/spf13/cobra"
@@ -271,43 +257,16 @@ func runServe(ctx context.Context) error {
 		hostStore = mtlsStore
 	}
 
-	// SessionTracker subscribes to ssh-proxyd's ssh_audit stream and
-	// powers the /sessions page. The same source feeds the
-	// /audit page's tracker alongside certd's own audit stream so
-	// operators see both streams in one viewer.
-	sshAuditSrcForSessions, err := openSSHAuditSource(log)
-	if err != nil {
-		return fmt.Errorf("ssh-audit source (sessions): %w", err)
-	}
-	sessionTracker, err := newSessionTracker(log, sshAuditSrcForSessions)
-	if err != nil {
-		return fmt.Errorf("session tracker: %w", err)
-	}
-	var sessionStore portal.SessionStore
-	if sessionTracker != nil {
-		sessionStore = sessionTracker
-	}
-
-	// AuditTracker tails certd's own audit stream + (optionally)
-	// ssh-proxyd's. Both subscriptions are independent of the
-	// session tracker's so the audit page never blocks on
-	// recording.completed processing.
-	sshAuditSrcForAudit, err := openSSHAuditSource(log)
-	if err != nil {
-		return fmt.Errorf("ssh-audit source (audit): %w", err)
-	}
-	auditTracker, err := newAuditTracker(log, auditSrc, sshAuditSrcForAudit)
+	// AuditTracker tails certd's own audit stream (cert issuance,
+	// denial, revocation) for the /portal/audit viewer. The SSH
+	// data-plane's own access-audit view lives in ssh-proxyd's portal.
+	auditTracker, err := newAuditTracker(log, auditSrc)
 	if err != nil {
 		return fmt.Errorf("audit tracker: %w", err)
 	}
 	var auditStore portal.AuditStore
 	if auditTracker != nil {
 		auditStore = auditTracker
-	}
-
-	castStore, err := loadCastStore(log)
-	if err != nil {
-		return fmt.Errorf("cast store: %w", err)
 	}
 
 	var krlStore krl.Store
@@ -332,9 +291,7 @@ func runServe(ctx context.Context) error {
 		Log:             log,
 		RoleStore:       roleStore,
 		HostStore:       hostStore,
-		SessionStore:    sessionStore,
 		AuditStore:      auditStore,
-		CastStore:       castStore,
 		RevocationStore: krlStore,
 		BasicAuth: portal.BasicAuthConfig{
 			Username: os.Getenv("CERTD_PORTAL_USERNAME"),
@@ -383,13 +340,6 @@ func runServe(ctx context.Context) error {
 
 	rootCtx := rt.Ctx
 
-	if sessionTracker != nil {
-		go func() {
-			if err := sessionTracker.Run(rootCtx); err != nil && !errors.Is(err, context.Canceled) {
-				log.Warn("session tracker exited", "err", err)
-			}
-		}()
-	}
 	if auditTracker != nil {
 		go func() {
 			if err := auditTracker.Run(rootCtx); err != nil && !errors.Is(err, context.Canceled) {
@@ -724,100 +674,21 @@ func buildServerTLS(log *slog.Logger) (*tls.Config, error) {
 	return cfg, nil
 }
 
-// loadCastStore wires the asciinema cast directory the portal's
-// session-detail page replays from. When CERTD_CAST_DIR is unset,
-// returns (nil, nil) so the page hides its player and the
-// /sessions/{id}/cast endpoint returns 503.
-//
-// Typical production setup: the proxy writes casts to a directory
-// that's mounted into certd at the same absolute path (NFS export,
-// shared volume, etc.). The path the proxy embeds in
-// recording.completed events must resolve under CERTD_CAST_DIR.
-func loadCastStore(log *slog.Logger) (portal.CastStore, error) {
-	dir := os.Getenv("CERTD_CAST_DIR")
-	if dir == "" {
-		log.Warn("CERTD_CAST_DIR unset — /portal/sessions/{id}/cast disabled (player embed hidden)")
-		return nil, nil
-	}
-	store, err := portal.NewLocalCastStore(dir)
-	if err != nil {
-		return nil, err
-	}
-	log.Info("portal cast store configured", "root", store.Root())
-	return store, nil
-}
-
-// openSSHAuditSource attaches to ssh-proxyd's ssh_audit stream and
-// returns the journal source. Returns (nil, nil) when no URL is
-// configured. Stream + subject are fixed to match ssh-proxyd's audit
-// package constants. TLS material reuses the certd NATS env vars by
-// default and falls through to SSH_AUDIT-specific overrides for
-// split-broker deployments.
-func openSSHAuditSource(log *slog.Logger) (journal.Source, error) {
-	if os.Getenv("CERTD_SSH_AUDIT_URL") == "" && os.Getenv("CERTD_NATS_URL") == "" {
-		log.Warn("CERTD_SSH_AUDIT_URL unset — /portal/sessions and ssh-proxy audit disabled")
-		return nil, nil
-	}
-	url := envutil.First("CERTD_SSH_AUDIT_URL", "CERTD_NATS_URL")
-	tlsCfg, err := btls.FromFiles(
-		envutil.First("CERTD_SSH_AUDIT_CERT", "CERTD_NATS_CERT"),
-		envutil.First("CERTD_SSH_AUDIT_KEY", "CERTD_NATS_KEY"),
-		envutil.First("CERTD_SSH_AUDIT_CA", "CERTD_NATS_CA", "CERTD_WORKLOAD_CA"),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("ssh-audit source TLS: %w", err)
-	}
-	source, err := jetstream.NewSource(jetstream.SourceConfig{
-		URL:        url,
-		StreamName: "ssh_audit",
-		Subject:    "ssh.audit.events",
-		TLS:        tlsCfg,
-		Log:        log,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("ssh-audit source: %w", err)
-	}
-	log.Info("ssh-audit source configured", "url", url)
-	return source, nil
-}
-
-// newSessionTracker wraps source in the portal session tracker. nil
-// source short-circuits to nil so callers don't need to nil-check.
-func newSessionTracker(log *slog.Logger, source journal.Source) (*portal.SessionTracker, error) {
-	if source == nil {
-		return nil, nil
-	}
-	return portal.NewSessionTracker(portal.SessionTrackerConfig{
-		Source:       source,
-		SubjectLabel: "ssh.audit.events",
-		Log:          log,
-	})
-}
-
-// newAuditTracker wires the portal audit tracker across whichever
-// audit sources the operator has provided. nil sources are skipped;
-// when none remain, the tracker is also nil so the page renders 503.
-func newAuditTracker(log *slog.Logger, certdSrc, sshSrc journal.Source) (*portal.AuditTracker, error) {
-	var sources []portal.AuditSource
-	// NoopSource has nothing useful to surface — only include real
-	// JetStream attachments.
-	if _, isNoop := certdSrc.(journal.NoopSource); certdSrc != nil && !isNoop {
-		sources = append(sources, portal.AuditSource{Source: certdSrc, Label: "certd"})
-	}
-	if sshSrc != nil {
-		sources = append(sources, portal.AuditSource{Source: sshSrc, Label: "ssh-proxy"})
-	}
-	if len(sources) == 0 {
-		log.Warn("no audit streams wired — /portal/audit disabled")
+// newAuditTracker wires the portal audit tracker over certd's own
+// audit stream. A nil or NoopSource source (no NATS configured) yields
+// a nil tracker so /portal/audit renders 503.
+func newAuditTracker(log *slog.Logger, certdSrc journal.Source) (*portal.AuditTracker, error) {
+	if _, isNoop := certdSrc.(journal.NoopSource); certdSrc == nil || isNoop {
+		log.Warn("no audit stream wired — /portal/audit disabled")
 		return nil, nil
 	}
 	tracker, err := portal.NewAuditTracker(portal.AuditTrackerConfig{
-		Sources: sources,
-		Log:     log,
+		Source: certdSrc,
+		Log:    log,
 	})
 	if err != nil {
 		return nil, err
 	}
-	log.Info("audit tracker configured", "sources", len(sources))
+	log.Info("audit tracker configured")
 	return tracker, nil
 }

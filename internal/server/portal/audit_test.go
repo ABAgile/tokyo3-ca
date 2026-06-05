@@ -18,9 +18,8 @@ type stubAuditStore struct{ events []portal.AuditEvent }
 
 func (s *stubAuditStore) Events() []portal.AuditEvent { return s.events }
 
-// pushCertdEvent marshals a certd-shaped audit Entry onto the mock
-// source. Tests use this to confirm the tracker handles the certd
-// schema (Caller / Subject / IP fields, no SessionID).
+// pushCertdEvent marshals a certd audit Entry (Caller / Subject / IP /
+// Metadata) onto the mock source.
 func pushCertdEvent(t *testing.T, src *mockSource, action, caller, subject, ip string, when time.Time) {
 	t.Helper()
 	payload, _ := json.Marshal(map[string]any{
@@ -35,48 +34,16 @@ func pushCertdEvent(t *testing.T, src *mockSource, action, caller, subject, ip s
 	src.out <- journal.Msg{Seq: 1, Time: when, Data: payload}
 }
 
-// pushSshProxyEvent marshals an ssh-proxy-shaped audit Entry onto the
-// mock source. Different field names (User / Target / ClientIP) so
-// the tracker has to pick them up off the union schema.
-func pushSshProxyEvent(t *testing.T, src *mockSource, action, user, target, clientIP, sessionID string, when time.Time) {
-	t.Helper()
-	payload, _ := json.Marshal(map[string]any{
-		"id":          "evt-" + action,
-		"action":      action,
-		"user":        user,
-		"target":      target,
-		"client_ip":   clientIP,
-		"session_id":  sessionID,
-		"occurred_at": when,
-	})
-	src.out <- journal.Msg{Seq: 1, Time: when, Data: payload}
-}
-
-func TestNewAuditTracker_RequiresSources(t *testing.T) {
+func TestNewAuditTracker_RequiresSource(t *testing.T) {
 	_, err := portal.NewAuditTracker(portal.AuditTrackerConfig{})
-	if err == nil || !strings.Contains(err.Error(), "at least one source") {
+	if err == nil || !strings.Contains(err.Error(), "source is required") {
 		t.Errorf("err = %v, want source-required", err)
 	}
 }
 
-func TestNewAuditTracker_RejectsEmptyLabel(t *testing.T) {
-	_, err := portal.NewAuditTracker(portal.AuditTrackerConfig{
-		Sources: []portal.AuditSource{{Source: newMockSource(), Label: ""}},
-	})
-	if err == nil || !strings.Contains(err.Error(), "empty Label") {
-		t.Errorf("err = %v, want empty-label rejection", err)
-	}
-}
-
-func TestAuditTracker_IngestsCertdAndSshProxyShapes(t *testing.T) {
-	certdSrc := newMockSource()
-	sshSrc := newMockSource()
-	tracker, err := portal.NewAuditTracker(portal.AuditTrackerConfig{
-		Sources: []portal.AuditSource{
-			{Source: certdSrc, Label: "certd"},
-			{Source: sshSrc, Label: "ssh-proxy"},
-		},
-	})
+func TestAuditTracker_IngestsCertdEvents(t *testing.T) {
+	src := newMockSource()
+	tracker, err := portal.NewAuditTracker(portal.AuditTrackerConfig{Source: src})
 	if err != nil {
 		t.Fatalf("NewAuditTracker: %v", err)
 	}
@@ -84,49 +51,30 @@ func TestAuditTracker_IngestsCertdAndSshProxyShapes(t *testing.T) {
 	go func() { _ = tracker.Run(ctx) }()
 
 	now := time.Date(2026, 5, 26, 14, 0, 0, 0, time.UTC)
-	pushCertdEvent(t, certdSrc, "ssh.user_cert.signed", "alice@example.com", "user:alice", "10.0.0.1", now)
-	pushSshProxyEvent(t, sshSrc, "ssh.session.opened", "user:alice", "db-1.prod:22", "10.0.0.1", "sess-abc", now.Add(time.Second))
+	pushCertdEvent(t, src, "ssh.user_cert.signed", "alice@example.com", "user:alice", "10.0.0.1", now)
 
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		if events := tracker.Events(); len(events) == 2 {
-			// Newest-first across both sources.
-			if events[0].Action != "ssh.session.opened" {
-				t.Errorf("newest action = %q, want ssh.session.opened (ssh-proxy is +1s)", events[0].Action)
+		if events := tracker.Events(); len(events) == 1 {
+			e := events[0]
+			// certd event: Actor = Caller, Subject = Subject, IP = IP.
+			if e.Actor != "alice@example.com" || e.Subject != "user:alice" || e.IP != "10.0.0.1" {
+				t.Errorf("certd fields: actor=%q subject=%q ip=%q", e.Actor, e.Subject, e.IP)
 			}
-			// ssh-proxy event normalized: Actor = User, Subject = Target, IP = ClientIP.
-			if events[0].Actor != "user:alice" || events[0].Subject != "db-1.prod:22" || events[0].IP != "10.0.0.1" {
-				t.Errorf("ssh-proxy normalization: actor=%q subject=%q ip=%q",
-					events[0].Actor, events[0].Subject, events[0].IP)
-			}
-			if events[0].SessionID != "sess-abc" {
-				t.Errorf("SessionID = %q", events[0].SessionID)
-			}
-			if events[0].Source != "ssh-proxy" {
-				t.Errorf("Source = %q, want ssh-proxy", events[0].Source)
-			}
-			// certd event normalized: Actor = Caller, Subject = Subject, IP = IP.
-			if events[1].Actor != "alice@example.com" || events[1].Subject != "user:alice" {
-				t.Errorf("certd normalization: actor=%q subject=%q",
-					events[1].Actor, events[1].Subject)
-			}
-			if events[1].Source != "certd" {
-				t.Errorf("Source = %q, want certd", events[1].Source)
-			}
-			if !strings.Contains(events[1].Detail, "eng-prod") {
-				t.Errorf("certd Detail not preserved: %q", events[1].Detail)
+			if !strings.Contains(e.Detail, "eng-prod") {
+				t.Errorf("certd Detail not preserved: %q", e.Detail)
 			}
 			return
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Errorf("tracker did not ingest 2 events; got=%v", tracker.Events())
+	t.Errorf("tracker did not ingest the event; got=%v", tracker.Events())
 }
 
 func TestAuditTracker_SortsNewestFirst(t *testing.T) {
 	src := newMockSource()
 	tracker, _ := portal.NewAuditTracker(portal.AuditTrackerConfig{
-		Sources: []portal.AuditSource{{Source: src, Label: "certd"}},
+		Source: src,
 	})
 	ctx := t.Context()
 	go func() { _ = tracker.Run(ctx) }()
@@ -155,7 +103,7 @@ func TestAuditTracker_SortsNewestFirst(t *testing.T) {
 func TestAuditTracker_BoundedByMaxEvents(t *testing.T) {
 	src := newMockSource()
 	tracker, _ := portal.NewAuditTracker(portal.AuditTrackerConfig{
-		Sources:   []portal.AuditSource{{Source: src, Label: "certd"}},
+		Source:    src,
 		MaxEvents: 3,
 	})
 	ctx := t.Context()
@@ -180,7 +128,7 @@ func TestAuditTracker_BoundedByMaxEvents(t *testing.T) {
 func TestAuditTracker_SkipsMalformedAndIncompleteEvents(t *testing.T) {
 	src := newMockSource()
 	tracker, _ := portal.NewAuditTracker(portal.AuditTrackerConfig{
-		Sources: []portal.AuditSource{{Source: src, Label: "certd"}},
+		Source: src,
 	})
 	ctx := t.Context()
 	go func() { _ = tracker.Run(ctx) }()
@@ -211,7 +159,6 @@ func TestPortal_AuditIndex_RendersList(t *testing.T) {
 	when := time.Date(2026, 5, 26, 14, 0, 0, 0, time.UTC)
 	store := &stubAuditStore{events: []portal.AuditEvent{
 		{
-			Source:     "certd",
 			Action:     "ssh.user_cert.signed",
 			Actor:      "alice@example.com",
 			Subject:    "user:alice",
@@ -220,12 +167,11 @@ func TestPortal_AuditIndex_RendersList(t *testing.T) {
 			Detail:     `{"role":"eng-prod"}`,
 		},
 		{
-			Source:     "ssh-proxy",
-			Action:     "ssh.channel.rejected",
-			Actor:      "user:bob",
-			Subject:    "db-1:22",
+			Action:     "x509.workload_cert.rollback_rejected",
+			Actor:      "spiffe://tokyo3/authd/agent",
+			Subject:    "spiffe://tokyo3/authd/db-app",
 			OccurredAt: when.Add(time.Second),
-			Reason:     "policy denied principal 'bob' for db-1",
+			Detail:     `{"presented_serial":"deadbeef"}`,
 		},
 	}}
 	p, _ := portal.New(portal.Config{Version: "v", AuditStore: store, Now: time.Now})
@@ -235,14 +181,12 @@ func TestPortal_AuditIndex_RendersList(t *testing.T) {
 	body := getBody(t, srv.URL+"/audit")
 	for _, want := range []string{
 		`<h1>Audit</h1>`,
-		`<code>certd</code>`,
-		`<code>ssh-proxy</code>`,
 		`<code>ssh.user_cert.signed</code>`,
-		`<code>ssh.channel.rejected</code>`,
+		`<code>x509.workload_cert.rollback_rejected</code>`,
 		`alice@example.com`,
-		`db-1:22`,
-		`policy denied principal`,
-		`eng-prod`, // from the certd detail blob
+		`spiffe://tokyo3/authd/db-app`,
+		`eng-prod`,         // from the first detail blob
+		`presented_serial`, // from the second detail blob
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("body missing %q\n--- body ---\n%s", want, body)

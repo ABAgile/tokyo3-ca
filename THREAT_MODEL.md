@@ -68,9 +68,8 @@ Threats:
 | 5 | Mass cert minting (DoS or stockpiling)                                              | Rate limiting NOT implemented at the API layer — relies on the operator's edge (load balancer / WAF). Documented as a residual risk.                                                                                       |
 | 6 | Cross-site forgery against the portal                                               | `validateCSRF` (`portal/csrf.go`) enforces double-submit-cookie on every POST. SameSite=Lax + constant-time compare. Tests in `csrf_test.go`.                                                                              |
 | 7 | Cross-tenant access via portal                                                      | Optional HTTP Basic gate (`portal/auth.go`); operators front the portal with an identity-aware edge (oauth2-proxy, OIDC) in multi-user deployments. Single-admin Basic auth is the documented default.                     |
-| 8 | Path traversal in `/portal/sessions/{id}/cast`                                      | `LocalCastStore.Open` (`portal/cast.go`) resolves the cast path via `filepath.EvalSymlinks` and refuses anything outside `CERTD_CAST_DIR`. Test `TestLocalCastStore_RejectsTraversal` pins the guard.                       |
-| 9 | Revocation set disclosure to attackers                                              | Both `/api/v1/ssh/revocations` and `/api/v1/ssh/krl.spec` go through `Server.authenticate`. Residual: a compromised caller can scrape the set — accepted because the revocation list isn't itself a secret.                |
-| 10| Audit log loss masking a breach                                                     | `audit.Append` failures are logged at warn but do not block the request. Residual: if NATS is down + an attacker exploits a sign endpoint, the event is lost. Operators must alert on broker unavailability.               |
+| 8 | Revocation set disclosure to attackers                                              | Both `/api/v1/ssh/revocations` and `/api/v1/ssh/krl.spec` go through `Server.authenticate`. Residual: a compromised caller can scrape the set — accepted because the revocation list isn't itself a secret.                |
+| 9 | Audit log loss masking a breach                                                     | `audit.Append` failures are logged at warn but do not block the request. Residual: if NATS is down + an attacker exploits a sign endpoint, the event is lost. Operators must alert on broker unavailability.               |
 
 ### S2. signer.Signer (CA key custody)
 **Surface:** the CA private key.
@@ -86,8 +85,7 @@ Threats:
 
 ### S3. Audit publish
 **Surface:** NATS JetStream stream `ca_audit` with subject
-`ca.audit.events`. ssh-proxyd consumers (and the portal /audit
-page) read from it.
+`ca.audit.events`. The portal /audit page reads from it.
 
 Threats:
 

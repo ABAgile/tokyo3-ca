@@ -20,8 +20,8 @@ This repo ships two binaries:
 exposes the full HTTP API (SSH user / host / X.509 sign + revoke +
 revocations + KRL spec), runs OIDC and mTLS caller auth, applies
 role-table policy, publishes audit to NATS JetStream, and serves
-the admin portal (roles CRUD, hosts list, sessions + asciinema
-replay, audit tail, revocations). `cert-agentd run` renews the
+the admin portal (roles CRUD, hosts list, audit tail, revocations).
+`cert-agentd run` renews the
 workload X.509 cert at 60% TTL with KMS-style abstraction
 support, optionally renews additional client certs for sibling
 processes (`CERT_AGENTD_WORKLOADS_FILE` — per-cert SPIFFE URI, TTL,
@@ -282,30 +282,17 @@ internal/
   exposes a form to revoke certs interactively (rendered Revoker
   field is `"portal"`).
 
-- **Audit viewer (live, multi-stream).** `portal.AuditTracker`
-  subscribes to N audit streams concurrently and normalizes each
-  event into a common `AuditEvent` shape — both ssh-proxy's
-  `audit.Entry` (user/target/client_ip/session_id) and certd's
-  (caller/subject/ip) collapse onto the same actor/subject/ip
-  columns, with the source labeled per row. `/portal/audit` renders
-  newest-first across all sources (default cap 500). Denial events
-  surface the policy reason inline; everything else shows the raw
-  metadata blob in a collapsed `<details>` block.
+- **Audit viewer (live).** `portal.AuditTracker` tails certd's own
+  `ca_audit` stream into a bounded ring (`caller`/`subject`/`ip` per
+  event). `/portal/audit` renders newest-first (default cap 500); each
+  row's metadata blob expands in a collapsed `<details>` block.
 
-- **Session list + replay.** Set `CERTD_SSH_AUDIT_URL` (or rely on the
-  `CERTD_NATS_URL` fallback) and certd subscribes to ssh-proxyd's
-  `ssh_audit` stream, decoding each `recording.completed` event into a
-  bounded in-memory ring. `/portal/sessions` renders the recent
-  sessions (newest first) with user, target, remote login, duration,
-  and the cast file path; clicking a session ID opens
-  `/portal/sessions/{id}` with an asciinema-player embed (loaded from
-  the asciinema-player CDN) wired to `/portal/sessions/{id}/cast`.
-  The replay endpoint streams the raw cast through a `LocalCastStore`
-  rooted at `CERTD_CAST_DIR` — paths outside that root are refused
-  with 403, sealing off the file-system attack surface a hostile
-  `recording.completed` payload would otherwise open. The ring caps
-  at `DefaultMaxSessions` (200); older sessions age out and have to
-  be queried directly from JetStream.
+- **SSH session + access views live in ssh-proxyd, not here.** The
+  recorded-session list, asciinema replay, **and** the SSH-access audit
+  viewer are all served by ssh-proxyd's own portal (it produces the
+  recordings and owns the `ssh_audit` stream). certd's `/portal/audit`
+  shows only certd's own cert-lifecycle events — it no longer subscribes
+  to ssh-proxyd's stream.
 
 - **Host registry viewer.** Set `CERTD_MTLS_PRINCIPALS_FILE` and the
   portal's `/portal/hosts` page lists every registered workload mTLS

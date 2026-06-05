@@ -134,7 +134,6 @@ func TestPortal_Index_RendersLandingPage(t *testing.T) {
 		"v0.0.1-test",
 		"2026-05-26T12:00:00Z", // RFC3339 from the fixed clock
 		"Roles",
-		"Sessions",
 		"Audit",
 		"Hosts",
 	} {
@@ -145,7 +144,7 @@ func TestPortal_Index_RendersLandingPage(t *testing.T) {
 	// Planned pages do NOT get clickable links — only "ready" ones do.
 	// Every entry on the scaffold is "planned", so no anchors should
 	// appear pointing at the page paths.
-	for _, planned := range []string{`href="/roles"`, `href="/sessions"`, `href="/audit"`, `href="/hosts"`} {
+	for _, planned := range []string{`href="/roles"`, `href="/audit"`, `href="/hosts"`} {
 		if strings.Contains(body, planned) {
 			t.Errorf("planned page has clickable link: %s", planned)
 		}

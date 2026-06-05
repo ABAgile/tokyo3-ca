@@ -45,9 +45,7 @@ host that needs renewable credentials.
 4. **Seed the role table.** Write `CERTD_ROLES_FILE` as a JSON array of `policy.Role` objects (see `internal/server/policy/policy.go` for the struct shape).
 5. **Seed the workload registry.** Write `CERTD_MTLS_PRINCIPALS_FILE` as a JSON array of `mtls.Principal` (Name, SAN, Groups).
 6. **Hook NATS** for audit publish: `CERTD_NATS_URL` + the per-stream TLS env vars. Without it the audit stream is a no-op (dev only).
-7. **Subscribe to ssh-proxy's audit stream** for the portal session list: `CERTD_SSH_AUDIT_URL` (falls back to `CERTD_NATS_URL`).
-8. **Point the cast root at the same mount** ssh-proxy writes to: `CERTD_CAST_DIR`. Without this the portal session-detail page can't replay.
-9. **Set portal credentials.** `CERTD_PORTAL_USERNAME` + `CERTD_PORTAL_PASSWORD` if no upstream identity-aware proxy is in front; otherwise leave both empty and trust the edge.
+7. **Set portal credentials.** `CERTD_PORTAL_USERNAME` + `CERTD_PORTAL_PASSWORD` if no upstream identity-aware proxy is in front; otherwise leave both empty and trust the edge. (The SSH session + access-audit views live in ssh-proxyd's own portal — certd's `/portal/audit` shows only certd's `ca_audit` events.)
 
 Start the binary, hit `https://certd/healthz` to confirm it bound,
 and follow with `/portal/` to confirm the auth gate behaves as
@@ -263,15 +261,6 @@ edit ca_audit --max-age 1y` (or whatever your retention SLO is).
 certd's `StreamMaxAge` constant only governs the bootstrap config;
 operator changes after first run live in the broker.
 
-### Diagnose "/portal/sessions can't replay"
-
-Common causes, in order of likelihood:
-
-1. **`CERTD_CAST_DIR` not configured** — page shows "cast store is not configured". Set the env var to the same path ssh-proxy writes to.
-2. **Cast root mismatch** — the proxy writes to `/var/lib/ssh-proxyd/casts` but certd reads from a different mount. `/portal/sessions/{id}/cast` returns 403. Align the paths.
-3. **No PTY** — the session ran without `pty-req` (typical for `scp` or non-interactive `ssh user@host command`). No cast file exists; UI says "session was not PTY-recorded".
-4. **Stale session out of ring** — the in-memory session tracker caps at 200; older sessions return 404. Query the `ssh_audit` JetStream stream directly for older records.
-
 ## 4. cert-agentd operational notes
 
 ### First-run bootstrap
@@ -355,7 +344,7 @@ hostname + chain verification still run inside the callback.
 | NATS subject `ssh.audit.events`        | Tail for every SSH session lifecycle event                 |
 | certd structured logs                  | INFO on every successful sign; WARN on audit failures      |
 | cert-agentd structured logs            | INFO on each renewal; WARN on certd-unreachable bursts     |
-| Portal `/audit` page                   | Combined view of certd + ssh-proxy events                  |
+| Portal `/audit` page                   | certd's own cert issuance / denial / revocation events     |
 
 ## 6. Known limitations
 
@@ -365,7 +354,5 @@ hostname + chain verification still run inside the callback.
   Restart certd to pick up changes.
 - **In-memory revocation store** — restart clears it; back via
   audit-log replay or a future persistent backend.
-- **Portal session list caps at 200** — older sessions need
-  JetStream tail.
 - **No per-org rate limiting** at the API. Front certd with a
   rate-limiting edge if needed.
