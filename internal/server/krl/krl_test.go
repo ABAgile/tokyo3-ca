@@ -2,7 +2,6 @@ package krl_test
 
 import (
 	"errors"
-	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -141,16 +140,6 @@ func TestInMemoryStore_Revoke_AppendsTimestampWhenAbsent(t *testing.T) {
 		t.Errorf("Revoked = %v, want within [%v, %v]", got, before, after)
 	}
 }
-
-// SortedSlice is a tiny helper used to compare snapshot orderings
-// in a stable way without pulling in cmp/cmpopts.
-func sortedSlice(xs []uint64) []uint64 {
-	out := append([]uint64(nil), xs...)
-	slices.Sort(out)
-	return out
-}
-
-var _ = sortedSlice // keep helper compiled even if a future test stops using it
 
 func TestInMemoryStore_MarshalSpec_EmptyHasHeaderAndMarker(t *testing.T) {
 	s := krl.NewInMemoryStore()
