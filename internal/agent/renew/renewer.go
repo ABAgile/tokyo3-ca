@@ -36,6 +36,9 @@ import (
 // an httptest server.
 type Signer interface {
 	SignWorkloadCert(ctx context.Context, req client.SignWorkloadRequest) (*client.SignWorkloadResponse, error)
+	// AdoptCert acks that the just-issued cert is durably persisted, letting
+	// certd's guard collapse the one-step grace for this identity.
+	AdoptCert(ctx context.Context, spiffeURI, serial string) (bool, error)
 }
 
 // KeyType selects the algorithm for a workload's locally-generated
@@ -259,6 +262,12 @@ func (r *Renewer) SignOnce(ctx context.Context) (validAfter, validBefore time.Ti
 		"valid_before", resp.ValidBefore,
 		"cert_path", r.cfg.CertOutputPath,
 	)
+	// Ack adoption now that the new cert is durably on disk: certd drops the
+	// serial we rotated from, shrinking the reuse-acceptance window. Best-
+	// effort — a failure just leaves the one-step grace in place.
+	if _, err := r.cfg.Signer.AdoptCert(ctx, resp.SPIFFEURI, resp.Serial); err != nil {
+		r.cfg.Log.Warn("adopt cert (best-effort)", "spiffe_uri", resp.SPIFFEURI, "err", err)
+	}
 	if r.cfg.OnRenewed != nil {
 		r.cfg.OnRenewed(resp.ValidAfter, resp.ValidBefore)
 	}

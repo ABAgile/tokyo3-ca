@@ -58,3 +58,17 @@ func (s *activeCertStore) Lock(identity, offendingSerial string) error {
 		nowRFC3339(), serial, identity)
 	return err
 }
+
+// AdoptCurrent satisfies [store.ActiveCertStore]: collapse the one-step grace
+// only when serial is the current serial and the row isn't locked.
+func (s *activeCertStore) AdoptCurrent(identity, serial string) (bool, error) {
+	res, err := s.db.ExecContext(context.Background(),
+		`UPDATE active_workload_cert SET previous_serial = NULL, previous_not_after = NULL
+		 WHERE identity = $1 AND current_serial = $2 AND locked_at IS NULL`,
+		identity, serial)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
+}

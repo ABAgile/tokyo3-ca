@@ -358,6 +358,42 @@ func RunActiveCertStoreSuite(t *testing.T, newStore func(t *testing.T) store.Act
 			t.Errorf("Lock absent: %v, want nil", err)
 		}
 	})
+
+	t.Run("AdoptCurrent", func(t *testing.T) {
+		as := newStore(t)
+		if err := as.Upsert(store.ActiveCert{Identity: "id", CurrentSerial: "9", CurrentNotAfter: cur, PreviousSerial: "8", PreviousNotAfter: prev}); err != nil {
+			t.Fatal(err)
+		}
+		// Wrong serial (not current) collapses nothing.
+		if ok, err := as.AdoptCurrent("id", "8"); err != nil || ok {
+			t.Fatalf("Adopt non-current: ok=%v err=%v, want false/nil", ok, err)
+		}
+		if got, _, _ := as.Get("id"); got.PreviousSerial != "8" {
+			t.Errorf("previous collapsed by a non-current adopt: %q", got.PreviousSerial)
+		}
+		// Current serial collapses the grace to a single serial.
+		if ok, err := as.AdoptCurrent("id", "9"); err != nil || !ok {
+			t.Fatalf("Adopt current: ok=%v err=%v, want true/nil", ok, err)
+		}
+		got, _, _ := as.Get("id")
+		if got.PreviousSerial != "" || !got.PreviousNotAfter.IsZero() {
+			t.Errorf("previous not collapsed: serial=%q not_after=%v", got.PreviousSerial, got.PreviousNotAfter)
+		}
+		if got.CurrentSerial != "9" {
+			t.Errorf("current mutated by adopt: %q", got.CurrentSerial)
+		}
+		// A locked identity is not collapsible.
+		if err := as.Lock("id", "666"); err != nil {
+			t.Fatal(err)
+		}
+		if ok, _ := as.AdoptCurrent("id", "9"); ok {
+			t.Error("Adopt collapsed a locked row")
+		}
+		// Absent identity is a benign no-op.
+		if ok, err := as.AdoptCurrent("ghost", "1"); err != nil || ok {
+			t.Errorf("Adopt absent: ok=%v err=%v, want false/nil", ok, err)
+		}
+	})
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────

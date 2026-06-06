@@ -109,6 +109,13 @@ type ActiveCertStore interface {
 	// denied until the row is cleared with Delete. A no-op if the row is
 	// absent (the guard only locks an identity that already has a record).
 	Lock(identity, offendingSerial string) error
+	// AdoptCurrent collapses the one-step grace: it clears previous_serial /
+	// previous_not_after for the identity IFF serial is its recorded current
+	// serial and the row is not locked. Returns whether a row was collapsed
+	// (false when serial isn't current, the row is absent, or it's locked).
+	// The agent calls it once it has durably persisted the current cert,
+	// shrinking the window the rotated-from serial stays acceptable.
+	AdoptCurrent(identity, serial string) (bool, error)
 }
 
 // ── roles ──────────────────────────────────────────────────────────────

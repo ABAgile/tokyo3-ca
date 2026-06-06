@@ -164,6 +164,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /api/v1/ssh/sign-host", s.handleSignHostCert)
 	mux.HandleFunc("POST /api/v1/x509/sign-workload", s.handleSignX509WorkloadCert)
 	mux.HandleFunc("GET /api/v1/x509/trust-bundle", s.handleTrustBundle)
+	mux.HandleFunc("POST /api/v1/x509/adopt", s.handleAdoptX509)
 	mux.HandleFunc("POST /api/v1/ssh/revoke", s.handleRevoke)
 	mux.HandleFunc("GET /api/v1/ssh/revocations", s.handleRevocations)
 	mux.HandleFunc("GET /api/v1/ssh/krl.spec", s.handleRevocationsSpec)

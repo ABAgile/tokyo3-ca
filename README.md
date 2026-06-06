@@ -462,7 +462,12 @@ internal/
   emitting `x509.workload_cert.reenroll`; it auto-heals within one cert
   TTL. A **locked** identity does *not* auto-heal — an operator clears its
   `active_workload_cert` row to reset (OPERATIONS.md *Recover a locked
-  workload identity*). Off entirely without a store. Refresh-token-rotation
+  workload identity*). **Adoption ack:** once cert-agentd has durably
+  persisted a renewed cert it calls `POST /api/v1/x509/adopt` with the new
+  serial, and certd collapses the grace (drops `previous`) — shrinking the
+  window the rotated-from serial stays acceptable from "until the next
+  renewal" to "until the ack" (best-effort; a missed ack just leaves the
+  one-step grace). Off entirely without a store. Refresh-token-rotation
   + reuse-detection, applied to certs — see `certd-store-design.md`.
   CSRF protection on every POST: each GET sets a `certd_csrf`
   cookie (256 bits of entropy, `SameSite=Lax`, `Secure` over HTTPS)

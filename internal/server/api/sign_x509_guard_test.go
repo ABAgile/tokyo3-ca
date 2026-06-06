@@ -61,6 +61,19 @@ func (f *fakeActiveCerts) Lock(id, offendingSerial string) error {
 	return nil
 }
 
+func (f *fakeActiveCerts) AdoptCurrent(id, serial string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	ac, ok := f.m[id]
+	if !ok || !ac.LockedAt.IsZero() || ac.CurrentSerial != serial {
+		return false, nil
+	}
+	ac.PreviousSerial = ""
+	ac.PreviousNotAfter = time.Time{}
+	f.m[id] = ac
+	return true, nil
+}
+
 func (f *fakeActiveCerts) current(id string) store.ActiveCert {
 	f.mu.Lock()
 	defer f.mu.Unlock()

@@ -20,10 +20,19 @@ import (
 
 // stubSigner is the [renew.Signer] test double.
 type stubSigner struct {
-	mu     sync.Mutex
-	calls  atomic.Int32
-	gotReq client.SignWorkloadRequest
-	respFn func(client.SignWorkloadRequest) (*client.SignWorkloadResponse, error)
+	mu           sync.Mutex
+	calls        atomic.Int32
+	gotReq       client.SignWorkloadRequest
+	respFn       func(client.SignWorkloadRequest) (*client.SignWorkloadResponse, error)
+	adoptedURI   string // last AdoptCert(spiffeURI, …)
+	adoptedSeria string // last AdoptCert(…, serial)
+}
+
+func (s *stubSigner) AdoptCert(_ context.Context, spiffeURI, serial string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.adoptedURI, s.adoptedSeria = spiffeURI, serial
+	return true, nil
 }
 
 func (s *stubSigner) SignWorkloadCert(_ context.Context, req client.SignWorkloadRequest) (*client.SignWorkloadResponse, error) {
@@ -94,6 +103,11 @@ func TestRenewer_SignOnce_GeneratesKeyAndWritesCert(t *testing.T) {
 	va, vb, err := r.SignOnce(context.Background())
 	if err != nil {
 		t.Fatalf("SignOnce: %v", err)
+	}
+
+	// The renewer acks adoption of the freshly-persisted cert.
+	if signer.adoptedURI != "spiffe://tokyo3.example/host/db-1" || signer.adoptedSeria != "1" {
+		t.Errorf("adopt not acked: uri=%q serial=%q", signer.adoptedURI, signer.adoptedSeria)
 	}
 
 	// Cert and key both landed on disk.

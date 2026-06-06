@@ -101,6 +101,33 @@ func (c *Client) SignWorkloadCert(ctx context.Context, req SignWorkloadRequest) 
 	return &out, nil
 }
 
+// AdoptRequest is the body of POST /api/v1/x509/adopt — a workload telling
+// certd it has durably persisted the cert with Serial so certd can collapse
+// the one-step rotation grace (drop previous) for SPIFFEURI.
+type AdoptRequest struct {
+	SPIFFEURI string `json:"spiffe_uri"`
+	Serial    string `json:"serial"`
+}
+
+// AdoptResponse reports whether the grace was collapsed (false is benign —
+// the serial wasn't current, or the identity is unknown/locked).
+type AdoptResponse struct {
+	Adopted bool `json:"adopted"`
+}
+
+// AdoptCert acks adoption of a freshly-persisted cert: certd drops the
+// rotated-from serial from the acceptance window for spiffeURI when serial is
+// its current serial. Best-effort — a non-2xx surfaces as an error the caller
+// can log and ignore (the grace simply stays one step wider).
+func (c *Client) AdoptCert(ctx context.Context, spiffeURI, serial string) (bool, error) {
+	var out AdoptResponse
+	if err := c.api.R(ctx, http.MethodPost, "/api/v1/x509/adopt", &out,
+		api.RO.WithBody(AdoptRequest{SPIFFEURI: spiffeURI, Serial: serial})); err != nil {
+		return false, fmt.Errorf("adopt: %w", err)
+	}
+	return out.Adopted, nil
+}
+
 // TrustBundleResponse mirrors certd's GET /api/v1/x509/trust-bundle reply.
 // Bundle is PEM and may hold multiple CERTIFICATE blocks (old⊕new during a
 // CA rotation overlap).
