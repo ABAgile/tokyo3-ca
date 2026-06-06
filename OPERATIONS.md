@@ -295,18 +295,67 @@ one-step-previous one **while the recorded cert is still valid**, the
 reuse-detection guard escalates: it stamps `locked_at` + `locked_serial`
 on the `active_workload_cert` row and denies that identity on **every**
 subsequent sign request — past expiry too — emitting
-`x509.workload_cert.locked` (alert on this; it usually means a stolen
-key pair, or a botched bootstrap over stale state). Recovery is a
-deliberate operator action: investigate, then clear the row (no
-API/portal control today — direct DB op):
+`x509.workload_cert.locked`. The lock is a deliberate **halt-and-
+investigate** signal; it does not auto-heal, so "wait it out" is not a
+recovery path. Triage → clear certd state → reset the agent only as far
+as needed.
+
+**0. Investigate (don't reflexively clear).** Pull the
+`x509.workload_cert.locked` event(s) from the audit stream — they carry
+`presented_serial`, `locked_serial`, `current_serial`, `previous_serial`,
+`locked_at`, and the caller. Decide which case you're in:
+- **Theft / clone** — the offending serial came from a host that
+  shouldn't hold this identity (two live holders).
+- **Benign** — the agent reverted to an old cert: VM snapshot/backup
+  restore, deployment rollback, a baked-in stale `svid.pem`, clock skew,
+  or re-bootstrapping over a *retained* database.
+
+**1. Clear the certd-side state.** Deleting the row clears the lock
+**and** the serial chain, so the next request is a clean first-enrollment
+(there is no partial "unlock that keeps continuity"):
 
 ```sql
 DELETE FROM active_workload_cert WHERE identity = 'spiffe://<trust-domain>/<path>';
 ```
 
-Same statement on the sqlite dev backend. The next sign request for that
-identity is then a fresh first-enrollment. (Deleting the row is also how
-you reset the leftover-state case above.)
+Direct DB op (no API/portal control yet); same statement on the sqlite
+dev backend. This also resets the leftover-state bootstrap case above.
+
+**2. Reset the agent — only as much as needed.** While locked, the agent
+keeps retrying (each 403 is a sign failure → retry on
+`CERT_AGENTD`'s backoff), so recovery depends on its on-disk cert:
+- **Benign + `svid.pem` still TLS-valid** → nothing on the agent. Its
+  next retry hits the now-empty record, re-enrolls, and the renewer
+  overwrites `svid.pem`. Bounce the agent only to skip the wait.
+- **Lock outlived the cert TTL** (it couldn't renew while locked, so
+  `svid.pem` expired and can no longer complete the mTLS handshake to
+  reach the sign endpoint) → **re-bootstrap + restart**:
+  ```sh
+  certd ca issue-workload --spiffe-uri spiffe://<trust-domain>/<path> \
+    --ca-cert issuer.crt --kms-key …  \
+    --out-cert svid.pem --out-key svid.key --bundle-out svid_bundle.pem
+  ```
+  drop `svid.{pem,key}` onto the host (the agent's writable `/certs` /
+  `agent_state`) and restart cert-agentd.
+- **Confirmed theft** → treat the key as compromised: re-bootstrap with a
+  **fresh keypair** (the command above generates one — do *not* keep the
+  old `svid.key`), restart, and remediate the source host. Keep workload
+  TTLs short — the lock halts *new* issuance, but a stolen leaf stays
+  usable until its own TTL lapses (there is no X.509 workload-revocation
+  list in this repo; short TTL + the lock are the containment).
+
+**3. Fix the root cause for benign re-locks.** If something keeps making
+the agent present a stale serial — a snapshot-restore loop, a read-only
+image with a baked old cert, clock skew — clearing the row only helps
+until the next renewal re-locks it. Fix the source (give the agent a
+writable `svid.pem`, stop restoring stale state).
+
+**Ordering:** clear the row **before** re-bootstrapping — a locked row
+denies the agent regardless of which cert it presents, so a fresh
+bootstrap cert won't take until the lock is gone. **Verify:** a fresh
+`x509.workload_cert.signed` for the identity, a clean renewal log, and a
+new `current_serial` with no `locked_at`. **Dev rig:** `make clean-all`
+(then `make gen-certs && make docker-up`) is the full from-scratch reset.
 
 ### Revoke a cert (immediate)
 
