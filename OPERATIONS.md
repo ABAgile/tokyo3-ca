@@ -179,7 +179,12 @@ Rotating the **issuer cert** over the **same** key is cheap: a new
 self-signed cert with the same public key still validates every
 existing leaf (chains verify against the key, not the cert bytes).
 Re-mint with `certd ca bootstrap --force` and distribute — no bundle,
-no reissuance.
+no reissuance. **No restart, either:** certd hot-reloads
+`CERTD_CA_X509_CERT_FILE` (it refuses a cert whose key doesn't match
+the live signing key, so only a same-key re-mint is accepted) and
+`CERTD_API_CLIENT_CA`. Distribution is pull-based too — agents that set
+`CERT_AGENTD_TRUST_BUNDLE_PATH` fetch the refreshed bundle from
+`GET /api/v1/x509/trust-bundle` on their own cadence.
 
 Rotating the **key** is the disruptive operation. `certd ca rotate`
 mints the new issuer cert from the new key and emits an overlap trust
@@ -192,6 +197,13 @@ certd ca rotate --key new-ca.key --out issuer-new.crt \
 # once all old-key leaves have expired, drop the old cert:
 certd ca bundle --out trust-bundle.crt issuer-new.crt
 ```
+
+The `CERTD_API_CLIENT_CA` widen→narrow and the served trust bundle both
+hot-reload (and agents auto-pull), so the only restart a key rotation
+still needs is the one that swaps certd onto the new **signing key**
+(`CERTD_CA_KMS_KEY` / `CERTD_CA_KEY_FILE`) — the signing key is loaded
+once at boot, and the issuer reloader deliberately refuses a new-key
+issuer until that restart so chains never break mid-flight.
 
 See *Rotate the CA key* below for the full cutover sequence.
 

@@ -87,6 +87,18 @@
 //	CERT_AGENTD_NATS_KEY    Matching private key. Defaults to CERT_AGENTD_WORKLOAD_KEY.
 //	CERT_AGENTD_NATS_CA     CA bundle that signs the NATS server cert. Defaults to
 //	                        CERT_AGENTD_WORKLOAD_CA.
+//
+// Optional trust-bundle pull (keeps the CA anchor fresh through a rotation,
+// the trust counterpart to leaf renewal):
+//
+//	CERT_AGENTD_TRUST_BUNDLE_PATH             When set, the agent periodically GETs certd's
+//	                                          /api/v1/x509/trust-bundle and writes it atomically
+//	                                          here (the anchor it + provisioned siblings verify
+//	                                          certd-issued peers against). Unset ⇒ feature off.
+//	                                          A fetch/write error keeps the on-disk bundle (fail-
+//	                                          safe); unchanged bundles are not rewritten.
+//	CERT_AGENTD_TRUST_BUNDLE_REFRESH_SECONDS  Pull cadence. Default 3600 (anchors rotate rarely).
+//
 //	CERT_AGENTD_INSTANCE    Per-host identifier appended to the NATS subject and added as an
 //	                        "instance" log attribute on every line. Defaults to os.Hostname().
 //	                        Operators may override when hostnames aren't stable (e.g.,
@@ -264,6 +276,13 @@ func runAgent(ctx context.Context) error {
 		return fmt.Errorf("ssh-config snippet: %w", err)
 	}
 
+	// Optional trust-bundle refresher: pull certd's CA bundle on a schedule
+	// and write it to CERT_AGENTD_TRUST_BUNDLE_PATH (nil when unset).
+	trustBundleRefresher, err := buildTrustBundleRefresher(certdClient, log)
+	if err != nil {
+		return fmt.Errorf("trust-bundle refresher: %w", err)
+	}
+
 	// Derive a cancellable child of rt.Ctx so one component's exit
 	// unwinds the others (cancel() in the collector loop below); rt.Ctx
 	// itself is cancelled on signal/shutdown by rt.Shutdown.
@@ -283,6 +302,9 @@ func runAgent(ctx context.Context) error {
 	}
 	if userRenewer != nil {
 		runners = append(runners, userRenewer.Run)
+	}
+	if trustBundleRefresher != nil {
+		runners = append(runners, trustBundleRefresher)
 	}
 	for _, wr := range workloadRenewers {
 		runners = append(runners, wr.Run)

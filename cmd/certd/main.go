@@ -25,7 +25,9 @@
 //	CERTD_API_CLIENT_CA  Optional CA PEM for verifying inbound mTLS client certs (mesh
 //	                     workloads); falls back to CERTD_WORKLOAD_CA. When set, client certs are
 //	                     validated against the bundle (VerifyClientCertIfGiven mode). Both unset
-//	                     ⇒ client-cert verification off.
+//	                     ⇒ client-cert verification off. Hot-reloaded: the bundle is re-read
+//	                     (mtime-gated, keep-last-good on a bad file) on every handshake, so a CA
+//	                     rotation can widen it to old⊕new and later narrow it with no restart.
 //
 //	CERTD_WORKLOAD_CA  CA PEM that signs every internal workload cert certd connects to (NATS,
 //	                   future DB). Used as the fallback for CERTD_NATS_CA when that var is
@@ -46,7 +48,14 @@
 //	                         key. SSH needs no issuer cert — clients trust the key's public half
 //	                         via TrustedUserCAKeys. When unset, certd self-signs one at startup
 //	                         from the CA signing key — dev only; production should pin a stable
-//	                         cert so consumers can verify the chain.
+//	                         cert so consumers can verify the chain. When set, hot-reloaded:
+//	                         a same-key re-mint (expiry refresh) is picked up live. A cert whose
+//	                         public key does NOT match the signing key is refused (kept on the
+//	                         old issuer + logged) — a signing-KEY rotation still needs a restart.
+//	CERTD_CA_TRUST_BUNDLE    PEM served as-is at GET /api/v1/x509/trust-bundle so workloads can
+//	                         pull the current trust anchor (old⊕new during a rotation overlap).
+//	                         Defaults to CERTD_CA_X509_CERT_FILE; read per request; unauthenticated
+//	                         (CA certs are public). Empty ⇒ the endpoint returns 503.
 //	CERTD_CA_X509_CERT_CN    Subject CN for the self-signed startup CA cert. Default
 //	                         "tokyo3-ca".
 //
@@ -121,7 +130,6 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
-	"encoding/pem"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -239,7 +247,7 @@ func runServe(ctx context.Context) error {
 		return fmt.Errorf("mtls store: %w", err)
 	}
 
-	x509IssuerCert, err := loadOrGenerateX509Issuer(log, caSigner)
+	x509IssuerCert, x509IssuerReload, err := loadX509Issuer(log, caSigner)
 	if err != nil {
 		return fmt.Errorf("x509 issuer cert: %w", err)
 	}
@@ -304,18 +312,20 @@ func runServe(ctx context.Context) error {
 	}
 
 	srv, err := api.New(api.Config{
-		Log:             log,
-		CASigner:        caSigner,
-		X509IssuerCert:  x509IssuerCert,
-		Policy:          policyEngine,
-		OIDCVerifier:    oidcVerifier,
-		MTLSStore:       mtlsStore,
-		Audit:           auditSink,
-		AuditSource:     auditSrc,
-		Portal:          portalSrv,
-		KRL:             krlStore,
-		ActiveCertStore: activeCerts,
-		Version:         Version,
+		Log:              log,
+		CASigner:         caSigner,
+		X509IssuerCert:   x509IssuerCert,
+		X509IssuerReload: x509IssuerReload,
+		TrustBundlePath:  envutil.Or("CERTD_CA_TRUST_BUNDLE", os.Getenv("CERTD_CA_X509_CERT_FILE")),
+		Policy:           policyEngine,
+		OIDCVerifier:     oidcVerifier,
+		MTLSStore:        mtlsStore,
+		Audit:            auditSink,
+		AuditSource:      auditSrc,
+		Portal:           portalSrv,
+		KRL:              krlStore,
+		ActiveCertStore:  activeCerts,
+		Version:          Version,
 	})
 	if err != nil {
 		return fmt.Errorf("api server: %w", err)
@@ -433,37 +443,31 @@ func loadOIDCVerifier(_ context.Context, log *slog.Logger) (oidc.TokenVerifier, 
 	return v, nil
 }
 
-// loadOrGenerateX509Issuer returns the CA cert used as the issuer
-// for X.509 / SPIFFE workload issuance. When CERTD_CA_X509_CERT_FILE
-// is set, the cert is loaded from PEM at that path; otherwise certd
-// self-signs a fresh cert at startup using the existing CA signer.
-// The self-signed path is dev-only — production deployments should
-// pin trust to a stable, externally-issued cert.
-func loadOrGenerateX509Issuer(log *slog.Logger, caSigner signer.Signer) (*x509.Certificate, error) {
+// loadX509Issuer returns the CA cert used as the issuer for X.509 / SPIFFE
+// workload issuance, plus an optional hot-reload getter. When
+// CERTD_CA_X509_CERT_FILE is set, the cert is loaded from PEM at that path
+// behind a pemReloader, and the returned getter yields the live cert so an
+// operator's same-key re-mint is picked up without a restart (the reloader
+// refuses a new-key issuer — see issuerLoader). When unset, certd self-signs
+// a fresh cert at startup (dev only) and the getter is nil (fixed issuer).
+func loadX509Issuer(log *slog.Logger, caSigner signer.Signer) (*x509.Certificate, func() *x509.Certificate, error) {
 	if path := os.Getenv("CERTD_CA_X509_CERT_FILE"); path != "" {
-		data, err := os.ReadFile(path)
+		rl, err := newPEMReloader(path, "X.509 issuer cert", log, issuerLoader(caSigner.Public()))
 		if err != nil {
-			return nil, fmt.Errorf("read %s: %w", path, err)
+			return nil, nil, fmt.Errorf("CERTD_CA_X509_CERT_FILE: %w", err)
 		}
-		block, _ := pem.Decode(data)
-		if block == nil || block.Type != "CERTIFICATE" {
-			return nil, fmt.Errorf("%s does not contain a CERTIFICATE PEM block", path)
-		}
-		cert, err := x509.ParseCertificate(block.Bytes)
-		if err != nil {
-			return nil, fmt.Errorf("parse %s: %w", path, err)
-		}
-		log.Info("x509 issuer ready", "source", "file", "path", path, "cn", cert.Subject.CommonName)
-		return cert, nil
+		cert := rl.get()
+		log.Info("x509 issuer ready", "source", "file", "path", path, "cn", cert.Subject.CommonName, "hot_reload", true)
+		return cert, rl.get, nil
 	}
 	cn := envutil.Or("CERTD_CA_X509_CERT_CN", "tokyo3-ca")
 	cert, err := x509engine.NewSelfSignedCA(rand.Reader, caSigner, cn)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	log.Warn("CERTD_CA_X509_CERT_FILE unset — generated self-signed CA cert at startup (not for production)",
 		"cn", cn, "not_after", cert.NotAfter)
-	return cert, nil
+	return cert, nil, nil
 }
 
 // loadMTLSStore returns the workload-identity registry parsed from
@@ -658,17 +662,23 @@ func buildServerTLS(log *slog.Logger) (*tls.Config, error) {
 	}
 
 	if clientCAFile != "" {
-		data, err := os.ReadFile(clientCAFile)
+		caRL, err := newPEMReloader(clientCAFile, "API client CA bundle", log, loadCAPool)
 		if err != nil {
-			return nil, fmt.Errorf("read CERTD_API_CLIENT_CA: %w", err)
+			return nil, fmt.Errorf("CERTD_API_CLIENT_CA: %w", err)
 		}
-		pool, err := btls.CertPoolFromPEM(data)
-		if err != nil {
-			return nil, fmt.Errorf("parse CERTD_API_CLIENT_CA: %w", err)
-		}
-		cfg.ClientCAs = pool
 		cfg.ClientAuth = tls.VerifyClientCertIfGiven
-		log.Info("tls: mTLS client CA loaded", "ca", clientCAFile)
+		cfg.ClientCAs = caRL.get()
+		// Re-read the bundle (mtime-gated) on every handshake so a rotation
+		// widen→narrow lands with no certd restart. A per-handshake config is
+		// the only way to swap ClientCAs live; keep-last-good on a bad
+		// drop-in is handled inside the reloader.
+		cfg.GetConfigForClient = func(*tls.ClientHelloInfo) (*tls.Config, error) {
+			c := cfg.Clone()
+			c.GetConfigForClient = nil
+			c.ClientCAs = caRL.get()
+			return c, nil
+		}
+		log.Info("tls: mTLS client CA loaded (hot-reload)", "ca", clientCAFile)
 	}
 
 	return cfg, nil

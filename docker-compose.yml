@@ -392,6 +392,13 @@ services:
       # sibling workloads it provisions use to verify their certd-issued peers.
       CERT_AGENTD_NATS_URL: tls://nats:4222
       CERT_AGENTD_NATS_CA: /certs/certd-x509-ca.crt
+      # Pull-based trust-bundle refresh: periodically GET certd's
+      # /api/v1/x509/trust-bundle and rewrite the local anchor, so a certd CA
+      # rotation propagates without an out-of-band push. Points at the same
+      # file the agent + provisioned siblings verify peers against. In this
+      # rig the anchor is stable, so it's a no-op steady state (the fetch
+      # matches and skips the write) — it exercises the path end to end.
+      CERT_AGENTD_TRUST_BUNDLE_PATH: /certs/certd-x509-ca.crt
     healthcheck:
       # No HTTP surface — probe via filesystem mtime instead.
       # Renewals fire every ~72 s; if the cert hasn't been touched in

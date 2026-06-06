@@ -101,6 +101,26 @@ func (c *Client) SignWorkloadCert(ctx context.Context, req SignWorkloadRequest) 
 	return &out, nil
 }
 
+// TrustBundleResponse mirrors certd's GET /api/v1/x509/trust-bundle reply.
+// Bundle is PEM and may hold multiple CERTIFICATE blocks (old⊕new during a
+// CA rotation overlap).
+type TrustBundleResponse struct {
+	Bundle string `json:"trust_bundle"`
+}
+
+// FetchTrustBundle pulls certd's current X.509 trust bundle (the anchor
+// workloads verify certd-issued peers against). Lets an agent refresh the
+// bundle on a schedule instead of waiting for an out-of-band push — the
+// endpoint is unauthenticated public material, but the call still rides the
+// client's TLS channel to certd.
+func (c *Client) FetchTrustBundle(ctx context.Context) (string, error) {
+	var out TrustBundleResponse
+	if err := c.api.R(ctx, http.MethodGet, "/api/v1/x509/trust-bundle", &out); err != nil {
+		return "", fmt.Errorf("trust-bundle: %w", err)
+	}
+	return out.Bundle, nil
+}
+
 // SignUserRequest mirrors certd's POST /api/v1/ssh/sign-user body.
 // Keep in sync with the certd handler — fields drift here silently
 // turn into 400s.

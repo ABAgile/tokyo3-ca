@@ -203,6 +203,24 @@ container healthcheck and host `curl` work without a client cert):
 curl -s https://localhost:8443/healthz     # → 200 (ca_pubkey_hash, audit_active)
 ```
 
+**Trust-bundle pull + hot-reload.** certd serves its current trust
+anchor at `GET /api/v1/x509/trust-bundle` (`CERTD_CA_TRUST_BUNDLE`,
+default = the issuer file; unauthenticated — CA certs are public). The
+agent pulls it on a schedule when `CERT_AGENTD_TRUST_BUNDLE_PATH` is set
+(the rig points it at `/certs/certd-x509-ca.crt`) and rewrites the
+anchor atomically, so a CA rotation propagates without an out-of-band
+push — the trust counterpart to leaf renewal. certd itself hot-reloads
+`CERTD_API_CLIENT_CA` (per handshake) and a same-key `CERTD_CA_X509_CERT_FILE`
+re-mint (per sign), keep-last-good on a bad drop-in; a new-key issuer is
+refused live (restart after a signing-key rotation). See OPERATIONS.md §3
+"Rotation note".
+
+```sh
+docker compose exec cert-agentd \
+  wget -qO- --no-check-certificate https://certd:8443/api/v1/x509/trust-bundle
+#   → {"trust_bundle":"-----BEGIN CERTIFICATE-----\n…"}
+```
+
 **Postgres (certd's store, mTLS by default).** certd uses the
 `postgres` service as its persistent backend (`CERTD_DATABASE_URL`) —
 the role table, mTLS principal registry, KRL, and the X.509

@@ -57,7 +57,8 @@ type signX509Response struct {
 }
 
 func (s *Server) handleSignX509WorkloadCert(w http.ResponseWriter, r *http.Request) {
-	if s.x509IssuerCert == nil {
+	issuerCert := s.issuerCert()
+	if issuerCert == nil {
 		writeError(w, http.StatusServiceUnavailable, "x509 issuance not configured (no CA cert)")
 		return
 	}
@@ -182,7 +183,7 @@ func (s *Server) handleSignX509WorkloadCert(w http.ResponseWriter, r *http.Reque
 	}
 
 	now := time.Now().UTC()
-	cert, err := x509engine.SignWorkloadCert(rand.Reader, s.caSigner, s.x509IssuerCert, x509engine.WorkloadCertParams{
+	cert, err := x509engine.SignWorkloadCert(rand.Reader, s.caSigner, issuerCert, x509engine.WorkloadCertParams{
 		PublicKey:         pub,
 		SPIFFEURI:         spiffeURI,
 		SubjectCommonName: req.SubjectCommonName,
