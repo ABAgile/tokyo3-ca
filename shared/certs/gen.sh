@@ -66,33 +66,40 @@ mkc_server() {
   ok
 }
 
-mkc_client() {
-  local name=$1; shift
-  step "$name (client cert)"
-  mkcert -client -cert-file "$OUT/$name.crt" -key-file "$OUT/$name.key" "$@" >/dev/null 2>&1
+# certd_leaf NAME CN EKU SAN...
+# Self-issues a leaf cert signed by the certd CA signing key, so it chains to
+# certd-x509-ca.crt — the SINGLE CA for all internal mTLS (nats + postgres,
+# both server and client certs, and every workload identity). Runs offline
+# with no certd process — exactly the "self-issued bootstrap" path in
+# OPERATIONS.md, which is what lets certd present a client cert to its own
+# dependencies before any certd is up to issue one. NAME → $OUT/NAME.{crt,key}
+# (Ed25519, matching the CA key); EKU is serverAuth or clientAuth; the SAN args
+# are openssl SAN entries (DNS:…, IP:…, URI:spiffe://…). MUST be called AFTER
+# the signing key + issuer cert exist.
+certd_leaf() {
+  local name=$1 cn=$2 eku=$3; shift 3
+  step "$name (certd-issued, $eku)"
+  local san="$1"; shift
+  for s in "$@"; do san="$san,$s"; done
+  openssl genpkey -algorithm ed25519 -out "$OUT/$name.key" >/dev/null 2>&1
+  chmod 600 "$OUT/$name.key"
+  openssl req -new -key "$OUT/$name.key" -subj "/CN=$cn" -out "$TMP/$name.csr" >/dev/null 2>&1
+  openssl x509 -req -in "$TMP/$name.csr" \
+    -CA "$OUT/certd-x509-ca.crt" -CAkey "$OUT/certd-signing.key" -CAcreateserial \
+    -days 3650 -out "$OUT/$name.crt" \
+    -extfile <(printf 'basicConstraints = CA:FALSE\nkeyUsage = critical, digitalSignature\nextendedKeyUsage = %s\nsubjectAltName = %s\n' "$eku" "$san") \
+    >/dev/null 2>&1
+  chmod 644 "$OUT/$name.crt"
   ok
 }
 
-# ── X.509 leaf certs ─────────────────────────────────────────────────────────
-# certd serves HTTPS on localhost:8443 (host) and certd:8443 (compose net).
+# ── certd HTTPS server cert (mkcert) ─────────────────────────────────────────
+# certd's PUBLIC API cert is the ONE exception to the single-CA rule: it stays
+# mkcert-signed so `curl https://localhost:8443/healthz` works from the host
+# with no --cacert (mkcert's root is in the OS trust store), and cert-agentd
+# verifies the API via ca.crt. Everything ELSE (the internal nats/postgres
+# mesh) is certd-issued — see the certd_leaf block after the issuer cert below.
 mkc_server "certd"        certd  localhost  127.0.0.1
-
-# cert-agentd's bootstrap client cert. Renewed in place by cert-agentd
-# itself once it starts; the mkcert-signed copy here is only the
-# bootstrap credential. The renewed cert is signed by certd's own
-# signing key (not mkcert's root), which is why the rig leaves
-# CERTD_API_CLIENT_CA unset in docker-compose.yml.
-#
-# -ecdsa keeps the bootstrap key EC, not mkcert's default RSA. The agent
-# reuses this key as its workload key (renewer.go ensureKey loads it from
-# disk on first sign), so an RSA bootstrap key would mean RSA workload mTLS
-# handshakes — the cost RSA was dropped from the renewer's key *generation*
-# to avoid. The loader (parsePrivateKeyPEM) actually accepts any
-# crypto.Signer incl. RSA, so this is a throughput/consistency choice, not a
-# hard parse requirement; mkcert can't emit Ed25519, so ECDSA is the EC
-# option. (Set the agent's CERT_AGENTD_ROTATE_KEY to stop reusing the
-# bootstrap key — it then mints a fresh workload key each renewal.)
-mkc_client "cert-agentd"  -ecdsa  spiffe://demo/workload/cert-agentd  cert-agentd
 
 # ── certd's CA signing key (X.509 + SSH) ─────────────────────────────────────
 # One Ed25519 key signs everything certd issues: X.509/SPIFFE workload
@@ -145,6 +152,41 @@ else
     -addext "keyUsage=critical,keyCertSign,cRLSign,digitalSignature" >/dev/null 2>&1
   ok
 fi
+
+# ── Internal mTLS mesh certs (certd-issued, chain to certd-x509-ca.crt) ───────
+# Every cert below is signed by the CA key above, so the ONE anchor
+# certd-x509-ca.crt verifies them all — no per-channel CA bundle. Servers
+# (nats, postgres) and clients alike: NATS's --tlscacert, Postgres's
+# ssl_ca_file, and each client's server-verify CA are all certd-x509-ca.crt.
+# Self-issued here (offline) so the services that connect at boot — certd to
+# NATS + Postgres, before any runtime issuance exists — already hold a cert
+# the mesh trusts.
+TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+
+# Server certs (serverAuth). SANs cover the compose hostname + loopback.
+certd_leaf "nats"      nats      serverAuth  DNS:nats      DNS:localhost  IP:127.0.0.1
+certd_leaf "postgres"  postgres  serverAuth  DNS:postgres  DNS:localhost  IP:127.0.0.1
+
+# Client certs (clientAuth). For Postgres `cert` auth the CN MUST equal the
+# connecting role; NATS has no per-subject auth, so its CNs are cosmetic.
+certd_leaf "certd-nats"  certd  clientAuth  URI:spiffe://demo/workload/certd-nats
+certd_leaf "natsbox"     natsbox  clientAuth  URI:spiffe://demo/workload/natsbox
+# certd's Postgres client identity — CN=certd authenticates as the "certd"
+# superuser role (POSTGRES_USER) that owns certd's own store.
+certd_leaf "certd-db"    certd  clientAuth  URI:spiffe://demo/workload/certd-db
+# cert-agentd's bootstrap client cert. certd-issued (not mkcert) so it
+# authenticates to NATS from its very first connection; cert-agentd reuses the
+# KEY as its workload key and renews the cert in place — runtime-renewed certs
+# are signed by the same CA, so the anchor never changes. (Set the agent's
+# CERT_AGENTD_ROTATE_KEY to mint a fresh key each renewal instead of reusing
+# this one.)
+#
+# Its SAN is the agent's REAL workload identity (spiffe://tokyo3/authd/agent),
+# NOT a demo/workload/* placeholder — that's the principal certd's inbound
+# mTLS auth maps to groups (shared/policy/principals.json), and it's the same
+# SAN the renewed cert carries (CERT_AGENTD_SPIFFE_URI), so the agent
+# authenticates by the same principal on its first request and every renewal.
+certd_leaf "cert-agentd"  cert-agentd  clientAuth  URI:spiffe://tokyo3/authd/agent
 
 echo ""
 echo "dev TLS material written to ./shared/certs/"

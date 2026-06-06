@@ -36,22 +36,22 @@ host that needs renewable credentials.
 
 1. **Generate or import the CA key.**
    - Dev: `openssl genpkey -algorithm ed25519 -out ca.key`; `CERTD_CA_KEY_FILE=ca.key`.
-   - Prod: provision an asymmetric SIGN_VERIFY key in your KMS (AWS KMS, GCP KMS, Vault Transit, or HSM); set `CERTD_CA_KMS_KEY` (the AWS binding is compiled in by default). See **§2.1 Production CA bootstrap (KMS)** below.
-1b. **Pin a persistent X.509 issuer cert.** Set `CERTD_CA_X509_CERT_FILE` to a stable self-signed CA cert over the signing key. **Do not skip this in production:** when unset, certd self-signs a *fresh, ephemeral* issuer at every boot, so previously-issued leaf certs stop chain-validating after a restart. This cert (not the API server cert, not the SSH CA pubkey) is the trust anchor every workload pins to verify a certd-issued mTLS peer. See §2.1 for minting it with a KMS key.
-2. **Configure mTLS for the API.**
+   - Prod: provision an asymmetric SIGN_VERIFY key in your KMS (AWS KMS, GCP KMS, Vault Transit, or HSM); set `CERTD_CA_KMS_KEY` (the AWS binding is compiled in by default). See **§3 Production CA bootstrap (KMS)** below.
+2. **Pin a persistent X.509 issuer cert.** Set `CERTD_CA_X509_CERT_FILE` to a stable self-signed CA cert over the signing key. **Do not skip this in production:** when unset, certd self-signs a *fresh, ephemeral* issuer at every boot, so previously-issued leaf certs stop chain-validating after a restart. This cert (not the API server cert, not the SSH CA pubkey) is the trust anchor every workload pins to verify a certd-issued mTLS peer. See §3 for minting it with a KMS key.
+3. **Configure mTLS for the API.**
    - `CERTD_API_CERT` + `CERTD_API_KEY` = the server certificate the workloads validate (a TLS *server* cert with a DNS SAN — typically from your platform CA / cert-manager, **not** from certd itself).
-   - `CERTD_API_CLIENT_CA` = the CA bundle the *inbound* workload client certs are signed by (i.e. certd's own issuer cert from step 1b, once agents present certd-issued mTLS identities).
-3. **Provision OIDC verification** (humans-and-OIDC path) via `CERTD_OIDC_ISSUER` + matching JWKS reachability.
-4. **Seed the role table.** Write `CERTD_ROLES_FILE` as a JSON array of `policy.Role` objects (see `internal/server/policy/policy.go` for the struct shape).
-5. **Seed the workload registry.** Write `CERTD_MTLS_PRINCIPALS_FILE` as a JSON array of `mtls.Principal` (Name, SAN, Groups).
-6. **Hook NATS** for audit publish: `CERTD_NATS_URL` + the per-stream TLS env vars. Without it the audit stream is a no-op (dev only).
-7. **Set portal credentials.** `CERTD_PORTAL_USERNAME` + `CERTD_PORTAL_PASSWORD` if no upstream identity-aware proxy is in front; otherwise leave both empty and trust the edge. (The SSH session + access-audit views live in ssh-proxyd's own portal — certd's `/portal/audit` shows only certd's `ca_audit` events.)
+   - `CERTD_API_CLIENT_CA` = the CA bundle the *inbound* workload client certs are signed by (i.e. certd's own issuer cert from step 2, once agents present certd-issued mTLS identities).
+4. **Provision OIDC verification** (humans-and-OIDC path) via `CERTD_OIDC_ISSUER` + matching JWKS reachability.
+5. **Seed the role table.** Write `CERTD_ROLES_FILE` as a JSON array of `policy.Role` objects (see `internal/server/policy/policy.go` for the struct shape).
+6. **Seed the workload registry.** Write `CERTD_MTLS_PRINCIPALS_FILE` as a JSON array of `mtls.Principal` (Name, SAN, Groups).
+7. **Hook NATS** for audit publish: `CERTD_NATS_URL` + the per-stream TLS env vars. Without it the audit stream is a no-op (dev only).
+8. **Set portal credentials.** `CERTD_PORTAL_USERNAME` + `CERTD_PORTAL_PASSWORD` if no upstream identity-aware proxy is in front; otherwise leave both empty and trust the edge. (The SSH session + access-audit views live in ssh-proxyd's own portal — certd's `/portal/audit` shows only certd's `ca_audit` events.)
 
 Start the binary, hit `https://certd/healthz` to confirm it bound,
 and follow with `/portal/` to confirm the auth gate behaves as
 expected.
 
-## 2.1 Production CA bootstrap (KMS)
+## 3. Production CA bootstrap (KMS)
 
 The CA has **two** pieces of key material, and they are not the same
 object:
@@ -119,11 +119,13 @@ options:
   The adapter handles pubkey parse, algorithm/message-type selection, and
   ctx/timeout. Standard AWS credential resolution applies (IRSA / env /
   profile / IMDS). Cost: ~+4.4 MiB of binary for the SDK; a future
-  `-tags` split can make it optional for non-KMS deployments. Key spec:
-  AWS KMS supports **Ed25519** (`ECC_NIST_EDWARDS25519`, since 2025-11 —
-  certd's default, so the CA key type carries over unchanged), plus
-  `ECC_NIST_P256` and RSA. GCP KMS lacks Ed25519 — use ECDSA P-256 there. Budget for KMS latency + throttling on the issuance hot
-  path (only the public key is cached, which the adapter does).
+  `-tags` split can make it optional for non-KMS deployments.
+
+  Key spec: AWS KMS supports **Ed25519** (`ECC_NIST_EDWARDS25519`, since
+  2025-11 — certd's default, so the CA key type carries over unchanged),
+  plus `ECC_NIST_P256` and RSA; GCP KMS lacks Ed25519, so use ECDSA P-256
+  there. Budget for KMS latency + throttling on the issuance hot path —
+  only the public key is cached, which the adapter does.
 
   Other backends (GCP KMS, Vault Transit, PKCS#11 HSM): implement the
   two-method `kms.Client` and register it the same way — see
@@ -145,14 +147,14 @@ signing key performs exactly **one** `Sign` to create it. The
 and `x509engine.NewSelfSignedCA` path `serve` uses:
 
 ```sh
-# Model B (file key): runs as-is against the shipped binary.
-certd ca bootstrap --key /run/tokyo3-ca/ca.key --cn "tokyo3-ca prod" \
-  --out /etc/tokyo3-ca/issuer.crt
-
-# Model A (KMS): the SAME command on a KMS-bound build. The key never
-# leaves KMS; this is its one Sign.
+# Model A (KMS): the key never leaves KMS; this is its one Sign.
 certd ca bootstrap --kms-key arn:aws:kms:us-east-1:111:key/abc \
   --cn "tokyo3-ca prod" --out /etc/tokyo3-ca/issuer.crt
+
+# Model B (file key): the SAME command against the shipped binary,
+# pointing at the decrypted key file instead.
+certd ca bootstrap --key /run/tokyo3-ca/ca.key --cn "tokyo3-ca prod" \
+  --out /etc/tokyo3-ca/issuer.crt
 ```
 
 Run it once per CA generation and commit the resulting cert to config
@@ -162,7 +164,7 @@ Model B you can equivalently `openssl req -x509 -new -key <decrypted>.key
 
 ### Step 4 — wire and distribute
 
-1. `CERTD_CA_KEY_FILE` (Model B) **or** `CERTD_CA_KMS_KEY` on a KMS-bound build (Model A).
+1. `CERTD_CA_KMS_KEY` on a KMS-bound build (Model A) **or** `CERTD_CA_KEY_FILE` (Model B).
 2. `CERTD_CA_X509_CERT_FILE=/etc/tokyo3-ca/issuer.crt` — the cert from step 3.
 3. Push `issuer.crt` to **every workload's trust bundle** (`CERT_AGENTD_WORKLOAD_CA` on agents; `AUTH_DB_CA` / `AUTH_NATS_CA` / `AUTH_WORKLOAD_CA` etc. on consumers) so they validate certd-issued peers. This is a *different* file from the bundle that verifies certd's HTTPS server cert.
 4. Verify the chain before going live:
@@ -193,7 +195,7 @@ certd ca bundle --out trust-bundle.crt issuer-new.crt
 
 See *Rotate the CA key* below for the full cutover sequence.
 
-## 3. Common scenarios
+## 4. Common scenarios
 
 ### Rotate the CA key
 
@@ -226,6 +228,43 @@ rotate without downtime:
    `ssh-tunnel-host` role).
 4. The workload's `ssh-tunneld` picks up the trust-bundle and
    starts renewing on the next cycle.
+
+### Bootstrap a workload with a self-issued mTLS cert
+
+When a workload's **first** mTLS cert is minted offline rather than
+issued through certd's sign endpoint — `openssl`-signed directly by the
+CA key (chains to the issuer cert), or from a separate bootstrap PKI —
+the first certd renewal does **not** trip the renewal/anti-theft guard.
+The common case: seeding certd's own client identity so it can reach
+Postgres / NATS over mTLS before any certd is running to issue that
+cert (the classic CA bootstrap cycle).
+
+Why it's safe: the guard keys on the per-identity row in
+`active_workload_cert` (PRIMARY KEY = the SPIFFE URI), **not** on the
+presented cert's chain or serial. A self-issued cert was never recorded
+by the sign path, so the first renewal for that SPIFFE identity finds no
+row and is processed as first enrollment — serial continuity begins at
+certd's first mint, and the offline cert's serial is never compared.
+This is chain-agnostic: it holds whether the bootstrap cert is signed by
+the CA key or by a separate bootstrap CA. (The guard only exists when
+`CERTD_DATABASE_URL` is set; with no persistent store it is inactive.)
+
+The one failure mode is a **leftover row** for that identity — you are
+re-bootstrapping over a retained database, rotated the CA but kept the
+`active_workload_cert` rows, or certd previously minted a cert for this
+identity. If that recorded cert is still inside its validity window, the
+first renewal presenting the self-issued serial is rejected with
+`403 possible clone` and an `x509.workload_cert.rollback_rejected` audit
+event. Resolve it one of two ways:
+
+- **Wait for the recorded cert to expire** — the next attempt takes the
+  auto-re-enroll path (`x509.workload_cert.reenroll`) and issues, or
+- **Clear the identity's row** (no API/portal control today — direct DB op):
+  ```sql
+  DELETE FROM active_workload_cert WHERE identity = 'spiffe://<trust-domain>/<path>';
+  ```
+  Same statement on the sqlite dev backend. A genuinely fresh bootstrap
+  database has no rows, so the clean path needs none of this.
 
 ### Revoke a cert (immediate)
 
@@ -261,7 +300,7 @@ edit ca_audit --max-age 1y` (or whatever your retention SLO is).
 certd's `StreamMaxAge` constant only governs the bootstrap config;
 operator changes after first run live in the broker.
 
-## 4. cert-agentd operational notes
+## 5. cert-agentd operational notes
 
 ### First-run bootstrap
 
@@ -334,7 +373,7 @@ hostname + chain verification still run inside the callback.
   cert can't authenticate to certd to refresh). Restart isn't
   needed but won't hurt.
 
-## 5. Monitoring hooks
+## 6. Monitoring hooks
 
 | Probe                                  | What it confirms                                           |
 |----------------------------------------|------------------------------------------------------------|
@@ -346,7 +385,7 @@ hostname + chain verification still run inside the callback.
 | cert-agentd structured logs            | INFO on each renewal; WARN on certd-unreachable bursts     |
 | Portal `/audit` page                   | certd's own cert issuance / denial / revocation events     |
 
-## 6. Known limitations
+## 7. Known limitations
 
 - **No bulk-import endpoint** for the revocation set. Use the
   `POST /api/v1/ssh/revoke` endpoint in a loop.
@@ -356,3 +395,7 @@ hostname + chain verification still run inside the callback.
   audit-log replay or a future persistent backend.
 - **No per-org rate limiting** at the API. Front certd with a
   rate-limiting edge if needed.
+- **No API/portal control to clear an active-cert record.** Resetting a
+  workload's rotation state (e.g. to re-bootstrap with a self-issued
+  cert) is a direct `DELETE FROM active_workload_cert` — see *Bootstrap a
+  workload with a self-issued mTLS cert* above.

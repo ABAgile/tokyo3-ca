@@ -35,7 +35,7 @@ runbooks), benchmark suite (`go test -bench=. -benchmem ./...`),
 CSRF + HTTP Basic auth gates on the portal, and a remote-signer
 abstraction operators wire KMS adapters against.
 
-Operational caveats are tracked in [OPERATIONS.md §6](OPERATIONS.md):
+Operational caveats are tracked in [OPERATIONS.md §7](OPERATIONS.md):
 in-memory role / mTLS-principal / revocation stores (no
 hot-reload, no persistence yet), portal session ring caps at 200,
 no per-org rate limiting at the API edge.
@@ -97,25 +97,34 @@ make clean-all                      # full reset (wipes shared/certs/* + named v
 ```
 
 **Layout.** Dev material lives under `./shared/` (mirrors the
-tokyo3-auth tree so future expansion — postgres init scripts,
-traefik configs, etc. — slots into the same shape):
+tokyo3-auth tree, so adding consumers like the Postgres rig below
+slots into the same shape):
 
 ```
 shared/
   certs/
     gen.sh                # mkcert + openssl + ssh-keygen, host-side
-    ca.crt                # mkcert root (host + container trust bundle)
-    certd.{crt,key}       # certd HTTPS server cert
-    cert-agentd.{crt,key} # bootstrap workload identity
+    ca.crt                # mkcert root — verifies certd's HTTPS API only
+    certd.{crt,key}       # certd HTTPS API server cert (mkcert-signed)
     certd-signing.key     # CA signing key, PKCS#8 PEM (signs X.509 + SSH)
     certd-signing.key.pub # OpenSSH-format CA pubkey (TrustedUserCAKeys)
-    certd-x509-ca.crt     # X.509 issuer cert → CERTD_CA_X509_CERT_FILE;
-                          #   trust anchor for certd-issued mTLS leaves
+    certd-x509-ca.crt     # X.509 issuer → CERTD_CA_X509_CERT_FILE; the ONE
+                          #   internal-mTLS CA — every cert below chains to it
+    nats.{crt,key}        # NATS TLS server cert (certd-issued)
+    postgres.{crt,key}    # postgres TLS server cert (certd-issued)
+    certd-nats.{crt,key}  # certd's NATS publisher client cert (certd-issued)
+    certd-db.{crt,key}    # certd's Postgres client cert, CN=certd (certd-issued)
+    natsbox.{crt,key}     # natsbox NATS client cert (certd-issued)
+    cert-agentd.{crt,key} # cert-agentd bootstrap workload identity (certd-issued)
   policy/                 # sample certd policy
-    roles.json            # role table → CERTD_ROLES_FILE
+    roles.json            # role table → CERTD_ROLES_FILE (seeds the DB)
     principals.json       # mTLS principal map (sample; prod mTLS path)
   agent/
     workloads.json        # extra cert-agentd workload certs → CERT_AGENTD_WORKLOADS_FILE
+  postgres/               # postgres mTLS rig (mounted at /shared/postgres)
+    pg-entrypoint.sh      # stages server-key perms + enables ssl/HBA
+    pg_hba_cert.conf      # mTLS-only HBA: hostssl cert, reject plain
+    db-init.sh            # creates the auth_app/auth_admin login roles (CN → role)
 ```
 
 **Volume model.** `make docker-up` tar-pipes `./shared/` into a
@@ -126,33 +135,44 @@ cert-agentd is the exception — it renews its own cert in place, so
 the rig copies the bootstrap material onto a separate writeable
 `agent_state` volume via the `cert-agentd-init` service on first
 boot. That way, re-running `_sync-shared` never clobbers a renewed
-cert.
+cert. The seeded material is the agent's `cert-agentd.{crt,key}` plus
+**`certd-x509-ca.crt`** (the mTLS CA) — *not* mkcert's `ca.crt`: the
+agent's own volume holds only the anchor it and the workloads it
+provisions need for mTLS. mkcert's root verifies just certd's
+HTTPS/portal endpoint, which the agent reads from `/shared`
+(`CERT_AGENTD_WORKLOAD_CA=/shared/certs/ca.crt`).
 
 **Policy & workloads (sample).** The rig enforces the
-`shared/policy/roles.json` role table (`CERTD_ROLES_FILE`): the
-`authd` group may obtain `spiffe://tokyo3/authd/*` certs (X.509 cap
-`max_x509_cert_ttl_seconds: 86400`). cert-agentd authorises via
-**body-groups** (`CERT_AGENTD_GROUPS=authd`, identity
-`spiffe://tokyo3/authd/agent`) — the dev/test path, so no client-CA
-bootstrap is needed. It provisions authd's four mTLS client certs from
+`shared/policy/roles.json` role table (`CERTD_ROLES_FILE`, which now
+*seeds* the Postgres store on first boot rather than feeding an
+in-memory table): the `authd` group may obtain `spiffe://tokyo3/authd/*`
+certs (X.509 cap `max_x509_cert_ttl_seconds: 86400`). cert-agentd
+authorises via the **mTLS principal** path: `CERTD_API_CLIENT_CA`
+verifies its client cert at the TLS layer, and
+`shared/policy/principals.json` (`CERTD_MTLS_PRINCIPALS_FILE`) maps its
+SAN `spiffe://tokyo3/authd/agent` → `["authd"]`. Both its bootstrap and
+renewed certs carry that SAN, so it authenticates as the same principal
+on the first request and every renewal — `CERT_AGENTD_GROUPS` is now an
+inert fallback (body-groups aren't consulted once principals are wired).
+It provisions authd's four mTLS client certs from
 `shared/agent/workloads.json` (`CERT_AGENTD_WORKLOADS_FILE`), all
 Ed25519, into `/certs`: `db-app` (CN `auth_app`) and `db-admin` (CN
 `auth_admin`) for Postgres cert-auth, plus `nats` and `scim`. Keys are
 stable by default (cert-only rotation); set a workload's `rotate_key`
 (or `CERT_AGENTD_ROTATE_KEY` for the agent's own cert) to regenerate the
 key each renewal — leave it off for the Postgres certs, which can't
-safely reload a rotating pair.
-`shared/policy/principals.json` ships as a sample for the production
-mTLS-principal path (`authd-agent` → `["authd"]`) but is left unwired —
-that path needs verified client certs (`CERTD_API_CLIENT_CA` /
-`CERTD_WORKLOAD_CA`), which the rig doesn't set. OIDC is also off;
-production wires OIDC + mTLS principals on top.
+safely reload a rotating pair. Both `roles.json` and `principals.json`
+*seed* the Postgres store on first boot. OIDC stays off (no human
+callers in the rig); production layers it on alongside the mTLS path.
 
-**Three CAs, don't conflate them.** The rig has three public
-trust artifacts, each for a different job:
+**One internal CA, plus two edge anchors.** Every internal mTLS link
+— certd ⇄ Postgres, certd ⇄ NATS, cert-agentd ⇄ NATS, and all provisioned
+workload certs — uses a **single** anchor, `certd-x509-ca.crt`, for both
+server and client certs. There is no per-channel CA and no bundle. The
+other two artifacts each have exactly one narrow job:
 
-- `ca.crt` — mkcert root. Verifies certd's **HTTPS server cert** and the agent's **bootstrap** cert (`CERT_AGENTD_WORKLOAD_CA`). This is the transport layer; it must stay mkcert.
-- `certd-x509-ca.crt` — certd's **X.509 issuer cert** (`CERTD_CA_X509_CERT_FILE`). The anchor a workload pins to verify a *peer whose leaf certd issued* (the `authd-*` certs above). A real Postgres/NATS consumer would mount this, not `ca.crt`.
+- `certd-x509-ca.crt` — certd's **X.509 issuer cert** (`CERTD_CA_X509_CERT_FILE`). The ONE CA for the internal mesh: NATS's `--tlscacert`, Postgres's `ssl_ca_file`, and every client's server-verify CA all point here. The nats/postgres *server* certs chain to it too, so it works in both directions. `gen.sh` self-issues the bootstrap certs (certd's own, natsbox's, cert-agentd's) offline with the CA key so they chain here from first boot.
+- `ca.crt` — mkcert root. Verifies certd's **public HTTPS API/portal cert** only (so `curl https://localhost:8443` works with no `--cacert`, and cert-agentd verifies that one hop via `CERT_AGENTD_WORKLOAD_CA`, read from `/shared`). It is *not* used for any internal mTLS link and is deliberately kept out of cert-agentd's own `/certs` volume — that holds `certd-x509-ca.crt` instead.
 - `certd-signing.key.pub` — OpenSSH-format **SSH CA** pubkey (`TrustedUserCAKeys`). SSH world only; never goes in a TLS trust bundle.
 
 Watch it work:
@@ -165,6 +185,87 @@ docker compose exec natsbox nats stream view ca_audit  # x509.workload.cert.sign
 docker compose exec cert-agentd sh -c \
   'openssl verify -CAfile /shared/certs/certd-x509-ca.crt /certs/authd-db-app.crt'
 #   → /certs/authd-db-app.crt: OK
+```
+
+**Inbound API mTLS (by default).** certd's sign endpoints authenticate
+the caller by its **verified client-cert SAN → principal** — body-groups
+and OIDC are off. The cert must chain to `certd-x509-ca.crt`
+(`CERTD_API_CLIENT_CA`) and its SAN must be a registered principal
+(`CERTD_MTLS_PRINCIPALS_FILE`); a missing cert, an unverifiable cert, or
+a verified cert whose SAN isn't a principal all yield `401`. cert-agentd's
+steady renewals — the `x509.workload_cert.signed` events in the audit
+stream above — *are* this path working end to end.
+
+`/healthz` is the one exemption (`VerifyClientCertIfGiven`, so the
+container healthcheck and host `curl` work without a client cert):
+
+```sh
+curl -s https://localhost:8443/healthz     # → 200 (ca_pubkey_hash, audit_active)
+```
+
+**Postgres (certd's store, mTLS by default).** certd uses the
+`postgres` service as its persistent backend (`CERTD_DATABASE_URL`) —
+the role table, mTLS principal registry, KRL, and the X.509
+renewal/anti-theft guard all live here. There is **no plaintext path**:
+`shared/postgres/pg_hba_cert.conf` rejects every non-TLS connection
+(`host ... reject`) and requires each TLS client to present a
+certificate whose CN matches the connecting role (`hostssl all all all
+cert`). Roles map to client certs by CN — `certd` ← `certd-db.crt`
+(certd itself, the owner/superuser), and `auth_app` ← `authd-db-app.crt`
+/ `auth_admin` ← `authd-db-admin.crt` (the certs cert-agentd provisions,
+demonstrating workload login). The service is **not** published to the
+host — reach it via `docker compose exec postgres ...`.
+
+Both directions use the one internal CA: postgres verifies connecting
+**clients** against `certd-x509-ca.crt` (`POSTGRES_SSL_CA`), and its
+**server** cert (`postgres.crt`) is certd-issued too, so clients verify
+the server against the *same* anchor (`sslrootcert` in the DSN). The
+`pg-entrypoint.sh` wrapper stages the server key with the perms+owner
+postgres demands, then starts it with `ssl=on` and the cert HBA.
+
+Because the store is on, the **renewal/anti-theft guard** is active:
+the first renewal of each provisioned identity is recorded as an
+enrollment, and later renewals must present the current/previous serial
+(the renewer reads it from the on-disk cert). A fresh DB has no rows, so
+the bootstrap (self-issued) certs enroll cleanly — see OPERATIONS.md
+*Bootstrap a workload with a self-issued mTLS cert*.
+
+```sh
+# A TLS connection without a client cert is refused — mTLS is mandatory:
+docker compose exec postgres \
+  psql 'host=postgres dbname=certd user=certd sslmode=require'
+#   → FATAL: connection requires a valid client certificate
+
+# certd's own client leaf authenticates as the certd role by CN:
+docker compose exec postgres \
+  openssl x509 -in /shared/certs/certd-db.crt -noout -subject
+#   → subject=CN = certd
+```
+
+**NATS (mTLS by default).** The NATS client port runs `--tlsverify`,
+so every publisher and consumer must present a client cert — there is
+no plaintext NATS path. Unlike a typical split-anchor setup, **one CA
+covers everything**: both the server cert (`nats.crt`) and every client
+cert are certd-issued, so `--tlscacert`, each client's server-verify CA,
+and the workload identities all resolve to `certd-x509-ca.crt`.
+
+- certd's publisher cert (`certd-nats.crt`) and `natsbox`'s cert are
+  self-issued offline by `gen.sh` (they connect at boot, before any
+  runtime issuance exists), so they already chain to the CA.
+- `cert-agentd` reuses its own workload cert as its NATS identity
+  (`CERT_AGENTD_NATS_CERT` defaults to it). It's certd-issued from the
+  bootstrap cert onward and stays certd-issued across renewals, so the
+  single anchor never needs a second entry.
+
+The monitoring port (`8222`) stays plaintext HTTP for the healthcheck.
+
+```sh
+# certd + cert-agentd ship logs and audit over mTLS; tail them via the
+# TLS context natsbox saved on boot (no extra flags needed):
+docker compose exec natsbox nats stream view ca_audit
+# A plaintext client is refused at the handshake — mTLS is mandatory:
+docker compose exec natsbox nats --server nats://nats:4222 stream ls
+#   → nats: error: ... tls: first record does not look like a TLS handshake
 ```
 
 **Streams.** `natsbox` provisions two JetStream streams on boot:
