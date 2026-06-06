@@ -13,7 +13,7 @@ import (
 // can fail closed.
 func (s *activeCertStore) Get(identity string) (store.ActiveCert, bool, error) {
 	row := s.db.QueryRowContext(context.Background(),
-		`SELECT `+store.ActiveCertColumns+` FROM active_workload_cert WHERE identity = $1`, identity)
+		`SELECT `+store.ActiveCertSelectColumns+` FROM active_workload_cert WHERE identity = $1`, identity)
 	ac, err := store.ScanActiveCert(row)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
@@ -43,5 +43,18 @@ func (s *activeCertStore) Upsert(ac store.ActiveCert) error {
 func (s *activeCertStore) Delete(identity string) error {
 	_, err := s.db.ExecContext(context.Background(),
 		`DELETE FROM active_workload_cert WHERE identity = $1`, identity)
+	return err
+}
+
+// Lock satisfies [store.ActiveCertStore]: stamp locked_at (now) +
+// locked_serial on the identity. A no-op on a missing row (0 rows updated).
+func (s *activeCertStore) Lock(identity, offendingSerial string) error {
+	var serial any
+	if offendingSerial != "" {
+		serial = offendingSerial
+	}
+	_, err := s.db.ExecContext(context.Background(),
+		`UPDATE active_workload_cert SET locked_at = $1, locked_serial = $2 WHERE identity = $3`,
+		nowRFC3339(), serial, identity)
 	return err
 }

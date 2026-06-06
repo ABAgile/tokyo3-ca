@@ -27,7 +27,7 @@ type AuditEvent struct {
 	ID string
 
 	// Action is the dotted event name (e.g., "ssh.user_cert.signed",
-	// "x509.workload_cert.rollback_rejected").
+	// "x509.workload_cert.locked").
 	Action string
 
 	// OccurredAt is the producer-side timestamp.

@@ -325,6 +325,39 @@ func RunActiveCertStoreSuite(t *testing.T, newStore func(t *testing.T) store.Act
 			t.Errorf("Delete absent: %v, want nil (idempotent)", err)
 		}
 	})
+
+	t.Run("Lock", func(t *testing.T) {
+		as := newStore(t)
+		if err := as.Upsert(store.ActiveCert{Identity: "id", CurrentSerial: "9", CurrentNotAfter: cur}); err != nil {
+			t.Fatal(err)
+		}
+		// A fresh row is unlocked.
+		if got, _, _ := as.Get("id"); !got.LockedAt.IsZero() || got.LockedSerial != "" {
+			t.Fatalf("fresh row locked: at=%v serial=%q", got.LockedAt, got.LockedSerial)
+		}
+		// Lock stamps locked_at + the offending serial; Get reads them back.
+		if err := as.Lock("id", "666"); err != nil {
+			t.Fatalf("Lock: %v", err)
+		}
+		got, ok, err := as.Get("id")
+		if err != nil || !ok {
+			t.Fatalf("Get after lock: ok=%v err=%v", ok, err)
+		}
+		if got.LockedAt.IsZero() {
+			t.Error("locked_at not set after Lock")
+		}
+		if got.LockedSerial != "666" {
+			t.Errorf("locked_serial = %q, want 666", got.LockedSerial)
+		}
+		// The issuance columns survive the lock.
+		if got.CurrentSerial != "9" {
+			t.Errorf("current_serial mutated by Lock: %q", got.CurrentSerial)
+		}
+		// Lock on a missing identity is a no-op, not an error.
+		if err := as.Lock("ghost", "1"); err != nil {
+			t.Errorf("Lock absent: %v, want nil", err)
+		}
+	})
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────

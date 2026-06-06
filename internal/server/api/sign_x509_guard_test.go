@@ -51,6 +51,16 @@ func (f *fakeActiveCerts) Delete(id string) error {
 	return nil
 }
 
+func (f *fakeActiveCerts) Lock(id, offendingSerial string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	ac := f.m[id]
+	ac.LockedAt = time.Now()
+	ac.LockedSerial = offendingSerial
+	f.m[id] = ac
+	return nil
+}
+
 func (f *fakeActiveCerts) current(id string) store.ActiveCert {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -134,27 +144,73 @@ func TestSignX509Workload_AntiTheftGuard(t *testing.T) {
 		t.Fatalf("after rotation: current=%q previous=%q, want %q/%q", ac.CurrentSerial, ac.PreviousSerial, s2, s1)
 	}
 
-	// 3. Stale/unknown serial → 403 + rollback audit; state unchanged.
-	r3 := sign("999999999")
-	if r3.Code != http.StatusForbidden {
-		t.Fatalf("stale serial: %d, want 403", r3.Code)
+	// 3. One-step-previous serial still accepted (crash grace) → 200.
+	if r3 := sign(s1); r3.Code != http.StatusOK {
+		t.Fatalf("previous-serial grace: %d %s", r3.Code, r3.Body.String())
 	}
-	if got := guard.current(uri).CurrentSerial; got != s2 {
-		t.Errorf("state mutated on rejected rollback: current=%q", got)
+	cur := guard.current(uri).CurrentSerial
+
+	// 4. Stale/unknown serial → 403 + ESCALATION: the identity is locked
+	//    (locked_at + offending serial recorded), with a `locked` audit event.
+	r4 := sign("999999999")
+	if r4.Code != http.StatusForbidden {
+		t.Fatalf("stale serial: %d, want 403", r4.Code)
 	}
-	entries := cap.entries(t)
-	if last := entries[len(entries)-1]; last.Action != audit.ActionX509WorkloadCertRollback {
-		t.Errorf("last audit = %q, want rollback", last.Action)
+	locked := guard.current(uri)
+	if locked.LockedAt.IsZero() || locked.LockedSerial != "999999999" {
+		t.Fatalf("identity not locked on clone detection: locked_at=%v locked_serial=%q", locked.LockedAt, locked.LockedSerial)
+	}
+	if last := cap.entries(t); last[len(last)-1].Action != audit.ActionX509WorkloadCertLocked {
+		t.Errorf("last audit = %q, want locked", last[len(last)-1].Action)
 	}
 
-	// 4. One-step-previous serial still accepted (crash grace) → 200.
-	if r4 := sign(s1); r4.Code != http.StatusOK {
-		t.Fatalf("previous-serial grace: %d %s", r4.Code, r4.Body.String())
+	// 5. Once locked, even the *valid* current serial is denied (the lock
+	//    halts the workload until an operator intervenes).
+	if r5 := sign(cur); r5.Code != http.StatusForbidden {
+		t.Fatalf("locked identity should deny a valid serial: %d", r5.Code)
 	}
 
-	// 5. Empty serial once state exists → 403 (can't bypass by omission).
-	if r5 := sign(""); r5.Code != http.StatusForbidden {
-		t.Fatalf("empty serial with state: %d, want 403", r5.Code)
+	// 6. Operator clears the record (Delete) → fresh enrollment succeeds.
+	if err := guard.Delete(uri); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if r6 := sign(""); r6.Code != http.StatusOK {
+		t.Fatalf("re-enroll after clearing lock: %d %s", r6.Code, r6.Body.String())
+	}
+}
+
+// TestSignX509Workload_LockSurvivesExpiry: a locked identity stays denied even
+// after its recorded cert expires — the lock overrides the auto-re-enroll
+// path, so a detected clone can't quietly recover by waiting out the TTL.
+func TestSignX509Workload_LockSurvivesExpiry(t *testing.T) {
+	const uri = "spiffe://corp/svc/billing"
+	guard := &fakeActiveCerts{m: map[string]store.ActiveCert{
+		uri: {
+			Identity: uri, CurrentSerial: "111",
+			CurrentNotAfter: time.Now().Add(-time.Hour), // expired
+			LockedAt:        time.Now().Add(-time.Minute),
+			LockedSerial:    "999999999",
+		},
+	}}
+	srv, cap := newGuardedServer(t, guard)
+	rec := postJSON(srv, "/api/v1/x509/sign-workload", "Bearer x", map[string]any{
+		"public_key": makeSubjectPubKeyPEM(t),
+		"spiffe_uri": uri, // empty current_serial would normally re-enroll once expired
+	})
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("locked+expired should deny (no auto-re-enroll): %d", rec.Code)
+	}
+	if got := guard.current(uri).CurrentSerial; got != "111" {
+		t.Errorf("locked identity re-enrolled despite lock: current=%q", got)
+	}
+	var sawLocked bool
+	for _, e := range cap.entries(t) {
+		if e.Action == audit.ActionX509WorkloadCertLocked {
+			sawLocked = true
+		}
+	}
+	if !sawLocked {
+		t.Error("no locked audit event emitted for the already-locked denial")
 	}
 }
 

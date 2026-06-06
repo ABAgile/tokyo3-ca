@@ -167,7 +167,7 @@ func TestPortal_AuditIndex_RendersList(t *testing.T) {
 			Detail:     `{"role":"eng-prod"}`,
 		},
 		{
-			Action:     "x509.workload_cert.rollback_rejected",
+			Action:     "x509.workload_cert.locked",
 			Actor:      "spiffe://tokyo3/authd/agent",
 			Subject:    "spiffe://tokyo3/authd/db-app",
 			OccurredAt: when.Add(time.Second),
@@ -182,7 +182,7 @@ func TestPortal_AuditIndex_RendersList(t *testing.T) {
 	for _, want := range []string{
 		`<h1>Audit</h1>`,
 		`<code>ssh.user_cert.signed</code>`,
-		`<code>x509.workload_cert.rollback_rejected</code>`,
+		`<code>x509.workload_cert.locked</code>`,
 		`alice@example.com`,
 		`spiffe://tokyo3/authd/db-app`,
 		`eng-prod`,         // from the first detail blob

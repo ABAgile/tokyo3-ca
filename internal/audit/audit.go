@@ -50,11 +50,13 @@ const (
 	ActionSSHHostCertDenied      = "ssh.host_cert.denied"
 	ActionX509WorkloadCertSigned = "x509.workload_cert.signed"
 	ActionX509WorkloadCertDenied = "x509.workload_cert.denied"
-	// ActionX509WorkloadCertRollback flags a renewal that presented a
-	// serial outside the {current, previous} window for its identity — a
-	// superseded/unknown cert reappearing, i.e. a possible key-pair theft
-	// (the renewal/anti-theft guard). High-signal: alert on it.
-	ActionX509WorkloadCertRollback = "x509.workload_cert.rollback_rejected"
+	// ActionX509WorkloadCertLocked flags the reuse-detection escalation: a
+	// renewal presented a serial outside the {current, previous} window for
+	// its identity while the recorded cert was still valid — a superseded/
+	// unknown cert reappearing, i.e. a possible key-pair theft — so the
+	// identity was LOCKED. Also emitted (already_locked=true) on every later
+	// request blocked by the lock. Highest-signal event: alert on it.
+	ActionX509WorkloadCertLocked = "x509.workload_cert.locked"
 	// ActionX509WorkloadCertReenroll flags issuance that bypassed the
 	// active-cert serial check because the prior recorded cert had already
 	// expired (no valid credential in the wild ⇒ the anti-theft layer is

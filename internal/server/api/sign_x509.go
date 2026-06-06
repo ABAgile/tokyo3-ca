@@ -135,6 +135,20 @@ func (s *Server) handleSignX509WorkloadCert(w http.ResponseWriter, r *http.Reque
 			return
 		}
 		if ok {
+			// Already locked by a prior reuse-detection escalation: deny hard.
+			// Unlike the expiry path below, a locked identity does NOT auto-
+			// re-enroll — only an operator clearing the row (Delete) lifts it.
+			if !existing.LockedAt.IsZero() {
+				s.emitAudit(r.Context(), audit.ActionX509WorkloadCertLocked, "workload:"+spiffeURI, caller.Caller, 0, r, map[string]any{
+					"spiffe_uri":       spiffeURI,
+					"presented_serial": req.CurrentSerial,
+					"locked_at":        existing.LockedAt,
+					"locked_serial":    existing.LockedSerial,
+					"already_locked":   true,
+				})
+				writeError(w, http.StatusForbidden, "identity is locked after a suspected clone (reuse detected); an operator must clear its active-cert record to re-enroll")
+				return
+			}
 			presented := req.CurrentSerial
 			// A non-empty serial that is the current or previous one is a
 			// normal rotation. Empty never matches (an empty PreviousSerial
@@ -161,15 +175,21 @@ func (s *Server) handleSignX509WorkloadCert(w http.ResponseWriter, r *http.Reque
 				})
 			} else {
 				// Stale/unknown serial while the recorded cert is still
-				// valid — a superseded or fabricated cert reappearing, i.e.
-				// a possible clone. Reject and alert.
-				s.emitAudit(r.Context(), audit.ActionX509WorkloadCertRollback, "workload:"+spiffeURI, caller.Caller, 0, r, map[string]any{
+				// valid — a superseded or fabricated cert reappearing, i.e. a
+				// possible clone. ESCALATE: lock the identity so it stays
+				// denied even past expiry (no auto-re-enroll) until an operator
+				// clears the record. Lock first; deny even if the write fails.
+				if err := s.activeCerts.Lock(spiffeURI, presented); err != nil {
+					s.log.Error("active-cert guard: lock failed", "spiffe_uri", spiffeURI, "err", err)
+				}
+				s.emitAudit(r.Context(), audit.ActionX509WorkloadCertLocked, "workload:"+spiffeURI, caller.Caller, 0, r, map[string]any{
 					"spiffe_uri":       spiffeURI,
 					"presented_serial": presented,
 					"current_serial":   existing.CurrentSerial,
 					"previous_serial":  existing.PreviousSerial,
+					"escalated":        true,
 				})
-				writeError(w, http.StatusForbidden, "presented serial is not the current or previous serial for this identity (possible clone); wait for the active cert to expire to auto re-enroll, or clear the identity's active-cert record")
+				writeError(w, http.StatusForbidden, "presented serial is not the current or previous serial for this identity (possible clone); identity LOCKED — an operator must clear its active-cert record to re-enroll")
 				return
 			}
 		}

@@ -85,6 +85,15 @@ type ActiveCert struct {
 	CurrentNotAfter  time.Time
 	PreviousSerial   string
 	PreviousNotAfter time.Time
+	// LockedAt is non-zero once the identity has been locked by the
+	// reuse-detection escalation (a serial mismatch while the recorded cert
+	// was still valid — a possible clone). While locked, every sign request
+	// for the identity is denied — including past expiry, so the auto-
+	// re-enroll path does NOT fire — until an operator clears the row.
+	LockedAt time.Time
+	// LockedSerial is the offending serial that triggered the lock (the
+	// serial the suspected clone presented), kept for forensics.
+	LockedSerial string
 }
 
 // ActiveCertStore persists [ActiveCert] rows. The equality guard + reuse
@@ -95,6 +104,11 @@ type ActiveCertStore interface {
 	Get(identity string) (ActiveCert, bool, error)
 	Upsert(ac ActiveCert) error
 	Delete(identity string) error
+	// Lock escalates a reuse detection: it stamps locked_at (now) and
+	// locked_serial on the identity's row so every later sign request is
+	// denied until the row is cleared with Delete. A no-op if the row is
+	// absent (the guard only locks an identity that already has a record).
+	Lock(identity, offendingSerial string) error
 }
 
 // ── roles ──────────────────────────────────────────────────────────────
@@ -287,20 +301,28 @@ func RevocationInsertArgs(r krl.Revocation) []any {
 
 // ── active workload certs ────────────────────────────────────────────────
 
-// ActiveCertColumns is the shared column list for the active_workload_cert
-// table (excluding updated_at). Order matches [ScanActiveCert].
+// ActiveCertColumns is the column list the issuance upsert writes (excluding
+// updated_at). The lock columns are deliberately NOT here — they're mutated
+// only by Lock and read by [ActiveCertSelectColumns], never by Upsert.
 const ActiveCertColumns = `identity, current_serial, current_not_after, previous_serial, previous_not_after`
 
-// ScanActiveCert reads one row into an [ActiveCert]. previous_* are NULL
-// when the state has collapsed to a single live serial.
+// ActiveCertSelectColumns is what Get reads: the issuance columns plus the
+// lock state. Order matches [ScanActiveCert].
+const ActiveCertSelectColumns = ActiveCertColumns + `, locked_at, locked_serial`
+
+// ScanActiveCert reads one row (over [ActiveCertSelectColumns]) into an
+// [ActiveCert]. previous_* are NULL when the state has collapsed to a single
+// live serial; locked_* are NULL when the identity is not locked.
 func ScanActiveCert(sc RowScanner) (ActiveCert, error) {
 	var (
 		ac           ActiveCert
 		curNotAfter  string
 		prevSerial   sql.NullString
 		prevNotAfter sql.NullString
+		lockedAt     sql.NullString
+		lockedSerial sql.NullString
 	)
-	if err := sc.Scan(&ac.Identity, &ac.CurrentSerial, &curNotAfter, &prevSerial, &prevNotAfter); err != nil {
+	if err := sc.Scan(&ac.Identity, &ac.CurrentSerial, &curNotAfter, &prevSerial, &prevNotAfter, &lockedAt, &lockedSerial); err != nil {
 		return ActiveCert{}, err
 	}
 	t, err := time.Parse(time.RFC3339Nano, curNotAfter)
@@ -310,6 +332,16 @@ func ScanActiveCert(sc RowScanner) (ActiveCert, error) {
 	ac.CurrentNotAfter = t
 	if prevSerial.Valid {
 		ac.PreviousSerial = prevSerial.String
+	}
+	if lockedSerial.Valid {
+		ac.LockedSerial = lockedSerial.String
+	}
+	if lockedAt.Valid && lockedAt.String != "" {
+		t, err := time.Parse(time.RFC3339Nano, lockedAt.String)
+		if err != nil {
+			return ActiveCert{}, err
+		}
+		ac.LockedAt = t
 	}
 	if prevNotAfter.Valid && prevNotAfter.String != "" {
 		t, err := time.Parse(time.RFC3339Nano, prevNotAfter.String)

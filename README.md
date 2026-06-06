@@ -246,9 +246,13 @@ postgres demands, then starts it with `ssl=on` and the cert HBA.
 Because the store is on, the **renewal/anti-theft guard** is active:
 the first renewal of each provisioned identity is recorded as an
 enrollment, and later renewals must present the current/previous serial
-(the renewer reads it from the on-disk cert). A fresh DB has no rows, so
-the bootstrap (self-issued) certs enroll cleanly — see OPERATIONS.md
-*Bootstrap a workload with a self-issued mTLS cert*.
+(the renewer reads it from the on-disk cert). A mismatch while the
+recorded cert is still valid is treated as a possible clone and **locks
+the identity** until an operator clears its row (it stays denied past
+expiry — no auto-heal). A fresh DB has no rows, so the bootstrap
+(self-issued) certs enroll cleanly — see OPERATIONS.md *Bootstrap a
+workload with a self-issued mTLS cert* and *Recover a locked workload
+identity*.
 
 ```sh
 # A TLS connection without a client cert is refused — mTLS is mandatory:
@@ -443,19 +447,22 @@ internal/
 - **X.509 renewal anti-theft guard.** Active whenever the persistent
   store is configured: each workload-cert renewal must present its
   identity's *current* (or one-step-*previous*, the crash/rotation
-  grace) serial via `current_serial`. A stale or unknown serial — a
-  superseded or fabricated cert reappearing, i.e. a possible key-pair
-  clone — is rejected `403` and emits a high-signal
-  `x509.workload_cert.rollback_rejected` audit event. cert-agentd
-  sends the serial of the cert on disk automatically (stateless across
-  restarts). First issuance (no recorded state) is unguarded. **Lockout
-  recovery:** once the recorded cert has *expired*, a renewal that can't
-  present a matching serial (e.g. an agent that lost its cert) is allowed
-  to re-enroll — no valid credential is in the wild, so the guard is moot
-  (caller auth + role policy still apply) — emitting an
-  `x509.workload_cert.reenroll` event; it auto-heals within one cert TTL.
-  An operator can also clear the identity's `active_workload_cert` row to
-  reset immediately. Off entirely without a store. Refresh-token-rotation
+  grace) serial via `current_serial`. A stale or unknown serial **while
+  the recorded cert is still valid** — a superseded or fabricated cert
+  reappearing, i.e. a possible key-pair clone — **locks the identity**:
+  `403`, `locked_at` + the offending serial stamped on its row, and every
+  later sign request denied (past expiry too — no auto-heal), emitting a
+  high-signal `x509.workload_cert.locked` event. cert-agentd sends the
+  serial of the cert on disk automatically (stateless across restarts).
+  First issuance (no recorded state) is unguarded. **Lost-cert recovery
+  (not a clone):** if the recorded cert has *expired* and the identity is
+  **not** locked, a renewal that can't present a matching serial (e.g. an
+  agent that lost its cert) re-enrolls — no valid credential is in the
+  wild, so the guard is moot (caller auth + role policy still apply) —
+  emitting `x509.workload_cert.reenroll`; it auto-heals within one cert
+  TTL. A **locked** identity does *not* auto-heal — an operator clears its
+  `active_workload_cert` row to reset (OPERATIONS.md *Recover a locked
+  workload identity*). Off entirely without a store. Refresh-token-rotation
   + reuse-detection, applied to certs — see `certd-store-design.md`.
   CSRF protection on every POST: each GET sets a `certd_csrf`
   cookie (256 bits of entropy, `SameSite=Lax`, `Secure` over HTTPS)

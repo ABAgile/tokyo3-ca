@@ -280,18 +280,33 @@ The one failure mode is a **leftover row** for that identity — you are
 re-bootstrapping over a retained database, rotated the CA but kept the
 `active_workload_cert` rows, or certd previously minted a cert for this
 identity. If that recorded cert is still inside its validity window, the
-first renewal presenting the self-issued serial is rejected with
-`403 possible clone` and an `x509.workload_cert.rollback_rejected` audit
-event. Resolve it one of two ways:
+first renewal presenting the self-issued serial is treated as a possible
+clone and **the identity is LOCKED**: it gets a `403` and an
+`x509.workload_cert.locked` audit event, and — crucially — the lock does
+**not** clear on expiry (no auto-re-enroll), so the only resolution is to
+clear the row (see *Recover a locked workload identity* below). A
+genuinely fresh bootstrap database has no rows, so the clean path needs
+none of this.
 
-- **Wait for the recorded cert to expire** — the next attempt takes the
-  auto-re-enroll path (`x509.workload_cert.reenroll`) and issues, or
-- **Clear the identity's row** (no API/portal control today — direct DB op):
-  ```sql
-  DELETE FROM active_workload_cert WHERE identity = 'spiffe://<trust-domain>/<path>';
-  ```
-  Same statement on the sqlite dev backend. A genuinely fresh bootstrap
-  database has no rows, so the clean path needs none of this.
+### Recover a locked workload identity
+
+When a renewal presents a serial that is neither the current nor the
+one-step-previous one **while the recorded cert is still valid**, the
+reuse-detection guard escalates: it stamps `locked_at` + `locked_serial`
+on the `active_workload_cert` row and denies that identity on **every**
+subsequent sign request — past expiry too — emitting
+`x509.workload_cert.locked` (alert on this; it usually means a stolen
+key pair, or a botched bootstrap over stale state). Recovery is a
+deliberate operator action: investigate, then clear the row (no
+API/portal control today — direct DB op):
+
+```sql
+DELETE FROM active_workload_cert WHERE identity = 'spiffe://<trust-domain>/<path>';
+```
+
+Same statement on the sqlite dev backend. The next sign request for that
+identity is then a fresh first-enrollment. (Deleting the row is also how
+you reset the leftover-state case above.)
 
 ### Revoke a cert (immediate)
 
