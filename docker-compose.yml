@@ -327,20 +327,25 @@ services:
     command:
       - |
         set -e
-        if [ -f /state/cert-agentd.crt ]; then
+        if [ -f /state/svid.pem ]; then
           echo "cert-agentd-init: /state already populated, skipping"
           exit 0
         fi
-        cp /shared/certs/cert-agentd.crt   /state/
-        cp /shared/certs/cert-agentd.key   /state/
-        # The mTLS CA — NOT mkcert's ca.crt. This is the anchor the agent and
-        # the sibling workloads it provisions (/certs/authd-*) use to verify
-        # certd-issued mTLS peers (NATS, Postgres). mkcert's ca.crt stays out
-        # of the agent's output volume; it only verifies certd's HTTPS/portal
+        # Seed the SPIFFE X.509-SVID layout (svid.pem / svid.key / svid_bundle.pem)
+        # — the generic workload-credential naming, decoupled from the agent's
+        # own name, so any consumer can read /certs as a standard SVID dir. The
+        # renewer rewrites svid.{pem,key} in place; the trust-bundle refresher
+        # rewrites svid_bundle.pem.
+        cp /shared/certs/cert-agentd.crt   /state/svid.pem
+        cp /shared/certs/cert-agentd.key   /state/svid.key
+        # The mTLS trust anchor — NOT mkcert's ca.crt. This is what the agent
+        # and the sibling workloads it provisions (/certs/authd-*) verify
+        # certd-issued peers (NATS, Postgres) against. mkcert's ca.crt stays
+        # out of the agent's volume; it only verifies certd's HTTPS/portal
         # endpoint, which the agent reads straight from /shared.
-        cp /shared/certs/certd-x509-ca.crt /state/
-        chmod 644 /state/*.crt
-        chmod 600 /state/*.key
+        cp /shared/certs/certd-x509-ca.crt /state/svid_bundle.pem
+        chmod 644 /state/svid.pem /state/svid_bundle.pem
+        chmod 600 /state/svid.key
         echo "cert-agentd-init: seeded bootstrap material into agent_state"
     restart: "no"
 
@@ -364,8 +369,11 @@ services:
       - shared_data:/shared:ro
     environment:
       CERT_AGENTD_CERTD_URL: https://certd:8443
-      CERT_AGENTD_WORKLOAD_CERT: /certs/cert-agentd.crt
-      CERT_AGENTD_WORKLOAD_KEY: /certs/cert-agentd.key
+      # SPIFFE X.509-SVID layout (svid.pem / svid.key / svid_bundle.pem) — the
+      # generic workload-credential naming, seeded by cert-agentd-init and
+      # rewritten in place on renewal.
+      CERT_AGENTD_WORKLOAD_CERT: /certs/svid.pem
+      CERT_AGENTD_WORKLOAD_KEY: /certs/svid.key
       # WORKLOAD_CA verifies certd's HTTPS *API* server cert, which is
       # mkcert-signed (the portal listener). That's the one mkcert hop, so read
       # ca.crt straight from /shared — it's deliberately NOT in the agent's
@@ -384,27 +392,27 @@ services:
       # scim — all Ed25519) into /certs alongside the agent's own
       # identity. The spiffe://tokyo3/authd/* role pattern covers both.
       CERT_AGENTD_WORKLOADS_FILE: /shared/agent/workloads.json
-      # NATS over mTLS. The agent reuses its own workload cert/key (/certs/
-      # cert-agentd.{crt,key}) as its NATS client identity — both the bootstrap
-      # cert and every renewed cert are certd-issued, so a single anchor works.
-      # NATS_CA is the mTLS CA seeded into the agent's own volume by
-      # cert-agentd-init (/certs/certd-x509-ca.crt) — the same anchor the
-      # sibling workloads it provisions use to verify their certd-issued peers.
+      # NATS over mTLS. The agent reuses its own SVID (/certs/svid.{pem,key})
+      # as its NATS client identity — both the bootstrap cert and every renewed
+      # cert are certd-issued, so a single anchor works. NATS_CA is the mTLS
+      # trust bundle seeded into the agent's own volume by cert-agentd-init
+      # (/certs/svid_bundle.pem) — the same anchor the sibling workloads it
+      # provisions use to verify their certd-issued peers.
       CERT_AGENTD_NATS_URL: tls://nats:4222
-      CERT_AGENTD_NATS_CA: /certs/certd-x509-ca.crt
+      CERT_AGENTD_NATS_CA: /certs/svid_bundle.pem
       # Pull-based trust-bundle refresh: periodically GET certd's
       # /api/v1/x509/trust-bundle and rewrite the local anchor, so a certd CA
       # rotation propagates without an out-of-band push. Points at the same
       # file the agent + provisioned siblings verify peers against. In this
       # rig the anchor is stable, so it's a no-op steady state (the fetch
       # matches and skips the write) — it exercises the path end to end.
-      CERT_AGENTD_TRUST_BUNDLE_PATH: /certs/certd-x509-ca.crt
+      CERT_AGENTD_TRUST_BUNDLE_PATH: /certs/svid_bundle.pem
     healthcheck:
       # No HTTP surface — probe via filesystem mtime instead.
       # Renewals fire every ~72 s; if the cert hasn't been touched in
       # 150 s, the agent has stalled. start_period gives the first
       # renewal time to land before any failure is reported.
-      test: ["CMD-SHELL", "test $(( $(date +%s) - $(stat -c %Y /certs/cert-agentd.crt) )) -lt 150"]
+      test: ["CMD-SHELL", "test $(( $(date +%s) - $(stat -c %Y /certs/svid.pem) )) -lt 150"]
       interval: 30s
       timeout: 3s
       retries: 3

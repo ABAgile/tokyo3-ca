@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"io"
 	"math/big"
+	"net"
 	"net/url"
 	"strings"
 	"time"
@@ -94,7 +95,73 @@ func SignWorkloadCert(rnd io.Reader, caSigner signer.Signer, caCert *x509.Certif
 		URIs:                  []*url.URL{uri},
 	}
 
-	der, err := x509.CreateCertificate(rnd, tmpl, caCert, p.PublicKey, caSigner)
+	return signTemplate(rnd, caSigner, caCert, p.PublicKey, tmpl)
+}
+
+// ServerCertParams describes a TLS *server*-cert signing request — the
+// DNS/IP-SAN counterpart to [WorkloadCertParams]. `certd ca issue-server`
+// uses it to mint listener certs (NATS, Postgres, …) whose clients verify the
+// server by hostname; [SignWorkloadCert] can't, because a SPIFFE SVID carries
+// only a URI SAN.
+type ServerCertParams struct {
+	// PublicKey is the server's public key (RSA, ECDSA, or Ed25519).
+	PublicKey crypto.PublicKey
+	// DNSNames / IPAddresses are the SANs clients match against. At least
+	// one entry across the two is required.
+	DNSNames    []string
+	IPAddresses []net.IP
+	// SPIFFEURI optionally also embeds the server's SPIFFE URI SAN (for
+	// SPIFFE-aware peers); empty omits it. Validated as scheme "spiffe".
+	SPIFFEURI string
+	// SubjectCommonName is the X.509 Subject CN; defaults to the first DNS
+	// name when empty.
+	SubjectCommonName string
+	// ValidAfter / ValidBefore bound validity; ValidBefore must be after.
+	ValidAfter  time.Time
+	ValidBefore time.Time
+	// Serial is the cert serial (caller-unique, like the workload path).
+	Serial *big.Int
+}
+
+// SignServerCert builds a TLS server cert per p (DNS/IP SANs, ExtKeyUsage
+// serverAuth) and signs it with caSigner against caCert. Same one CA key as
+// the workload + SSH paths; marshalling to PEM is the caller's job.
+func SignServerCert(rnd io.Reader, caSigner signer.Signer, caCert *x509.Certificate, p ServerCertParams) (*x509.Certificate, error) {
+	if err := validateServer(p, caCert); err != nil {
+		return nil, err
+	}
+	var uris []*url.URL
+	if p.SPIFFEURI != "" {
+		uri, err := url.Parse(p.SPIFFEURI)
+		if err != nil {
+			return nil, fmt.Errorf("parse spiffe uri: %w", err)
+		}
+		uris = append(uris, uri)
+	}
+	cn := p.SubjectCommonName
+	if cn == "" && len(p.DNSNames) > 0 {
+		cn = p.DNSNames[0]
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          p.Serial,
+		Subject:               pkix.Name{CommonName: cn},
+		NotBefore:             p.ValidAfter,
+		NotAfter:              p.ValidBefore,
+		KeyUsage:              keyUsageFor(p.PublicKey),
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		IsCA:                  false,
+		DNSNames:              p.DNSNames,
+		IPAddresses:           p.IPAddresses,
+		URIs:                  uris,
+	}
+	return signTemplate(rnd, caSigner, caCert, p.PublicKey, tmpl)
+}
+
+// signTemplate signs tmpl against caCert with caSigner and re-parses the DER
+// back to a *x509.Certificate. Shared by the workload + server leaf builders.
+func signTemplate(rnd io.Reader, caSigner signer.Signer, caCert *x509.Certificate, pub crypto.PublicKey, tmpl *x509.Certificate) (*x509.Certificate, error) {
+	der, err := x509.CreateCertificate(rnd, tmpl, caCert, pub, caSigner)
 	if err != nil {
 		return nil, fmt.Errorf("x509 create cert: %w", err)
 	}
@@ -103,6 +170,41 @@ func SignWorkloadCert(rnd io.Reader, caSigner signer.Signer, caCert *x509.Certif
 		return nil, fmt.Errorf("re-parse signed cert: %w", err)
 	}
 	return cert, nil
+}
+
+// validateServer enforces required-field invariants on a ServerCertParams.
+func validateServer(p ServerCertParams, caCert *x509.Certificate) error {
+	if caCert == nil {
+		return errors.New("ca cert is required")
+	}
+	if !caCert.IsCA {
+		return errors.New("ca cert is not marked as a CA (IsCA=false)")
+	}
+	if p.PublicKey == nil {
+		return errors.New("public key is required")
+	}
+	if len(p.DNSNames) == 0 && len(p.IPAddresses) == 0 {
+		return errors.New("a server cert needs at least one DNS name or IP address")
+	}
+	if p.SPIFFEURI != "" {
+		uri, err := url.Parse(p.SPIFFEURI)
+		if err != nil {
+			return fmt.Errorf("parse spiffe uri: %w", err)
+		}
+		if strings.ToLower(uri.Scheme) != SPIFFEURIScheme {
+			return fmt.Errorf("spiffe uri must use scheme %q, got %q", SPIFFEURIScheme, uri.Scheme)
+		}
+	}
+	if p.Serial == nil {
+		return errors.New("serial is required")
+	}
+	if p.ValidAfter.IsZero() {
+		return errors.New("valid-after is required")
+	}
+	if !p.ValidBefore.After(p.ValidAfter) {
+		return fmt.Errorf("valid-before (%s) must be after valid-after (%s)", p.ValidBefore, p.ValidAfter)
+	}
+	return nil
 }
 
 // keyUsageFor returns the X.509 KeyUsage bits appropriate to the subject

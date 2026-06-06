@@ -14,6 +14,8 @@
 #     already be set up so the mkcert binary lands on PATH)
 #   - openssl (mints the PKCS#8 Ed25519 CA signing key certd loads)
 #   - ssh-keygen (any OpenSSH install) to derive the SSH CA public key
+#   - go (builds certd once for the `certd ca issue-server` / `issue-workload`
+#     cert steps — the same path production uses to seed infra/workloads)
 #
 # Uses the abagile/mkcert fork (https://github.com/abagile/mkcert@add-cn)
 # so the first hostname argument becomes Subject CN.
@@ -66,39 +68,13 @@ mkc_server() {
   ok
 }
 
-# certd_leaf NAME CN EKU SAN...
-# Self-issues a leaf cert signed by the certd CA signing key, so it chains to
-# certd-x509-ca.crt — the SINGLE CA for all internal mTLS (nats + postgres,
-# both server and client certs, and every workload identity). Runs offline
-# with no certd process — exactly the "self-issued bootstrap" path in
-# OPERATIONS.md, which is what lets certd present a client cert to its own
-# dependencies before any certd is up to issue one. NAME → $OUT/NAME.{crt,key}
-# (Ed25519, matching the CA key); EKU is serverAuth or clientAuth; the SAN args
-# are openssl SAN entries (DNS:…, IP:…, URI:spiffe://…). MUST be called AFTER
-# the signing key + issuer cert exist.
-certd_leaf() {
-  local name=$1 cn=$2 eku=$3; shift 3
-  step "$name (certd-issued, $eku)"
-  local san="$1"; shift
-  for s in "$@"; do san="$san,$s"; done
-  openssl genpkey -algorithm ed25519 -out "$OUT/$name.key" >/dev/null 2>&1
-  chmod 600 "$OUT/$name.key"
-  openssl req -new -key "$OUT/$name.key" -subj "/CN=$cn" -out "$TMP/$name.csr" >/dev/null 2>&1
-  openssl x509 -req -in "$TMP/$name.csr" \
-    -CA "$OUT/certd-x509-ca.crt" -CAkey "$OUT/certd-signing.key" -CAcreateserial \
-    -days 3650 -out "$OUT/$name.crt" \
-    -extfile <(printf 'basicConstraints = CA:FALSE\nkeyUsage = critical, digitalSignature\nextendedKeyUsage = %s\nsubjectAltName = %s\n' "$eku" "$san") \
-    >/dev/null 2>&1
-  chmod 644 "$OUT/$name.crt"
-  ok
-}
-
 # ── certd HTTPS server cert (mkcert) ─────────────────────────────────────────
 # certd's PUBLIC API cert is the ONE exception to the single-CA rule: it stays
 # mkcert-signed so `curl https://localhost:8443/healthz` works from the host
 # with no --cacert (mkcert's root is in the OS trust store), and cert-agentd
 # verifies the API via ca.crt. Everything ELSE (the internal nats/postgres
-# mesh) is certd-issued — see the certd_leaf block after the issuer cert below.
+# mesh) is certd-issued — see the `certd ca issue-*` block after the issuer
+# cert below.
 mkc_server "certd"        certd  localhost  127.0.0.1
 
 # ── certd's CA signing key (X.509 + SSH) ─────────────────────────────────────
@@ -155,38 +131,61 @@ fi
 
 # ── Internal mTLS mesh certs (certd-issued, chain to certd-x509-ca.crt) ───────
 # Every cert below is signed by the CA key above, so the ONE anchor
-# certd-x509-ca.crt verifies them all — no per-channel CA bundle. Servers
-# (nats, postgres) and clients alike: NATS's --tlscacert, Postgres's
-# ssl_ca_file, and each client's server-verify CA are all certd-x509-ca.crt.
-# Self-issued here (offline) so the services that connect at boot — certd to
-# NATS + Postgres, before any runtime issuance exists — already hold a cert
-# the mesh trusts.
+# certd-x509-ca.crt verifies them all — no per-channel CA bundle. They all go
+# through `certd ca issue-{server,workload}`: the SAME offline path production
+# uses to seed infra/workloads, built by the same x509engine the sign endpoint
+# uses, so dev and prod bootstrap share one code path. Issued offline so the
+# services that connect at boot (certd → NATS + Postgres) already hold a cert
+# the mesh trusts. Build certd once into the scratch dir and reuse it.
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+REPO_ROOT="$(cd "$DIR/../.." && pwd)"
+CERTD_BIN="$TMP/certd"
+step "build certd (ca issue-*)"
+(cd "$REPO_ROOT" && go build -o "$CERTD_BIN" ./cmd/certd) >/dev/null 2>&1
+ok
 
-# Server certs (serverAuth). SANs cover the compose hostname + loopback.
-certd_leaf "nats"      nats      serverAuth  DNS:nats      DNS:localhost  IP:127.0.0.1
-certd_leaf "postgres"  postgres  serverAuth  DNS:postgres  DNS:localhost  IP:127.0.0.1
+# issue_server NAME DNS... — TLS server cert (DNS SANs + loopback IP, serverAuth).
+issue_server() {
+  local name=$1; shift
+  step "$name (issue-server)"
+  local args=(ca issue-server --ca-cert "$OUT/certd-x509-ca.crt" --key "$OUT/certd-signing.key"
+    --out-cert "$OUT/$name.crt" --out-key "$OUT/$name.key" --ip 127.0.0.1 --force)
+  for d in "$@"; do args+=(--dns "$d"); done
+  "$CERTD_BIN" "${args[@]}" >/dev/null 2>&1
+  ok
+}
 
-# Client certs (clientAuth). For Postgres `cert` auth the CN MUST equal the
-# connecting role; NATS has no per-subject auth, so its CNs are cosmetic.
-certd_leaf "certd-nats"  certd  clientAuth  URI:spiffe://demo/workload/certd-nats
-certd_leaf "natsbox"     natsbox  clientAuth  URI:spiffe://demo/workload/natsbox
+# issue_workload NAME SPIFFE-URI [CN] — SPIFFE SVID (URI SAN, clientAuth+serverAuth).
+issue_workload() {
+  local name=$1 spiffe=$2 cn=${3:-}
+  step "$name (issue-workload)"
+  local args=(ca issue-workload --spiffe-uri "$spiffe" --key-type ed25519
+    --ca-cert "$OUT/certd-x509-ca.crt" --key "$OUT/certd-signing.key"
+    --out-cert "$OUT/$name.crt" --out-key "$OUT/$name.key" --force)
+  [[ -n "$cn" ]] && args+=(--cn "$cn")
+  "$CERTD_BIN" "${args[@]}" >/dev/null 2>&1
+  ok
+}
+
+# Server certs — clients verify these by hostname, so they carry DNS SANs.
+issue_server "nats"      nats      localhost
+issue_server "postgres"  postgres  localhost
+
+# Client/workload SVIDs — verified by chain (NATS) or CN (Postgres certd-db),
+# so a URI SAN is enough. For Postgres `cert` auth the CN MUST equal the
+# connecting role; NATS has no per-subject auth, so its CN is cosmetic.
+issue_workload "certd-nats"  spiffe://demo/workload/certd-nats
+issue_workload "natsbox"     spiffe://demo/workload/natsbox
 # certd's Postgres client identity — CN=certd authenticates as the "certd"
 # superuser role (POSTGRES_USER) that owns certd's own store.
-certd_leaf "certd-db"    certd  clientAuth  URI:spiffe://demo/workload/certd-db
-# cert-agentd's bootstrap client cert. certd-issued (not mkcert) so it
-# authenticates to NATS from its very first connection; cert-agentd reuses the
-# KEY as its workload key and renews the cert in place — runtime-renewed certs
-# are signed by the same CA, so the anchor never changes. (Set the agent's
-# CERT_AGENTD_ROTATE_KEY to mint a fresh key each renewal instead of reusing
-# this one.)
-#
-# Its SAN is the agent's REAL workload identity (spiffe://tokyo3/authd/agent),
-# NOT a demo/workload/* placeholder — that's the principal certd's inbound
-# mTLS auth maps to groups (shared/policy/principals.json), and it's the same
-# SAN the renewed cert carries (CERT_AGENTD_SPIFFE_URI), so the agent
-# authenticates by the same principal on its first request and every renewal.
-certd_leaf "cert-agentd"  cert-agentd  clientAuth  URI:spiffe://tokyo3/authd/agent
+issue_workload "certd-db"    spiffe://demo/workload/certd-db   certd
+# cert-agentd's bootstrap identity. SAN = the agent's REAL workload identity
+# (spiffe://tokyo3/authd/agent) — the principal certd's inbound mTLS maps to
+# groups (shared/policy/principals.json) and the SAN the renewed cert carries
+# (CERT_AGENTD_SPIFFE_URI) — so it authenticates the same on its first request
+# and every renewal. The renewer reuses this Ed25519 key (set
+# CERT_AGENTD_ROTATE_KEY to mint a fresh key each renewal instead).
+issue_workload "cert-agentd"  spiffe://tokyo3/authd/agent
 
 echo ""
 echo "dev TLS material written to ./shared/certs/"

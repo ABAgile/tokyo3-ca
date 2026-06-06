@@ -103,7 +103,7 @@ slots into the same shape):
 ```
 shared/
   certs/
-    gen.sh                # mkcert + openssl + ssh-keygen, host-side
+    gen.sh                # mkcert + openssl + ssh-keygen + certd ca issue-{server,workload}
     ca.crt                # mkcert root — verifies certd's HTTPS API only
     certd.{crt,key}       # certd HTTPS API server cert (mkcert-signed)
     certd-signing.key     # CA signing key, PKCS#8 PEM (signs X.509 + SSH)
@@ -135,11 +135,13 @@ cert-agentd is the exception — it renews its own cert in place, so
 the rig copies the bootstrap material onto a separate writeable
 `agent_state` volume via the `cert-agentd-init` service on first
 boot. That way, re-running `_sync-shared` never clobbers a renewed
-cert. The seeded material is the agent's `cert-agentd.{crt,key}` plus
-**`certd-x509-ca.crt`** (the mTLS CA) — *not* mkcert's `ca.crt`: the
-agent's own volume holds only the anchor it and the workloads it
-provisions need for mTLS. mkcert's root verifies just certd's
-HTTPS/portal endpoint, which the agent reads from `/shared`
+cert. It's seeded as the SPIFFE **X.509-SVID layout** — `svid.pem` /
+`svid.key` (from `cert-agentd.{crt,key}`) plus `svid_bundle.pem` (the
+mTLS CA, from `certd-x509-ca.crt`) — the generic workload-credential
+naming, so `/certs` reads as a standard SVID dir for the agent and the
+sibling workloads it provisions. Note it's **not** mkcert's `ca.crt`:
+the agent's volume holds only the mTLS anchor. mkcert's root verifies
+just certd's HTTPS/portal endpoint, which the agent reads from `/shared`
 (`CERT_AGENTD_WORKLOAD_CA=/shared/certs/ca.crt`).
 
 **Policy & workloads (sample).** The rig enforces the
@@ -171,7 +173,7 @@ workload certs — uses a **single** anchor, `certd-x509-ca.crt`, for both
 server and client certs. There is no per-channel CA and no bundle. The
 other two artifacts each have exactly one narrow job:
 
-- `certd-x509-ca.crt` — certd's **X.509 issuer cert** (`CERTD_CA_X509_CERT_FILE`). The ONE CA for the internal mesh: NATS's `--tlscacert`, Postgres's `ssl_ca_file`, and every client's server-verify CA all point here. The nats/postgres *server* certs chain to it too, so it works in both directions. `gen.sh` self-issues the bootstrap certs (certd's own, natsbox's, cert-agentd's) offline with the CA key so they chain here from first boot.
+- `certd-x509-ca.crt` — certd's **X.509 issuer cert** (`CERTD_CA_X509_CERT_FILE`). The ONE CA for the internal mesh: NATS's `--tlscacert`, Postgres's `ssl_ca_file`, and every client's server-verify CA all point here. The nats/postgres *server* certs chain to it too, so it works in both directions. `gen.sh` mints every mesh cert offline via `certd ca issue-server` (DNS SANs for the nats/postgres listeners) and `certd ca issue-workload` (SPIFFE SVIDs for certd's own, natsbox's, and cert-agentd's client identities) — the same code path production uses to seed infra/workloads — so they chain here from first boot.
 - `ca.crt` — mkcert root. Verifies certd's **public HTTPS API/portal cert** only (so `curl https://localhost:8443` works with no `--cacert`, and cert-agentd verifies that one hop via `CERT_AGENTD_WORKLOAD_CA`, read from `/shared`). It is *not* used for any internal mTLS link and is deliberately kept out of cert-agentd's own `/certs` volume — that holds `certd-x509-ca.crt` instead.
 - `certd-signing.key.pub` — OpenSSH-format **SSH CA** pubkey (`TrustedUserCAKeys`). SSH world only; never goes in a TLS trust bundle.
 

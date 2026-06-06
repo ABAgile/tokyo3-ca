@@ -231,7 +231,9 @@ rotate without downtime:
 1. Issue the workload an mTLS cert with a SPIFFE URI of the form
    `spiffe://<trust-domain>/host/<fqdn>`. `cert-agentd` on that
    host can renew the cert thereafter, but the **initial** cert is
-   operator-bootstrapped (Kubernetes secret, manual install, etc.).
+   operator-bootstrapped — mint it with `certd ca issue-workload`
+   (see *Bootstrap a workload with a self-issued mTLS cert* below) and
+   deliver it via a Kubernetes secret / baked image / config mgmt.
 2. Register the workload identity in `CERTD_MTLS_PRINCIPALS_FILE`:
    `{"name":"db-1.prod","san":"spiffe://td/host/db-1.prod","groups":["ssh-tunnel-host"]}`.
    Reload certd (no hot-reload yet — schedule a restart).
@@ -244,12 +246,25 @@ rotate without downtime:
 ### Bootstrap a workload with a self-issued mTLS cert
 
 When a workload's **first** mTLS cert is minted offline rather than
-issued through certd's sign endpoint — `openssl`-signed directly by the
-CA key (chains to the issuer cert), or from a separate bootstrap PKI —
-the first certd renewal does **not** trip the renewal/anti-theft guard.
-The common case: seeding certd's own client identity so it can reach
-Postgres / NATS over mTLS before any certd is running to issue that
-cert (the classic CA bootstrap cycle).
+issued through certd's sign endpoint, the first certd renewal does
+**not** trip the renewal/anti-theft guard. Mint it with:
+
+```sh
+certd ca issue-workload \
+  --spiffe-uri spiffe://td/host/db-1 \   # the identity it will renew under
+  --ca-cert issuer.crt --kms-key arn:… \ # (or --key ca.key) — signs through KMS
+  --out-cert svid.pem --out-key svid.key --bundle-out svid_bundle.pem
+```
+
+`certd ca issue-workload` (SPIFFE SVID; its sibling `certd ca issue-server`
+mints DNS-SAN listener certs) is the offline twin of the sign endpoint: it
+generates the keypair and signs the leaf through the same signer seam
+(so it works with a KMS key, where `openssl` cannot) and the same
+x509engine builder. A separate bootstrap PKI, or `openssl` signing
+directly with a *file* CA key, works too. The common case: seeding
+certd's own client identity so it can reach Postgres / NATS over mTLS
+before any certd is running to issue that cert (the classic CA bootstrap
+cycle).
 
 Why it's safe: the guard keys on the per-identity row in
 `active_workload_cert` (PRIMARY KEY = the SPIFFE URI), **not** on the
