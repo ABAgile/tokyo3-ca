@@ -75,6 +75,10 @@ const (
 	CallerPrefixOIDC = "oidc:"
 	CallerPrefixMTLS = "mtls:"
 	CallerAnonymous  = "anonymous"
+	// CallerPrefixPortal attributes a portal action made over HTTP Basic
+	// auth (no per-user identity): "portal:<basic-auth-user|portal>". The
+	// native-OIDC portal path uses CallerPrefixOIDC with the user's email.
+	CallerPrefixPortal = "portal:"
 )
 
 // Sink is the typed JSON-encoding journal sink used to publish Entries.

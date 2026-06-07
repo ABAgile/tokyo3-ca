@@ -44,7 +44,7 @@ Trust boundaries (each labelled edge crosses one):
 | Boundary               | Direction              | Mechanism                                 |
 |------------------------|------------------------|-------------------------------------------|
 | Caller → API           | Inbound HTTPS          | OIDC bearer token OR mTLS client cert     |
-| Admin → Portal         | Inbound HTTPS          | HTTP Basic auth + CSRF tokens             |
+| Admin → Portal         | Inbound HTTPS          | Native OIDC login + admin-group gate (or HTTP Basic) + CSRF tokens |
 | API → policy.Engine    | In-process call        | none (trusted)                            |
 | API → signer.Signer    | In-process / KMS API   | KMS auth (per-deployment)                 |
 | API → audit.Sink       | NATS publish           | mTLS to broker                            |
@@ -116,16 +116,18 @@ Threats:
 | # | Threat                                          | Mitigation                                                                                                                                                                                        |
 |---|-------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | 1 | Brute force on Basic-auth                       | Constant-time compare (`auth.go`). The opt-in per-source-IP API limiter (`CERTD_RATE_LIMIT_RPS`) also covers `/portal/*` and bounds attempt throughput per IP; still front with an edge that rate-limits 401s for distributed attempts.                          |
-| 2 | Session hijack via cookie theft                 | CSRF cookie is `SameSite=Lax` + `Secure` over HTTPS. There is no portal SESSION cookie (the Basic-auth header is sent on each request).                                                            |
+| 2 | Session hijack via cookie theft                 | Basic-auth path sends the header per request (no session cookie). Native-OIDC path (`oidcauth.go`) seals the session in an AES-256-GCM cookie (`base/crypto`, `CERTD_PORTAL_SESSION_KEY`), `HttpOnly` + `SameSite=Lax` + `Secure` over HTTPS, bounded TTL (8h); rotating the key invalidates all live sessions.                                              |
 | 3 | XSS in rendered HTML                            | All template fields go through `html/template` auto-escaping. Operator-supplied annotations (Reason, Revoker) escape automatically.                                                                |
+| 4 | Portal login CSRF / token replay                | Native-OIDC login is Authorization-Code + PKCE (S256) with a `state` and a `nonce`, both stashed in a short-lived encrypted flow cookie and checked on callback (state ≠ → 400, nonce ≠ → 400). The ID-token signature + audience are verified by certd's OIDC verifier (a separate client from the sign path). `return_to` is confined to a local path. |
+| 5 | Unauthorized admin action                       | When OIDC is enabled, every `/portal/*` route (except `/healthz` + `/auth/*`) requires a valid session AND membership in `CERTD_PORTAL_ADMIN_GROUP`; non-members get 403. Each role/principal mutation is recorded in the structured change log attributed to the signed-in user's email. |
 
 ## Residual risks (known + tracked)
 
 1. **API rate limiting is opt-in and per-replica** — `CERTD_RATE_LIMIT_RPS` enables an in-process per-source-IP token bucket (default off); it shields a single instance but is not distributed, so volumetric/distributed DoS still leans on the operator's edge (LB/WAF).
 2. **In-memory revocation store (default)** — non-persistent; a Postgres/SQLite backend is available opt-in via `CERTD_DATABASE_URL` (`internal/store`), so revocations survive restart when configured.
 3. **No periodic KMS-key liveness probe** — the bundled KMS path fetches the CA public key at startup (a missing or inaccessible key fails boot, not the first sign), but there is no recurring re-check of continued accessibility while running.
-4. **Portal Basic auth is single-tenant** — multi-user RBAC for the portal needs OIDC integration (out of scope for v1).
-5. **The audit-log loss-tolerance is deliberate** but is a residual risk if the broker is offline during a malicious sign attempt.
+4. **Portal auth** — native multi-user OIDC login + an admin-group gate are available (`CERTD_PORTAL_OIDC_*`, `oidcauth.go`); the single-tenant HTTP Basic gate remains the default when OIDC is unconfigured (front it with an identity-aware edge for multi-user use).
+5. **Audit-log loss-tolerance is deliberate.** Cert issuance/denial events are published best-effort to `ca_audit` after the DB write, so a broker outage during a sign attempt can drop that event. Policy mutations (role/principal CRUD via the portal + `certd reconcile`) are recorded in the structured operational log (shipped to NATS via applog when configured), not the `ca_audit` event stream — a deliberately simple change-record, not a guaranteed-delivery audit. A durable transactional-audit pipeline for policy changes was scoped and deferred as more machinery than currently warranted.
 
 ## Out-of-scope assumptions
 

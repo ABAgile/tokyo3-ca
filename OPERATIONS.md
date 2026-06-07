@@ -236,12 +236,68 @@ rotate without downtime:
    deliver it via a Kubernetes secret / baked image / config mgmt.
 2. Register the workload identity in `CERTD_MTLS_PRINCIPALS_FILE`:
    `{"name":"db-1.prod","san":"spiffe://td/host/db-1.prod","groups":["ssh-tunnel-host"]}`.
-   Reload certd (no hot-reload yet — schedule a restart).
+   Apply it with `certd reconcile --apply` (DB-backed) — see *Reconcile
+   config to the database* below. (Without a DB the file only seeds an
+   empty in-memory store, so a restart is still needed.)
 3. Add a role in `CERTD_ROLES_FILE` that grants the new group
    permission to sign host certs (or reuse an existing
-   `ssh-tunnel-host` role).
+   `ssh-tunnel-host` role), then `certd reconcile --apply`.
 4. The workload's `ssh-tunneld` picks up the trust-bundle and
    starts renewing on the next cycle.
+
+### Reconcile config to the database (GitOps)
+
+With a DB backend (`CERTD_DATABASE_URL`), `CERTD_ROLES_FILE` /
+`CERTD_MTLS_PRINCIPALS_FILE` only **seed** an empty database on first boot;
+later file edits do nothing until reconciled. `certd reconcile` applies them:
+
+```bash
+# Dry-run (default): print the add/update/prune/conflict plan, change nothing.
+certd reconcile
+
+# Apply. Config is authoritative over rows it owns (source=config): it adds,
+# updates, and PRUNES them to match the files. Portal-created rows
+# (source=portal) are never pruned.
+certd reconcile --apply
+
+# Scope to one table, or keep config-orphans instead of pruning:
+certd reconcile --apply --roles-only
+certd reconcile --apply --prune=false
+
+# A file entry colliding with a portal-created row is a conflict (skipped +
+# warned). Take ownership of it (rewrite as source=config) with:
+certd reconcile --apply --adopt
+```
+
+Run it out-of-band from CD against the same `CERTD_DATABASE_URL` certd serves
+(it opens its own connection — no server endpoint, no extra auth surface). The
+applied counts are written to the structured log (shipped to NATS via applog
+when configured). Reconcile is idempotent — a second run with an unchanged
+file is a no-op.
+
+### Enable native OIDC login for the portal
+
+Multi-user portal access (instead of single shared Basic-auth creds):
+
+1. **Mint the admin group in the IdP.** In `tokyo3-auth`, create a SCIM group
+   named `ca-portal-admin` (`/portal/admin/groups/new`) and assign the CA
+   operators to it.
+2. **Register the portal as an OIDC client** in the IdP with redirect URI
+   `https://<certd-host>/portal/auth/callback` and scopes
+   `openid email profile groups` (confidential client — it gets a secret).
+3. **Configure certd** (alongside the existing portal serve env):
+   ```bash
+   export CERTD_PORTAL_OIDC_ISSUER=https://id.example.com
+   export CERTD_PORTAL_OIDC_CLIENT_ID=<client_id>
+   export CERTD_PORTAL_OIDC_CLIENT_SECRET=<client_secret>
+   export CERTD_PORTAL_OIDC_REDIRECT_URL=https://<certd-host>/portal/auth/callback
+   export CERTD_PORTAL_ADMIN_GROUP=ca-portal-admin          # default; "" ⇒ any authed user
+   export CERTD_PORTAL_SESSION_KEY=$(openssl rand -hex 32)  # 32-byte cookie-sealing key
+   ```
+   When all are set, `/portal/*` requires OIDC login + `ca-portal-admin`
+   membership; the Basic-auth vars are ignored. Portal role/principal edits are
+   then audited as `oidc:<email>`. Rotating `CERTD_PORTAL_SESSION_KEY`
+   invalidates all live sessions (forces re-login).
 
 ### Bootstrap a workload with a self-issued mTLS cert
 
@@ -480,8 +536,10 @@ hostname + chain verification still run inside the callback.
 
 - **No bulk-import endpoint** for the revocation set. Use the
   `POST /api/v1/ssh/revoke` endpoint in a loop.
-- **No hot-reload** for `CERTD_ROLES_FILE` / `CERTD_MTLS_PRINCIPALS_FILE`.
-  Restart certd to pick up changes.
+- **No live hot-reload** for `CERTD_ROLES_FILE` / `CERTD_MTLS_PRINCIPALS_FILE`.
+  With a DB backend, apply file edits with `certd reconcile --apply` (see
+  *Reconcile config to the database*) — no restart. Without a DB the files
+  only seed the in-memory stores, so a restart is still needed there.
 - **In-memory revocation store** — restart clears it; back via
   audit-log replay or a future persistent backend.
 - **No per-org rate limiting** at the API. Front certd with a

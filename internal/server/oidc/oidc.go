@@ -33,6 +33,12 @@ type Claims struct {
 	// Groups is the authoritative group-membership list. The IdP
 	// derives this from its own group/SCIM records.
 	Groups []string
+	// Nonce echoes the `nonce` the relying party sent on the authorize
+	// request — bound into the ID token by the IdP. Empty unless the
+	// caller requested one. The portal's browser login checks it against
+	// the value stashed in its flow cookie to defend against token replay;
+	// the machine bearer-token path leaves it unset.
+	Nonce string
 }
 
 // TokenVerifier is the abstraction certd's API layer talks to.
@@ -94,6 +100,7 @@ func (v *HTTPVerifier) Verify(ctx context.Context, rawIDToken string) (*Claims, 
 		Email  string   `json:"email"`
 		Name   string   `json:"name"`
 		Groups []string `json:"groups"`
+		Nonce  string   `json:"nonce"`
 	}
 	if err := tok.Claims(&raw); err != nil {
 		return nil, fmt.Errorf("decode token claims: %w", err)
@@ -103,6 +110,7 @@ func (v *HTTPVerifier) Verify(ctx context.Context, rawIDToken string) (*Claims, 
 		Email:   raw.Email,
 		Name:    raw.Name,
 		Groups:  raw.Groups,
+		Nonce:   raw.Nonce,
 	}, nil
 }
 

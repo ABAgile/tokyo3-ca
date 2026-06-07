@@ -75,8 +75,9 @@ func (s *roleStore) ByName(name string) (policy.Role, bool) {
 	return r, true
 }
 
-// Add inserts role. Returns [policy.ErrRoleExists] on a name collision.
-func (s *roleStore) Add(role policy.Role) error {
+// Add inserts role, stamping the owner-marker source. Returns
+// [policy.ErrRoleExists] on a name collision.
+func (s *roleStore) Add(role policy.Role, source string) error {
 	if role.Name == "" {
 		return errors.New("role name is required")
 	}
@@ -88,13 +89,14 @@ func (s *roleStore) Add(role policy.Role) error {
 		if exists {
 			return policy.ErrRoleExists
 		}
-		return insertRole(tx, role)
+		return insertRole(tx, role, source)
 	})
 }
 
 // Replace swaps the role registered as oldName for newRole (a rename when
-// the names differ). Returns [policy.ErrRoleNotFound] / [policy.ErrRoleExists].
-func (s *roleStore) Replace(oldName string, newRole policy.Role) error {
+// the names differ), stamping the owner-marker source on the new row.
+// Returns [policy.ErrRoleNotFound] / [policy.ErrRoleExists].
+func (s *roleStore) Replace(oldName string, newRole policy.Role, source string) error {
 	if newRole.Name == "" {
 		return errors.New("role name is required")
 	}
@@ -118,7 +120,7 @@ func (s *roleStore) Replace(oldName string, newRole policy.Role) error {
 		if _, err := tx.ExecContext(context.Background(), `DELETE FROM roles WHERE name = $1`, oldName); err != nil {
 			return err
 		}
-		return insertRole(tx, newRole)
+		return insertRole(tx, newRole, source)
 	})
 }
 
@@ -139,6 +141,18 @@ func (s *roleStore) Delete(name string) error {
 	return nil
 }
 
+// AllWithSource satisfies [store.RoleStore]: every role with its owner-marker
+// source, ordered by name. Returns an error so reconcile fails closed.
+func (s *roleStore) AllWithSource() ([]store.RoleRecord, error) {
+	rows, err := s.db.QueryContext(context.Background(),
+		`SELECT `+store.RoleColumns+`, source FROM roles ORDER BY name`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return store.ScanRoleRecords(rows)
+}
+
 // SeedRolesIfEmpty satisfies [store.RoleStore].
 func (s *roleStore) SeedRolesIfEmpty(roles []policy.Role) (bool, error) {
 	seeded := false
@@ -154,7 +168,7 @@ func (s *roleStore) SeedRolesIfEmpty(roles []policy.Role) (bool, error) {
 			if r.Name == "" {
 				return errors.New("seed role has empty name")
 			}
-			if err := insertRole(tx, r); err != nil {
+			if err := insertRole(tx, r, store.SourceConfig); err != nil {
 				return err
 			}
 		}
@@ -176,14 +190,15 @@ func roleExists(tx *sql.Tx, name string) (bool, error) {
 	return true, nil
 }
 
-func insertRole(tx *sql.Tx, r policy.Role) error {
+func insertRole(tx *sql.Tx, r policy.Role, source string) error {
 	args, err := store.RoleInsertArgs(r, time.Now().UTC().Format(time.RFC3339))
 	if err != nil {
 		return err
 	}
+	args = append(args, store.NormalizeSource(source))
 	_, err = tx.ExecContext(context.Background(),
-		`INSERT INTO roles (`+store.RoleColumns+`, updated_at) `+
-			`VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+		`INSERT INTO roles (`+store.RoleColumns+`, updated_at, source) `+
+			`VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
 		args...)
 	return err
 }

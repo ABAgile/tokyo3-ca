@@ -42,16 +42,42 @@ type Store interface {
 	io.Closer
 }
 
+// Owner-marker values for the row `source` column, passed to the Add/Replace
+// mutation methods. SourceConfig rows are managed by `certd reconcile`
+// (config-authoritative: added, updated, and pruned to match the files);
+// SourcePortal rows are created in the admin portal and never pruned.
+const (
+	SourceConfig = "config"
+	SourcePortal = "portal"
+)
+
+// NormalizeSource maps an empty source to [SourceConfig] — the default for
+// cold-start seeding and any caller that doesn't set one. Reconcile and the
+// portal always pass an explicit value.
+func NormalizeSource(s string) string {
+	if s == "" {
+		return SourceConfig
+	}
+	return s
+}
+
 // RoleStore is the persistent backend for the role table. It satisfies
-// [policy.Store] (the sign-time read surface) plus the admin write surface
-// the portal's MutableRoleStore wants, plus SeedRolesIfEmpty for cold-start
-// seeding from CERTD_ROLES_FILE. Reads fail closed in the backends.
+// [policy.Store] (the sign-time read surface) plus the audited admin write
+// surface, plus SeedRolesIfEmpty for cold-start seeding from CERTD_ROLES_FILE.
+// Reads fail closed in the backends.
 type RoleStore interface {
 	policy.Store // RolesForGroups(groups) []Role; All() []Role
 	ByName(name string) (policy.Role, bool)
-	Add(role policy.Role) error
-	Replace(oldName string, newRole policy.Role) error
+	// Add and Replace stamp the row's owner-marker source (SourceConfig /
+	// SourcePortal). Delete needs none — it writes no row.
+	Add(role policy.Role, source string) error
+	Replace(oldName string, newRole policy.Role, source string) error
 	Delete(name string) error
+	// AllWithSource returns every role paired with its owner-marker source —
+	// the read `certd reconcile` diffs against (it only prunes/updates
+	// SourceConfig rows). Returns an error (not a swallowed nil) so reconcile
+	// fails closed on a query failure rather than pruning on a partial read.
+	AllWithSource() ([]RoleRecord, error)
 	// SeedRolesIfEmpty inserts roles only when the table is empty,
 	// returning true when it seeded. Distinct name from the principal
 	// seed so both can live on one composite Store.
@@ -59,10 +85,30 @@ type RoleStore interface {
 }
 
 // PrincipalStore is the persistent backend for the mTLS cert-principal
-// registry. It satisfies [mtls.Store] (Lookup/All) plus a cold-start seed.
+// registry. It satisfies [mtls.Store] (Lookup/All), the audited write surface
+// (keyed by SAN), and a cold-start seed.
 type PrincipalStore interface {
 	mtls.Store // Lookup(sans) (*Principal, error); All() []Principal
+	BySAN(san string) (mtls.Principal, bool)
+	Add(p mtls.Principal, source string) error
+	Replace(oldSAN string, p mtls.Principal, source string) error
+	Delete(san string) error
+	// AllWithSource mirrors [RoleStore.AllWithSource] for principals.
+	AllWithSource() ([]PrincipalRecord, error)
 	SeedPrincipalsIfEmpty(principals []mtls.Principal) (bool, error)
+}
+
+// RoleRecord pairs a role with its owner-marker source. PrincipalRecord does
+// the same for a principal. Both are the reconcile read shape.
+type RoleRecord struct {
+	Role   policy.Role
+	Source string
+}
+
+// PrincipalRecord pairs a principal with its owner-marker source.
+type PrincipalRecord struct {
+	Principal mtls.Principal
+	Source    string
 }
 
 // RevocationStore is the persistent backend for the SSH KRL. It satisfies
@@ -194,6 +240,46 @@ func RoleInsertArgs(r policy.Role, updatedAt string) ([]any, error) {
 	}, nil
 }
 
+// ScanRoleRecord reads one role row in [RoleColumns] order plus a trailing
+// source column into a [RoleRecord] — the shape AllWithSource selects.
+func ScanRoleRecord(sc RowScanner) (RoleRecord, error) {
+	var (
+		r                      policy.Role
+		allowed, hosts, spiffe string
+		exts, source           string
+	)
+	if err := sc.Scan(&r.Name, &r.GroupClaim, &allowed, &hosts, &spiffe, &exts,
+		&r.MaxUserCertTTLSeconds, &r.MaxHostCertTTLSeconds, &r.MaxX509CertTTLSeconds, &source); err != nil {
+		return RoleRecord{}, err
+	}
+	if err := DecodeJSON(allowed, &r.AllowedPrincipals); err != nil {
+		return RoleRecord{}, err
+	}
+	if err := DecodeJSON(hosts, &r.HostPatterns); err != nil {
+		return RoleRecord{}, err
+	}
+	if err := DecodeJSON(spiffe, &r.SPIFFEPatterns); err != nil {
+		return RoleRecord{}, err
+	}
+	if err := DecodeJSON(exts, &r.DefaultExtensions); err != nil {
+		return RoleRecord{}, err
+	}
+	return RoleRecord{Role: r, Source: source}, nil
+}
+
+// ScanRoleRecords drains rows (over [RoleColumns] + source) into a slice.
+func ScanRoleRecords(rows *sql.Rows) ([]RoleRecord, error) {
+	var out []RoleRecord
+	for rows.Next() {
+		rec, err := ScanRoleRecord(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, rec)
+	}
+	return out, rows.Err()
+}
+
 // ── principals ─────────────────────────────────────────────────────────
 
 // PrincipalColumns is the shared column list for the principals table.
@@ -238,6 +324,36 @@ func PrincipalInsertArgs(p mtls.Principal, updatedAt string) ([]any, error) {
 		return nil, err
 	}
 	return []any{p.MatchedSAN, p.Name, groups, updatedAt}, nil
+}
+
+// ScanPrincipalRecord reads one principal row (over [PrincipalColumns]) plus a
+// trailing source column into a [PrincipalRecord].
+func ScanPrincipalRecord(sc RowScanner) (PrincipalRecord, error) {
+	var (
+		p              mtls.Principal
+		groups, source string
+	)
+	if err := sc.Scan(&p.MatchedSAN, &p.Name, &groups, &source); err != nil {
+		return PrincipalRecord{}, err
+	}
+	if err := DecodeJSON(groups, &p.Groups); err != nil {
+		return PrincipalRecord{}, err
+	}
+	return PrincipalRecord{Principal: p, Source: source}, nil
+}
+
+// ScanPrincipalRecords drains rows (over [PrincipalColumns] + source) into a
+// slice.
+func ScanPrincipalRecords(rows *sql.Rows) ([]PrincipalRecord, error) {
+	var out []PrincipalRecord
+	for rows.Next() {
+		rec, err := ScanPrincipalRecord(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, rec)
+	}
+	return out, rows.Err()
 }
 
 // ── revocations (SSH KRL) ────────────────────────────────────────────────

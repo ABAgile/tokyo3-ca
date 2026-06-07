@@ -400,6 +400,31 @@ internal/
   unmounted (404). Per-page template sets keep page-specific
   `{{define "title"}}`/`{{define "body"}}` blocks from clobbering each
   other.
+- **Native OIDC portal login.** When the `CERTD_PORTAL_OIDC_*` env is
+  set, the portal runs a browser Authorization-Code + PKCE flow against
+  the IdP (`/portal/auth/login` → `/authorize` → `/portal/auth/callback`),
+  verifies the ID token (signature + `nonce`), and seals an encrypted
+  session cookie (AES-256-GCM via `base/crypto`, `CERTD_PORTAL_SESSION_KEY`).
+  Access requires a valid session and membership in `CERTD_PORTAL_ADMIN_GROUP`
+  (default `ca-portal-admin`, minted as a SCIM group in the IdP). Reuses
+  `base/auth/oidcclient` for the token exchange and certd's own OIDC verifier
+  (a second instance keyed to the portal's `client_id`). Supersedes the HTTP
+  Basic gate; mutations are attributed to the signed-in user's email.
+- **Config reconciliation (GitOps).** `certd reconcile` diffs
+  `CERTD_ROLES_FILE` / `CERTD_MTLS_PRINCIPALS_FILE` against the database and
+  applies the difference, so file edits take effect after the seed-on-first-
+  boot. An owner-marker `source` column makes config authoritative over the
+  rows it owns (add / update / **prune** to match the files) while portal-
+  created rows (`source=portal`) are never pruned; a collision is a conflict,
+  skipped unless `--adopt` takes ownership. Dry-run by default; `--apply`
+  writes. Run it out-of-band from CD — no server endpoint, no extra auth.
+- **Owner-marker on policy rows.** Roles and principals carry a `source`
+  column — `config` (managed by `certd reconcile`) or `portal` (created in the
+  admin portal) — so reconcile can prune the config-owned set without touching
+  portal-created rows. Mutations (portal + reconcile) are recorded in the
+  structured log, attributed to the acting user (`oidc:<email>` /
+  `portal:<user>` / `config:<actor>`); the log ships to NATS via applog when
+  configured.
 - **Cert revocation.** `POST /api/v1/ssh/revoke` records a cert as
   revoked by serial or KeyID (authenticated via the same OIDC/mTLS
   paths the sign endpoints use); the entry persists in

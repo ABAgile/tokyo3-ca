@@ -116,6 +116,22 @@
 //	CERTD_PORTAL_REALM          Optional Basic-auth realm shown in the browser prompt. Default
 //	                            "certd portal".
 //
+//	CERTD_PORTAL_OIDC_ISSUER         When set (with the other CERTD_PORTAL_OIDC_* vars +
+//	                                 CERTD_PORTAL_SESSION_KEY), the portal runs native browser
+//	                                 OIDC login (Authorization-Code + PKCE) instead of HTTP Basic,
+//	                                 attributing mutations to the signed-in user. The portal is a
+//	                                 SEPARATE OIDC client from the sign path.
+//	CERTD_PORTAL_OIDC_CLIENT_ID      The portal's registered OIDC client_id (= ID-token audience).
+//	CERTD_PORTAL_OIDC_CLIENT_SECRET  The confidential-client secret (client_secret_post).
+//	CERTD_PORTAL_OIDC_REDIRECT_URL   Absolute callback URL — https://<certd>/portal/auth/callback —
+//	                                 registered as a redirect URI on the IdP client.
+//	CERTD_PORTAL_ADMIN_GROUP         Group claim required for portal access. Default
+//	                                 "ca-portal-admin" (mint it as a SCIM group in the IdP and
+//	                                 assign admins). Empty ⇒ any authenticated user may access.
+//	CERTD_PORTAL_SESSION_KEY         64-hex-char (32-byte) key sealing the portal session + flow
+//	                                 cookies (AES-256-GCM). Required to enable OIDC login; generate
+//	                                 with crypto.GenerateKEK. Rotating it invalidates live sessions.
+//
 //	CERTD_ROLES_FILE  Path to a JSON file holding the role table — top-level array of role
 //	                  objects matching the [policy.Role] shape (Name, GroupClaim,
 //	                  AllowedPrincipals, HostPatterns, SPIFFEPatterns, MaxFooCertTTL,
@@ -144,6 +160,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -153,6 +170,7 @@ import (
 	"time"
 
 	"github.com/abagile/tokyo3-base/cli"
+	"github.com/abagile/tokyo3-base/crypto"
 	"github.com/abagile/tokyo3-base/envutil"
 	"github.com/abagile/tokyo3-base/journal"
 	btls "github.com/abagile/tokyo3-base/tls"
@@ -160,6 +178,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/abagile/tokyo3-ca/internal/audit"
+	"github.com/abagile/tokyo3-ca/internal/reconcile"
 	"github.com/abagile/tokyo3-ca/internal/server/api"
 	"github.com/abagile/tokyo3-ca/internal/server/krl"
 	"github.com/abagile/tokyo3-ca/internal/server/mtls"
@@ -195,7 +214,7 @@ func rootCmd() *cobra.Command {
 		Use:   appName,
 		Short: "tokyo3-ca certificate authority server",
 	}
-	root.AddCommand(serveCmd(), versionCmd(), caCmd())
+	root.AddCommand(serveCmd(), versionCmd(), caCmd(), reconcileCmd())
 	return root
 }
 
@@ -209,6 +228,185 @@ func serveCmd() *cobra.Command {
 			return runServe(cmd.Context())
 		},
 	}
+}
+
+// ── reconcile ───────────────────────────────────────────────────────────────
+
+type reconcileOpts struct {
+	apply          bool
+	prune          bool
+	rolesOnly      bool
+	principalsOnly bool
+	adopt          bool
+	actor          string
+}
+
+func reconcileCmd() *cobra.Command {
+	o := reconcileOpts{prune: true}
+	cmd := &cobra.Command{
+		Use:   "reconcile",
+		Short: "Reconcile the role/principal tables to the config files (GitOps)",
+		Long: "Diff CERTD_ROLES_FILE / CERTD_MTLS_PRINCIPALS_FILE against the\n" +
+			"persistent store (CERTD_DATABASE_URL) and apply the difference.\n\n" +
+			"Config is authoritative over rows it owns (source=config): they are\n" +
+			"added, updated, and pruned to match the files. Portal-created rows\n" +
+			"(source=portal) are never pruned; a name/SAN collision is reported as\n" +
+			"a conflict and skipped unless --adopt takes ownership of it.\n\n" +
+			"Dry-run by default — prints the plan and changes nothing. Pass --apply\n" +
+			"to write. Every applied change lands with its audit entry in the same\n" +
+			"transaction (delivered to the ca_audit stream by a running certd serve).",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return runReconcile(cmd.Context(), o)
+		},
+	}
+	f := cmd.Flags()
+	f.BoolVar(&o.apply, "apply", false, "apply the changes (default: dry-run, print only)")
+	f.BoolVar(&o.prune, "prune", true, "delete config-owned rows absent from the files")
+	f.BoolVar(&o.rolesOnly, "roles-only", false, "reconcile only the role table")
+	f.BoolVar(&o.principalsOnly, "principals-only", false, "reconcile only the principal registry")
+	f.BoolVar(&o.adopt, "adopt", false, "take ownership of portal-created rows that collide with the files")
+	f.StringVar(&o.actor, "actor", "", "audit actor for config:<actor> (default: hostname)")
+	return cmd
+}
+
+func runReconcile(ctx context.Context, o reconcileOpts) error {
+	if o.rolesOnly && o.principalsOnly {
+		return errors.New("--roles-only and --principals-only are mutually exclusive")
+	}
+	rt := cli.App{Name: appName, EnvPrefix: "CERTD"}.Setup(ctx)
+	defer rt.Shutdown()
+	log := rt.Log
+
+	db, err := openStore(ctx, log)
+	if err != nil {
+		return fmt.Errorf("open store database: %w", err)
+	}
+	if db == nil {
+		return errors.New("reconcile requires CERTD_DATABASE_URL (no persistent store configured)")
+	}
+	defer envutil.CloseIfCloser(db)
+
+	actor := o.actor
+	if actor == "" {
+		actor, _ = os.Hostname()
+		if actor == "" {
+			actor = "reconcile"
+		}
+	}
+
+	var rolePlan reconcile.RolePlan
+	var principalPlan reconcile.PrincipalPlan
+
+	if !o.principalsOnly {
+		path := os.Getenv("CERTD_ROLES_FILE")
+		if path == "" {
+			return errors.New("CERTD_ROLES_FILE unset; nothing to reconcile for roles (use --principals-only to skip)")
+		}
+		roles, err := readRolesFile(path)
+		if err != nil {
+			return err
+		}
+		recs, err := db.Roles().AllWithSource()
+		if err != nil {
+			return fmt.Errorf("read role table: %w", err)
+		}
+		rolePlan = reconcile.DiffRoles(roles, recs, o.adopt)
+	}
+	if !o.rolesOnly {
+		path := os.Getenv("CERTD_MTLS_PRINCIPALS_FILE")
+		if path == "" {
+			return errors.New("CERTD_MTLS_PRINCIPALS_FILE unset; nothing to reconcile for principals (use --roles-only to skip)")
+		}
+		principals, err := readPrincipalsFile(path)
+		if err != nil {
+			return err
+		}
+		recs, err := db.Principals().AllWithSource()
+		if err != nil {
+			return fmt.Errorf("read principal registry: %w", err)
+		}
+		principalPlan = reconcile.DiffPrincipals(principals, recs, o.adopt)
+	}
+
+	printReconcilePlan(os.Stdout, rolePlan, principalPlan, o.prune)
+	warnConflicts(log, rolePlan.Conflicts, principalPlan.Conflicts, o.adopt)
+
+	if !o.apply {
+		if rolePlan.Empty() && principalPlan.Empty() {
+			log.Info("reconcile: already in sync — nothing to apply")
+		} else {
+			log.Info("reconcile: dry-run — re-run with --apply to write the changes above")
+		}
+		return nil
+	}
+
+	roleApplied, err := rolePlan.ApplyRoles(db.Roles(), o.prune)
+	if err != nil {
+		return fmt.Errorf("apply roles: %w", err)
+	}
+	principalApplied, err := principalPlan.ApplyPrincipals(db.Principals(), o.prune)
+	if err != nil {
+		return fmt.Errorf("apply principals: %w", err)
+	}
+
+	// The applied change is recorded in the structured log (shipped to NATS
+	// via applog when configured) — the audit trail for reconcile runs.
+	log.Info("reconcile: applied",
+		"roles_added", roleApplied.Added, "roles_updated", roleApplied.Updated, "roles_pruned", roleApplied.Pruned,
+		"principals_added", principalApplied.Added, "principals_updated", principalApplied.Updated, "principals_pruned", principalApplied.Pruned,
+		"actor", actor)
+	return nil
+}
+
+// printReconcilePlan renders the human-readable diff.
+func printReconcilePlan(w io.Writer, rp reconcile.RolePlan, pp reconcile.PrincipalPlan, prune bool) {
+	line := func(kind string, items []string) {
+		for _, it := range items {
+			fmt.Fprintf(w, "  %-8s %s\n", kind, it)
+		}
+	}
+	fmt.Fprintln(w, "roles:")
+	line("add", roleNames(rp.Add))
+	line("update", roleNames(rp.Update))
+	if prune {
+		line("prune", rp.Prune)
+	} else {
+		line("orphan", rp.Prune) // would prune, but --prune=false
+	}
+	line("conflict", rp.Conflicts)
+	fmt.Fprintln(w, "principals:")
+	line("add", principalSANs(pp.Add))
+	line("update", principalSANs(pp.Update))
+	if prune {
+		line("prune", pp.Prune)
+	} else {
+		line("orphan", pp.Prune)
+	}
+	line("conflict", pp.Conflicts)
+}
+
+func warnConflicts(log *slog.Logger, roleConflicts, principalConflicts []string, adopt bool) {
+	if adopt || (len(roleConflicts) == 0 && len(principalConflicts) == 0) {
+		return
+	}
+	log.Warn("reconcile: skipping portal-owned rows that collide with the config files; re-run with --adopt to take ownership",
+		"role_conflicts", roleConflicts, "principal_conflicts", principalConflicts)
+}
+
+func roleNames(rs []policy.Role) []string {
+	out := make([]string, len(rs))
+	for i, r := range rs {
+		out[i] = r.Name
+	}
+	return out
+}
+
+func principalSANs(ps []mtls.Principal) []string {
+	out := make([]string, len(ps))
+	for i, p := range ps {
+		out[i] = p.MatchedSAN
+	}
+	return out
 }
 
 // envFloat reads a float env var; empty/unset ⇒ 0 with no error.
@@ -373,6 +571,11 @@ func runServe(ctx context.Context) error {
 		log.Info("x509 renewal/anti-theft guard active")
 	}
 
+	portalOIDC, err := loadPortalOIDC(log)
+	if err != nil {
+		return fmt.Errorf("portal oidc: %w", err)
+	}
+
 	portalSrv, err := portal.New(portal.Config{
 		Version:         Version,
 		Log:             log,
@@ -385,6 +588,7 @@ func runServe(ctx context.Context) error {
 			Password: os.Getenv("CERTD_PORTAL_PASSWORD"),
 			Realm:    os.Getenv("CERTD_PORTAL_REALM"),
 		},
+		OIDC: portalOIDC,
 	})
 	if err != nil {
 		return fmt.Errorf("portal: %w", err)
@@ -523,6 +727,46 @@ func loadOIDCVerifier(_ context.Context, log *slog.Logger) (oidc.TokenVerifier, 
 	}
 	log.Info("oidc verifier configured (lazy)", "issuer", issuer, "audience", audience)
 	return v, nil
+}
+
+// loadPortalOIDC builds the portal's native-OIDC login config from
+// CERTD_PORTAL_OIDC_* env. All of issuer / client-id / client-secret /
+// redirect-url / session-key must be set to enable it; any unset ⇒ disabled
+// (the portal falls back to the Basic-auth gate). The portal client is a
+// SEPARATE OIDC client from the sign path, so it gets its own lazy verifier
+// keyed to its own audience (client_id).
+func loadPortalOIDC(log *slog.Logger) (portal.OIDCConfig, error) {
+	issuer := os.Getenv("CERTD_PORTAL_OIDC_ISSUER")
+	clientID := os.Getenv("CERTD_PORTAL_OIDC_CLIENT_ID")
+	secret := os.Getenv("CERTD_PORTAL_OIDC_CLIENT_SECRET")
+	redirect := os.Getenv("CERTD_PORTAL_OIDC_REDIRECT_URL")
+	keyHex := os.Getenv("CERTD_PORTAL_SESSION_KEY")
+	adminGroup := envutil.Or("CERTD_PORTAL_ADMIN_GROUP", "ca-portal-admin")
+
+	if issuer == "" && clientID == "" && secret == "" && redirect == "" && keyHex == "" {
+		return portal.OIDCConfig{}, nil // not configured — Basic-auth path
+	}
+	if issuer == "" || clientID == "" || secret == "" || redirect == "" || keyHex == "" {
+		return portal.OIDCConfig{}, fmt.Errorf("portal OIDC is partially configured: CERTD_PORTAL_OIDC_ISSUER, _CLIENT_ID, _CLIENT_SECRET, _REDIRECT_URL and CERTD_PORTAL_SESSION_KEY must all be set together")
+	}
+	key, err := crypto.ParseKEK(keyHex)
+	if err != nil {
+		return portal.OIDCConfig{}, fmt.Errorf("CERTD_PORTAL_SESSION_KEY: %w (want 64 hex chars / 32 bytes — generate with crypto.GenerateKEK)", err)
+	}
+	v, err := oidc.NewLazyHTTPVerifier(issuer, clientID)
+	if err != nil {
+		return portal.OIDCConfig{}, err
+	}
+	log.Info("portal oidc login enabled (lazy)", "issuer", issuer, "client_id", clientID, "admin_group", adminGroup)
+	return portal.OIDCConfig{
+		Issuer:       issuer,
+		ClientID:     clientID,
+		ClientSecret: secret,
+		RedirectURL:  redirect,
+		AdminGroup:   adminGroup,
+		Verifier:     v,
+		SessionKey:   key,
+	}, nil
 }
 
 // loadX509Issuer returns the CA cert used as the issuer for X.509 / SPIFFE

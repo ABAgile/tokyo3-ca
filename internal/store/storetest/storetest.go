@@ -39,7 +39,7 @@ func RunRoleStoreSuite(t *testing.T, newStore func(t *testing.T) store.RoleStore
 	t.Run("AddRoundTrip", func(t *testing.T) {
 		rs := newStore(t)
 		want := sampleRole()
-		if err := rs.Add(want); err != nil {
+		if err := rs.Add(want, store.SourcePortal); err != nil {
 			t.Fatalf("Add: %v", err)
 		}
 		got, ok := rs.ByName(want.Name)
@@ -48,6 +48,14 @@ func RunRoleStoreSuite(t *testing.T, newStore func(t *testing.T) store.RoleStore
 		}
 		if !reflect.DeepEqual(got, want) {
 			t.Errorf("round-trip mismatch:\n got=%+v\nwant=%+v", got, want)
+		}
+		// The owner-marker source round-trips via AllWithSource.
+		recs, err := rs.AllWithSource()
+		if err != nil {
+			t.Fatalf("AllWithSource: %v", err)
+		}
+		if len(recs) != 1 || recs[0].Source != store.SourcePortal {
+			t.Errorf("AllWithSource = %+v, want one row sourced %q", recs, store.SourcePortal)
 		}
 	})
 
@@ -58,7 +66,7 @@ func RunRoleStoreSuite(t *testing.T, newStore func(t *testing.T) store.RoleStore
 			{Name: "b", GroupClaim: "platform", HostPatterns: []string{"*.internal"}},
 			{Name: "c", GroupClaim: "audit"},
 		} {
-			if err := rs.Add(r); err != nil {
+			if err := rs.Add(r, store.SourceConfig); err != nil {
 				t.Fatalf("Add %s: %v", r.Name, err)
 			}
 		}
@@ -76,13 +84,13 @@ func RunRoleStoreSuite(t *testing.T, newStore func(t *testing.T) store.RoleStore
 	t.Run("AddDuplicate", func(t *testing.T) {
 		rs := newStore(t)
 		r := sampleRole()
-		if err := rs.Add(r); err != nil {
+		if err := rs.Add(r, store.SourceConfig); err != nil {
 			t.Fatalf("first Add: %v", err)
 		}
-		if err := rs.Add(r); !errors.Is(err, policy.ErrRoleExists) {
+		if err := rs.Add(r, store.SourceConfig); !errors.Is(err, policy.ErrRoleExists) {
 			t.Errorf("duplicate Add err = %v, want ErrRoleExists", err)
 		}
-		if err := rs.Add(policy.Role{}); err == nil {
+		if err := rs.Add(policy.Role{}, store.SourceConfig); err == nil {
 			t.Error("Add with empty name: want error, got nil")
 		}
 	})
@@ -92,7 +100,7 @@ func RunRoleStoreSuite(t *testing.T, newStore func(t *testing.T) store.RoleStore
 		mustAddRole(t, rs, policy.Role{Name: "old", GroupClaim: "g1"})
 		mustAddRole(t, rs, policy.Role{Name: "other", GroupClaim: "g2"})
 
-		if err := rs.Replace("old", policy.Role{Name: "new", GroupClaim: "g3"}); err != nil {
+		if err := rs.Replace("old", policy.Role{Name: "new", GroupClaim: "g3"}, store.SourcePortal); err != nil {
 			t.Fatalf("Replace rename: %v", err)
 		}
 		if _, ok := rs.ByName("old"); ok {
@@ -101,10 +109,10 @@ func RunRoleStoreSuite(t *testing.T, newStore func(t *testing.T) store.RoleStore
 		if got, ok := rs.ByName("new"); !ok || got.GroupClaim != "g3" {
 			t.Errorf("renamed role = %+v ok=%v, want GroupClaim g3", got, ok)
 		}
-		if err := rs.Replace("new", policy.Role{Name: "other"}); !errors.Is(err, policy.ErrRoleExists) {
+		if err := rs.Replace("new", policy.Role{Name: "other"}, store.SourcePortal); !errors.Is(err, policy.ErrRoleExists) {
 			t.Errorf("collision Replace err = %v, want ErrRoleExists", err)
 		}
-		if err := rs.Replace("ghost", policy.Role{Name: "ghost"}); !errors.Is(err, policy.ErrRoleNotFound) {
+		if err := rs.Replace("ghost", policy.Role{Name: "ghost"}, store.SourcePortal); !errors.Is(err, policy.ErrRoleNotFound) {
 			t.Errorf("absent Replace err = %v, want ErrRoleNotFound", err)
 		}
 	})
@@ -192,6 +200,86 @@ func RunPrincipalStoreSuite(t *testing.T, newStore func(t *testing.T) store.Prin
 			t.Errorf("empty Lookup err = %v, want ErrNoClientCert", err)
 		}
 	})
+
+	t.Run("AddBySANRoundTrip", func(t *testing.T) {
+		ps := newStore(t)
+		want := mtls.Principal{Name: "app", MatchedSAN: "spiffe://demo/app", Groups: []string{"workload"}}
+		if err := ps.Add(want, store.SourcePortal); err != nil {
+			t.Fatalf("Add: %v", err)
+		}
+		got, ok := ps.BySAN(want.MatchedSAN)
+		if !ok || !reflect.DeepEqual(got, want) {
+			t.Errorf("BySAN = %+v ok=%v, want %+v", got, ok, want)
+		}
+		if _, ok := ps.BySAN("spiffe://absent"); ok {
+			t.Error("BySAN(absent) = true, want false")
+		}
+		recs, err := ps.AllWithSource()
+		if err != nil {
+			t.Fatalf("AllWithSource: %v", err)
+		}
+		if len(recs) != 1 || recs[0].Source != store.SourcePortal {
+			t.Errorf("AllWithSource = %+v, want one row sourced %q", recs, store.SourcePortal)
+		}
+	})
+
+	t.Run("AddDuplicate", func(t *testing.T) {
+		ps := newStore(t)
+		p := mtls.Principal{Name: "app", MatchedSAN: "spiffe://demo/app"}
+		if err := ps.Add(p, store.SourceConfig); err != nil {
+			t.Fatalf("first Add: %v", err)
+		}
+		if err := ps.Add(p, store.SourceConfig); !errors.Is(err, mtls.ErrPrincipalExists) {
+			t.Errorf("duplicate Add err = %v, want ErrPrincipalExists", err)
+		}
+		if err := ps.Add(mtls.Principal{Name: "no-san"}, store.SourceConfig); err == nil {
+			t.Error("Add with empty SAN: want error, got nil")
+		}
+	})
+
+	t.Run("Replace", func(t *testing.T) {
+		ps := newStore(t)
+		mustAddPrincipal(t, ps, mtls.Principal{Name: "old", MatchedSAN: "spiffe://demo/old"})
+		mustAddPrincipal(t, ps, mtls.Principal{Name: "other", MatchedSAN: "spiffe://demo/other"})
+
+		// Re-key (SAN change) + payload update.
+		if err := ps.Replace("spiffe://demo/old", mtls.Principal{Name: "new", MatchedSAN: "spiffe://demo/new", Groups: []string{"g"}}, store.SourcePortal); err != nil {
+			t.Fatalf("Replace re-key: %v", err)
+		}
+		if _, ok := ps.BySAN("spiffe://demo/old"); ok {
+			t.Error("old SAN still present after re-key")
+		}
+		if got, ok := ps.BySAN("spiffe://demo/new"); !ok || got.Name != "new" {
+			t.Errorf("re-keyed principal = %+v ok=%v, want name new", got, ok)
+		}
+		if err := ps.Replace("spiffe://demo/new", mtls.Principal{Name: "x", MatchedSAN: "spiffe://demo/other"}, store.SourcePortal); !errors.Is(err, mtls.ErrPrincipalExists) {
+			t.Errorf("collision Replace err = %v, want ErrPrincipalExists", err)
+		}
+		if err := ps.Replace("spiffe://ghost", mtls.Principal{Name: "g", MatchedSAN: "spiffe://ghost2"}, store.SourcePortal); !errors.Is(err, mtls.ErrPrincipalNotFound) {
+			t.Errorf("absent Replace err = %v, want ErrPrincipalNotFound", err)
+		}
+	})
+
+	t.Run("Delete", func(t *testing.T) {
+		ps := newStore(t)
+		mustAddPrincipal(t, ps, mtls.Principal{Name: "doomed", MatchedSAN: "spiffe://demo/doomed"})
+		if err := ps.Delete("spiffe://demo/doomed"); err != nil {
+			t.Fatalf("Delete: %v", err)
+		}
+		if _, ok := ps.BySAN("spiffe://demo/doomed"); ok {
+			t.Error("principal present after Delete")
+		}
+		if err := ps.Delete("spiffe://demo/doomed"); !errors.Is(err, mtls.ErrPrincipalNotFound) {
+			t.Errorf("second Delete err = %v, want ErrPrincipalNotFound", err)
+		}
+	})
+}
+
+func mustAddPrincipal(t *testing.T, ps store.PrincipalStore, p mtls.Principal) {
+	t.Helper()
+	if err := ps.Add(p, store.SourceConfig); err != nil {
+		t.Fatalf("Add %s: %v", p.MatchedSAN, err)
+	}
 }
 
 // ── revocations ──────────────────────────────────────────────────────────
@@ -400,7 +488,7 @@ func RunActiveCertStoreSuite(t *testing.T, newStore func(t *testing.T) store.Act
 
 func mustAddRole(t *testing.T, rs store.RoleStore, r policy.Role) {
 	t.Helper()
-	if err := rs.Add(r); err != nil {
+	if err := rs.Add(r, store.SourceConfig); err != nil {
 		t.Fatalf("Add %s: %v", r.Name, err)
 	}
 }

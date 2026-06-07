@@ -120,7 +120,14 @@ type Config struct {
 	// (except /healthz) must present matching Basic creds; otherwise
 	// the portal stays open and operators front it with their own
 	// identity-aware edge.
+	//
+	// Ignored when OIDC is enabled — native OIDC login supersedes it.
 	BasicAuth BasicAuthConfig
+
+	// OIDC, when enabled (see OIDCConfig.enabled), gates the portal behind
+	// native browser OIDC login + an optional admin-group check, and
+	// attributes mutations to the signed-in user. Supersedes BasicAuth.
+	OIDC OIDCConfig
 }
 
 // New parses the portal templates and returns a ready [Server].
@@ -176,18 +183,13 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /audit", s.handleAuditIndex)
 	mux.HandleFunc("GET /revocations", s.handleRevocationsIndex)
 	mux.HandleFunc("POST /revocations", s.handleRevocationsCreate)
-	return requireBasicAuth(s.cfg.BasicAuth, mux)
-}
-
-// mutableStore narrows RoleStore to its mutation surface when the
-// configured store supports it. Returns nil when the store is
-// read-only — the write routes use this to short-circuit with 405.
-func (s *Server) mutableStore() MutableRoleStore {
-	if s.cfg.RoleStore == nil {
-		return nil
+	if s.cfg.OIDC.enabled() {
+		mux.HandleFunc("GET /auth/login", s.handleAuthLogin)
+		mux.HandleFunc("GET /auth/callback", s.handleAuthCallback)
+		mux.HandleFunc("POST /auth/logout", s.handleAuthLogout)
+		return s.requirePortalAuth(mux)
 	}
-	m, _ := s.cfg.RoleStore.(MutableRoleStore)
-	return m
+	return requireBasicAuth(s.cfg.BasicAuth, mux)
 }
 
 // indexData is the model passed to the landing page template.
@@ -320,7 +322,7 @@ type roleFormFields struct {
 }
 
 func (s *Server) handleRoleNewForm(w http.ResponseWriter, r *http.Request) {
-	if s.mutableStore() == nil {
+	if s.roleWriter(r) == nil {
 		http.Error(w, "role store is read-only", http.StatusMethodNotAllowed)
 		return
 	}
@@ -335,8 +337,8 @@ func (s *Server) handleRoleNewForm(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleRoleCreate(w http.ResponseWriter, r *http.Request) {
-	store := s.mutableStore()
-	if store == nil {
+	rw := s.roleWriter(r)
+	if rw == nil {
 		http.Error(w, "role store is read-only", http.StatusMethodNotAllowed)
 		return
 	}
@@ -353,22 +355,22 @@ func (s *Server) handleRoleCreate(w http.ResponseWriter, r *http.Request) {
 		s.renderFormError(w, r, "create", "/roles/new", "Create role", "", fields, err)
 		return
 	}
-	if err := store.Add(role); err != nil {
+	if err := rw.Add(role); err != nil {
 		s.renderFormError(w, r, "create", "/roles/new", "Create role", "", fields, err)
 		return
 	}
-	s.cfg.Log.Info("portal: role created", "name", role.Name)
+	s.cfg.Log.Info("portal: role created", "name", role.Name, "caller", rw.caller)
 	http.Redirect(w, r, "/roles/"+role.Name, http.StatusSeeOther)
 }
 
 func (s *Server) handleRoleEditForm(w http.ResponseWriter, r *http.Request) {
-	store := s.mutableStore()
-	if store == nil {
+	rw := s.roleWriter(r)
+	if rw == nil {
 		http.Error(w, "role store is read-only", http.StatusMethodNotAllowed)
 		return
 	}
 	name := r.PathValue("name")
-	role, ok := store.ByName(name)
+	role, ok := rw.byName(name)
 	if !ok {
 		http.Error(w, "role not found", http.StatusNotFound)
 		return
@@ -386,8 +388,8 @@ func (s *Server) handleRoleEditForm(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleRoleUpdate(w http.ResponseWriter, r *http.Request) {
-	store := s.mutableStore()
-	if store == nil {
+	rw := s.roleWriter(r)
+	if rw == nil {
 		http.Error(w, "role store is read-only", http.StatusMethodNotAllowed)
 		return
 	}
@@ -405,17 +407,17 @@ func (s *Server) handleRoleUpdate(w http.ResponseWriter, r *http.Request) {
 		s.renderFormError(w, r, "edit", "/roles/"+oldName+"/edit", "Save changes", oldName, fields, err)
 		return
 	}
-	if err := store.Replace(oldName, role); err != nil {
+	if err := rw.Replace(oldName, role); err != nil {
 		s.renderFormError(w, r, "edit", "/roles/"+oldName+"/edit", "Save changes", oldName, fields, err)
 		return
 	}
-	s.cfg.Log.Info("portal: role updated", "old_name", oldName, "name", role.Name)
+	s.cfg.Log.Info("portal: role updated", "old_name", oldName, "name", role.Name, "caller", rw.caller)
 	http.Redirect(w, r, "/roles/"+role.Name, http.StatusSeeOther)
 }
 
 func (s *Server) handleRoleDelete(w http.ResponseWriter, r *http.Request) {
-	store := s.mutableStore()
-	if store == nil {
+	rw := s.roleWriter(r)
+	if rw == nil {
 		http.Error(w, "role store is read-only", http.StatusMethodNotAllowed)
 		return
 	}
@@ -428,7 +430,7 @@ func (s *Server) handleRoleDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	name := r.PathValue("name")
-	if err := store.Delete(name); err != nil {
+	if err := rw.Delete(name); err != nil {
 		if errors.Is(err, policy.ErrRoleNotFound) {
 			http.Error(w, "role not found", http.StatusNotFound)
 			return
@@ -437,7 +439,7 @@ func (s *Server) handleRoleDelete(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "delete failed", http.StatusInternalServerError)
 		return
 	}
-	s.cfg.Log.Info("portal: role deleted", "name", name)
+	s.cfg.Log.Info("portal: role deleted", "name", name, "caller", rw.caller)
 	http.Redirect(w, r, "/roles", http.StatusSeeOther)
 }
 

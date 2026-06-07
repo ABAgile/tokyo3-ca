@@ -59,6 +59,15 @@ var ErrUnknownPrincipal = errors.New("no registered cert principal matches the c
 // other paths when present.
 var ErrNoClientCert = errors.New("no verified client certificate on request")
 
+// ErrPrincipalExists is returned by the persistent store's Add when a
+// principal is already registered under the same SAN. Mirrors
+// [github.com/abagile/tokyo3-ca/internal/server/policy.ErrRoleExists].
+var ErrPrincipalExists = errors.New("principal with that SAN already exists")
+
+// ErrPrincipalNotFound is returned by the persistent store's Replace and
+// Delete when no principal is registered under the target SAN.
+var ErrPrincipalNotFound = errors.New("principal not found")
+
 // InMemoryStore is a thread-safe in-memory [Store]. Seeded at
 // startup; mutate via ReplaceAll for hot-reload when the registry is
 // rewritten by the admin API.
