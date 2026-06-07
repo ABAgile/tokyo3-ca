@@ -11,6 +11,7 @@ require (
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/spf13/cobra v1.10.2
 	golang.org/x/crypto v0.52.0
+	golang.org/x/time v0.15.0
 	modernc.org/sqlite v1.51.0
 )
 

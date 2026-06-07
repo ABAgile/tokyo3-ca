@@ -318,6 +318,15 @@ docker compose logs certd | grep 'runtime stats'            # goroutines/os_thre
 Never set `CERTD_DEBUG_ADDR` on a deployed certd — pprof is
 unauthenticated and rides its own listener, off the mTLS API.
 
+**Rate limiting.** Set `CERTD_RATE_LIMIT_RPS` (with optional
+`CERTD_RATE_LIMIT_BURST`) to cap requests per source IP via an
+in-process token bucket — defense-in-depth that shields the auth path
+and CA signer from a single-source flood. It is disabled by default,
+per-replica (not distributed), and exempts `/healthz`; an edge LB/WAF
+remains the answer for volumetric/distributed DoS. Keying is on the
+peer IP — set `CERTD_TRUSTED_PROXIES` to a CIDR list to instead trust
+`X-Forwarded-For` from those proxies.
+
 See `shared/certs/gen.sh` for cert-generation details.
 
 ## Layout

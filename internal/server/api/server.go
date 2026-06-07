@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"net"
 	"net/http"
 
 	"github.com/abagile/tokyo3-base/journal"
@@ -41,6 +42,7 @@ type Server struct {
 	portal           *portal.Server           // Admin web UI; nil disables /portal/* routes.
 	krl              krl.Store                // Revocation registry; nil disables /api/v1/ssh/revoke + /revocations.
 	activeCerts      store.ActiveCertStore    // X.509 renewal/anti-theft guard state; nil disables the guard.
+	rateLimiter      *rateLimiter             // Per-source-IP request limiter; nil disables rate limiting.
 	version          string                   // build-time version string, surfaced in /healthz; empty allowed.
 }
 
@@ -115,6 +117,20 @@ type Config struct {
 	// Version is the build-time semver / commit identifier surfaced in
 	// /healthz. Empty acceptable but discouraged in deployed builds.
 	Version string
+	// RateLimitRPS enables per-source-IP request rate limiting at the given
+	// requests/second when > 0. Zero (the default) disables it entirely.
+	// Keyed on the immediate peer IP (r.RemoteAddr), not X-Forwarded-For —
+	// see TrustedProxies. /healthz is always exempt.
+	RateLimitRPS float64
+	// RateLimitBurst is the token-bucket burst (requests absorbed in an
+	// instant before throttling). Ignored when RateLimitRPS is 0; coerced
+	// to 1 when rate limiting is on and this is < 1.
+	RateLimitBurst int
+	// TrustedProxies are CIDRs of reverse proxies whose X-Forwarded-For
+	// header may be trusted for rate-limit keying. Empty (the default) ⇒
+	// X-Forwarded-For is ignored and the peer IP is always the key, so the
+	// header cannot be used to spoof a source and evade the limit.
+	TrustedProxies []*net.IPNet
 }
 
 // New constructs a Server from cfg, validating that the required
@@ -148,6 +164,7 @@ func New(cfg Config) (*Server, error) {
 		portal:           cfg.Portal,
 		krl:              cfg.KRL,
 		activeCerts:      cfg.ActiveCertStore,
+		rateLimiter:      newRateLimiter(cfg.RateLimitRPS, cfg.RateLimitBurst, cfg.TrustedProxies),
 		version:          cfg.Version,
 	}, nil
 }
@@ -171,7 +188,7 @@ func (s *Server) Routes() http.Handler {
 	if s.portal != nil {
 		mux.Handle("/portal/", http.StripPrefix("/portal", s.portal.Routes()))
 	}
-	return mux
+	return s.rateLimit(mux)
 }
 
 // healthzResponse is the body returned by GET /healthz. Stable for

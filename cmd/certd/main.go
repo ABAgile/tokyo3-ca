@@ -18,6 +18,18 @@
 //	                  — it serves unauthenticated profiling on its own listener, off the mTLS
 //	                  API.
 //
+//	CERTD_RATE_LIMIT_RPS    Per-source-IP request rate limit, in requests/second. Unset or 0 ⇒
+//	                        rate limiting disabled. In-process, per-replica defense-in-depth
+//	                        (shields the auth path + CA signer from a single-source flood); not a
+//	                        substitute for an upstream LB/WAF against volumetric DoS. /healthz is
+//	                        always exempt.
+//	CERTD_RATE_LIMIT_BURST  Token-bucket burst — requests absorbed in an instant before
+//	                        throttling. Defaults to 1 when CERTD_RATE_LIMIT_RPS is set.
+//	CERTD_TRUSTED_PROXIES   Comma-separated CIDRs (or bare IPs) of reverse proxies whose
+//	                        X-Forwarded-For is trusted for rate-limit keying. Unset ⇒ X-Forwarded-For
+//	                        is ignored and the peer IP is the key, so the header can't be used to
+//	                        spoof a source and evade the limit.
+//
 //	CERTD_API_CERT       Server TLS certificate PEM path. Hot-reloaded (mtime polled at most
 //	                     once per second across handshakes, so rotations land within ~1s).
 //	CERTD_API_KEY        Server TLS private key PEM path. Required iff CERTD_API_CERT is set. If
@@ -133,8 +145,10 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -197,12 +211,77 @@ func serveCmd() *cobra.Command {
 	}
 }
 
+// envFloat reads a float env var; empty/unset ⇒ 0 with no error.
+func envFloat(key string) (float64, error) {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return 0, nil
+	}
+	return strconv.ParseFloat(v, 64)
+}
+
+// envInt reads an int env var; empty/unset ⇒ 0 with no error.
+func envInt(key string) (int, error) {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return 0, nil
+	}
+	return strconv.Atoi(v)
+}
+
+// parseCIDRList parses a comma-separated list of CIDRs (a bare IP is treated
+// as a /32 or /128). Empty input ⇒ nil, nil.
+func parseCIDRList(s string) ([]*net.IPNet, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil, nil
+	}
+	var out []*net.IPNet
+	for part := range strings.SplitSeq(s, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if !strings.Contains(part, "/") {
+			if ip := net.ParseIP(part); ip != nil {
+				if ip.To4() != nil {
+					part += "/32"
+				} else {
+					part += "/128"
+				}
+			}
+		}
+		_, n, err := net.ParseCIDR(part)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, n)
+	}
+	return out, nil
+}
+
 func runServe(ctx context.Context) error {
 	rt := cli.App{Name: appName, EnvPrefix: "CERTD"}.Setup(ctx)
 	defer rt.Shutdown()
 	log := rt.Log
 
 	addr := envutil.Or("CERTD_ADDR", ":8443")
+
+	rlRPS, err := envFloat("CERTD_RATE_LIMIT_RPS")
+	if err != nil {
+		return fmt.Errorf("CERTD_RATE_LIMIT_RPS: %w", err)
+	}
+	rlBurst, err := envInt("CERTD_RATE_LIMIT_BURST")
+	if err != nil {
+		return fmt.Errorf("CERTD_RATE_LIMIT_BURST: %w", err)
+	}
+	trustedProxies, err := parseCIDRList(os.Getenv("CERTD_TRUSTED_PROXIES"))
+	if err != nil {
+		return fmt.Errorf("CERTD_TRUSTED_PROXIES: %w", err)
+	}
+	if rlRPS > 0 {
+		log.Info("rate limiting enabled", "rps", rlRPS, "burst", rlBurst, "trusted_proxies", len(trustedProxies))
+	}
 
 	caSigner, err := loadCASigner(ctx, log)
 	if err != nil {
@@ -325,6 +404,9 @@ func runServe(ctx context.Context) error {
 		Portal:           portalSrv,
 		KRL:              krlStore,
 		ActiveCertStore:  activeCerts,
+		RateLimitRPS:     rlRPS,
+		RateLimitBurst:   rlBurst,
+		TrustedProxies:   trustedProxies,
 		Version:          Version,
 	})
 	if err != nil {
