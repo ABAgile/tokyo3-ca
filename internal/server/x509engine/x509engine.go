@@ -298,6 +298,22 @@ func validate(p WorkloadCertParams, caCert *x509.Certificate) error {
 // Production deployments may instead load a CA cert from disk — this
 // helper is the convenience path for dev / first-boot bootstrapping.
 func NewSelfSignedCA(rnd io.Reader, caSigner signer.Signer, commonName string) (*x509.Certificate, error) {
+	return selfSignedCA(rnd, caSigner, commonName, 0)
+}
+
+// NewSelfSignedRootCA mints a self-signed root with a path-length budget of 1,
+// so it can sign exactly one level of intermediate CA (which then signs leaves).
+// Use this — not [NewSelfSignedCA] — for the offline root in a two-tier
+// hierarchy: [NewSelfSignedCA]'s path-length-0 cert may not sign any sub-CA, so
+// an intermediate beneath it would fail to verify.
+func NewSelfSignedRootCA(rnd io.Reader, caSigner signer.Signer, commonName string) (*x509.Certificate, error) {
+	return selfSignedCA(rnd, caSigner, commonName, 1)
+}
+
+// selfSignedCA mints a self-signed CA cert with the given path-length budget:
+// maxPathLen <= 0 ⇒ path-length 0 (MaxPathLenZero — direct leaf issuance only,
+// no sub-CAs); maxPathLen >= 1 ⇒ that many sub-CA levels permitted beneath it.
+func selfSignedCA(rnd io.Reader, caSigner signer.Signer, commonName string, maxPathLen int) (*x509.Certificate, error) {
 	if caSigner == nil {
 		return nil, errors.New("ca signer is required")
 	}
@@ -316,7 +332,11 @@ func NewSelfSignedCA(rnd io.Reader, caSigner signer.Signer, commonName string) (
 		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign | x509.KeyUsageDigitalSignature,
 		BasicConstraintsValid: true,
 		IsCA:                  true,
-		MaxPathLenZero:        true, // direct issuance only; no sub-CAs
+	}
+	if maxPathLen <= 0 {
+		tmpl.MaxPathLenZero = true // direct issuance only; no sub-CAs
+	} else {
+		tmpl.MaxPathLen = maxPathLen
 	}
 	der, err := x509.CreateCertificate(rnd, tmpl, tmpl, caSigner.Public(), caSigner)
 	if err != nil {
@@ -327,6 +347,83 @@ func NewSelfSignedCA(rnd io.Reader, caSigner signer.Signer, commonName string) (
 		return nil, fmt.Errorf("re-parse self-signed ca: %w", err)
 	}
 	return cert, nil
+}
+
+// IntermediateCertParams describes an intermediate-CA signing request.
+type IntermediateCertParams struct {
+	// PublicKey is the intermediate's public key — the half certd will sign
+	// leaves with. The private half is sealed at the ceremony and unsealed
+	// into certd's memory at boot; it never touches the root's host.
+	PublicKey crypto.PublicKey
+	// SubjectCommonName is the intermediate's Subject CN; defaults to
+	// "tokyo3-ca intermediate" when empty.
+	SubjectCommonName string
+	// ValidAfter / ValidBefore bound validity. ValidBefore must be after
+	// ValidAfter; it is additionally clamped to the root's NotAfter (an
+	// intermediate must never outlive its root — same chain invariant a leaf
+	// has against its issuer).
+	ValidAfter  time.Time
+	ValidBefore time.Time
+	// Serial is the cert serial (caller-unique).
+	Serial *big.Int
+}
+
+// SignIntermediateCA builds an intermediate-CA cert per p, signed by rootSigner
+// against rootCert, and returns the parsed cert. The intermediate is itself a
+// CA (it signs leaves) but path-length 0 — it may not mint further sub-CAs. Its
+// NotAfter is clamped to the root's by [signTemplate], so the chain never
+// outlives the root.
+func SignIntermediateCA(rnd io.Reader, rootSigner signer.Signer, rootCert *x509.Certificate, p IntermediateCertParams) (*x509.Certificate, error) {
+	if err := validateIntermediate(p, rootCert); err != nil {
+		return nil, err
+	}
+	cn := p.SubjectCommonName
+	if cn == "" {
+		cn = "tokyo3-ca intermediate"
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          p.Serial,
+		Subject:               pkix.Name{CommonName: cn},
+		NotBefore:             p.ValidAfter,
+		NotAfter:              p.ValidBefore,
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign | x509.KeyUsageDigitalSignature,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+		MaxPathLenZero:        true, // signs leaves only; no further sub-CAs
+	}
+	return signTemplate(rnd, rootSigner, rootCert, p.PublicKey, tmpl)
+}
+
+// validateIntermediate enforces required-field invariants on an
+// IntermediateCertParams before signing. The path-length guard catches the
+// common mistake of using a [NewSelfSignedCA] root (path-length 0) where a
+// [NewSelfSignedRootCA] (path-length 1) is required.
+func validateIntermediate(p IntermediateCertParams, rootCert *x509.Certificate) error {
+	if rootCert == nil {
+		return errors.New("root cert is required")
+	}
+	if !rootCert.IsCA {
+		return errors.New("root cert is not marked as a CA (IsCA=false)")
+	}
+	if rootCert.MaxPathLenZero {
+		return errors.New("root cert has path length 0 (MaxPathLenZero) and cannot sign an intermediate CA; mint the root with NewSelfSignedRootCA")
+	}
+	if p.PublicKey == nil {
+		return errors.New("public key is required")
+	}
+	if p.Serial == nil {
+		return errors.New("serial is required")
+	}
+	if p.ValidAfter.IsZero() {
+		return errors.New("valid-after is required")
+	}
+	if !p.ValidBefore.After(p.ValidAfter) {
+		return fmt.Errorf("valid-before (%s) must be after valid-after (%s)", p.ValidBefore, p.ValidAfter)
+	}
+	if !p.ValidAfter.Before(rootCert.NotAfter) {
+		return fmt.Errorf("root expires at %s, at or before the requested valid-after (%s); nothing valid can be issued", rootCert.NotAfter, p.ValidAfter)
+	}
+	return nil
 }
 
 // IsSelfSigned reports whether c is self-signed — its own issuer, i.e. a root

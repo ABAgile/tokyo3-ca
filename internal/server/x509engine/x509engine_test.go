@@ -311,6 +311,134 @@ func TestNewSelfSignedCA_RejectsNilSigner(t *testing.T) {
 	}
 }
 
+// ── NewSelfSignedRootCA + SignIntermediateCA ──────────────────────────────────
+
+func TestNewSelfSignedRootCA_HasPathLenOne(t *testing.T) {
+	caSig, _ := makeCA(t)
+	root, err := x509engine.NewSelfSignedRootCA(rand.Reader, caSig, "two-tier-root")
+	if err != nil {
+		t.Fatalf("NewSelfSignedRootCA: %v", err)
+	}
+	if !root.IsCA {
+		t.Error("IsCA = false, want true")
+	}
+	if root.MaxPathLenZero {
+		t.Error("MaxPathLenZero = true; a root must permit a sub-CA beneath it")
+	}
+	if root.MaxPathLen != 1 {
+		t.Errorf("MaxPathLen = %d, want 1", root.MaxPathLen)
+	}
+}
+
+func TestSignIntermediateCA_RoundTrip(t *testing.T) {
+	rootSig, err := signer.NewEphemeralEd25519()
+	if err != nil {
+		t.Fatalf("root signer: %v", err)
+	}
+	root, err := x509engine.NewSelfSignedRootCA(rand.Reader, rootSig, "root")
+	if err != nil {
+		t.Fatalf("root: %v", err)
+	}
+	intSig, err := signer.NewEphemeralEd25519()
+	if err != nil {
+		t.Fatalf("intermediate signer: %v", err)
+	}
+	now := time.Now().UTC()
+	inter, err := x509engine.SignIntermediateCA(rand.Reader, rootSig, root, x509engine.IntermediateCertParams{
+		PublicKey:         intSig.Public(),
+		SubjectCommonName: "int",
+		ValidAfter:        now,
+		ValidBefore:       now.Add(90 * 24 * time.Hour),
+		Serial:            big.NewInt(5),
+	})
+	if err != nil {
+		t.Fatalf("SignIntermediateCA: %v", err)
+	}
+	if !inter.IsCA {
+		t.Error("intermediate IsCA = false, want true")
+	}
+	if !inter.MaxPathLenZero {
+		t.Error("intermediate MaxPathLenZero = false; it must not sign further sub-CAs")
+	}
+	if inter.KeyUsage&x509.KeyUsageCertSign == 0 {
+		t.Error("intermediate KeyUsage missing CertSign")
+	}
+
+	// Intermediate verifies to the root.
+	roots := x509.NewCertPool()
+	roots.AddCert(root)
+	if _, err := inter.Verify(x509.VerifyOptions{Roots: roots, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageAny}}); err != nil {
+		t.Errorf("intermediate failed to verify to root: %v", err)
+	}
+
+	// A leaf signed by the intermediate builds leaf→intermediate→root.
+	leaf, err := x509engine.SignWorkloadCert(rand.Reader, intSig, inter, x509engine.WorkloadCertParams{
+		PublicKey:   makeSubjectKey(t),
+		SPIFFEURI:   "spiffe://corp/svc/x",
+		ValidAfter:  now,
+		ValidBefore: now.Add(time.Hour),
+		Serial:      big.NewInt(6),
+	})
+	if err != nil {
+		t.Fatalf("SignWorkloadCert under intermediate: %v", err)
+	}
+	inters := x509.NewCertPool()
+	inters.AddCert(inter)
+	if _, err := leaf.Verify(x509.VerifyOptions{
+		Roots:         roots,
+		Intermediates: inters,
+		KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+	}); err != nil {
+		t.Errorf("leaf→intermediate→root failed to verify: %v", err)
+	}
+}
+
+func TestSignIntermediateCA_RejectsPathLenZeroRoot(t *testing.T) {
+	caSig, root := makeCA(t) // NewSelfSignedCA → path length 0
+	intSig, err := signer.NewEphemeralEd25519()
+	if err != nil {
+		t.Fatalf("int signer: %v", err)
+	}
+	now := time.Now().UTC()
+	_, err = x509engine.SignIntermediateCA(rand.Reader, caSig, root, x509engine.IntermediateCertParams{
+		PublicKey:   intSig.Public(),
+		ValidAfter:  now,
+		ValidBefore: now.Add(time.Hour),
+		Serial:      big.NewInt(1),
+	})
+	if err == nil || !strings.Contains(err.Error(), "path length 0") {
+		t.Errorf("err = %v, want 'path length 0'", err)
+	}
+}
+
+func TestSignIntermediateCA_ClampsToRootNotAfter(t *testing.T) {
+	rootSig, err := signer.NewEphemeralEd25519()
+	if err != nil {
+		t.Fatalf("root signer: %v", err)
+	}
+	root, err := x509engine.NewSelfSignedRootCA(rand.Reader, rootSig, "root")
+	if err != nil {
+		t.Fatalf("root: %v", err)
+	}
+	intSig, err := signer.NewEphemeralEd25519()
+	if err != nil {
+		t.Fatalf("int signer: %v", err)
+	}
+	now := time.Now().UTC()
+	inter, err := x509engine.SignIntermediateCA(rand.Reader, rootSig, root, x509engine.IntermediateCertParams{
+		PublicKey:   intSig.Public(),
+		ValidAfter:  now,
+		ValidBefore: root.NotAfter.Add(24 * time.Hour), // past the root's own expiry
+		Serial:      big.NewInt(2),
+	})
+	if err != nil {
+		t.Fatalf("SignIntermediateCA: %v", err)
+	}
+	if !inter.NotAfter.Equal(root.NotAfter) {
+		t.Errorf("intermediate NotAfter = %s, want clamped to root NotAfter %s", inter.NotAfter, root.NotAfter)
+	}
+}
+
 // ── RandomSerial ──────────────────────────────────────────────────────────────
 
 func TestRandomSerial_PositiveAndWithinBounds(t *testing.T) {

@@ -28,7 +28,7 @@ func caCmd() *cobra.Command {
 		Use:   "ca",
 		Short: "CA-material tooling (issuer cert bootstrap, rotation, trust bundles, workload bootstrap)",
 	}
-	c.AddCommand(caBootstrapCmd(), caRotateCmd(), caBundleCmd(), caIssueWorkloadCmd(), caIssueServerCmd())
+	c.AddCommand(caBootstrapCmd(), caRotateCmd(), caBundleCmd(), caIssueWorkloadCmd(), caIssueServerCmd(), caIssueIntermediateCmd())
 	return c
 }
 
