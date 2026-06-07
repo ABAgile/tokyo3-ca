@@ -177,6 +177,18 @@ other two artifacts each have exactly one narrow job:
 - `ca.crt` — mkcert root. Verifies certd's **public HTTPS API/portal cert** only (so `curl https://localhost:8443` works with no `--cacert`, and cert-agentd verifies that one hop via `CERT_AGENTD_WORKLOAD_CA`, read from `/shared`). It is *not* used for any internal mTLS link and is deliberately kept out of cert-agentd's own `/certs` volume — that holds `certd-x509-ca.crt` instead.
 - `certd-signing.key.pub` — OpenSSH-format **SSH CA** pubkey (`TrustedUserCAKeys`). SSH world only; never goes in a TLS trust bundle.
 
+> **Optional two-tier CA.** The single anchor above is the default and what this
+> rig uses. certd can instead run a two-tier X.509 hierarchy — an offline root
+> signing a short-lived, KMS-sealed **intermediate** that certd unseals into
+> memory and signs leaves with — so the root key never sits on the online
+> issuance path. Consumers then pin the **root** (`CERTD_CA_ROOT_CERT_FILE`) and
+> each leaf carries the intermediate in its chain. Opt in with
+> `CERTD_CA_SEALED_KEY_FILE` + `CERTD_CA_SEAL_KMS_KEY` + `CERTD_CA_ROOT_CERT_FILE`;
+> it needs KMS for the seal, so this docker rig stays single-tier. SSH gains a
+> matching pollable CA-key set (`GET /api/v1/ssh/ca-keys`,
+> `CERTD_SSH_CA_KEYS_FILE`). See [docs/two-tier-ca.md](docs/two-tier-ca.md) and
+> OPERATIONS.md §3.
+
 Watch it work:
 
 ```sh

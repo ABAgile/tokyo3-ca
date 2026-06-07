@@ -207,6 +207,67 @@ issuer until that restart so chains never break mid-flight.
 
 See *Rotate the CA key* below for the full cutover sequence.
 
+### Two-tier: offline root + sealed intermediate (optional)
+
+By default certd is single-tier: one signing key signs every SSH and X.509
+leaf, and `CERTD_CA_X509_CERT_FILE` is both the issuer and the anchor consumers
+pin. The optional **two-tier** mode keeps the asymmetric **root** offline and
+signs X.509 leaves with a short-lived **intermediate** whose key certd unseals
+into memory at boot — so the root's `Sign` never sits on the online issuance
+path, and a certd compromise yields only a bounded, cheaply-rotated
+intermediate. SSH is unaffected (it keeps signing with
+`CERTD_CA_KEY_FILE`/`CERTD_CA_KMS_KEY`). Full rationale + design:
+[docs/two-tier-ca.md](docs/two-tier-ca.md).
+
+**Artifacts** (two-tier splits single-tier's signing-key + issuer apart):
+
+| Artifact | What | Where |
+|---|---|---|
+| Root key | asymmetric; signs only the intermediate | offline / ceremony-only (KMS or air-gapped file) |
+| Root cert | the trust anchor consumers pin | `CERTD_CA_ROOT_CERT_FILE` + every consumer CA bundle |
+| Seal key | symmetric; wraps the intermediate key | KMS (`CERTD_CA_SEAL_KMS_KEY`) |
+| Intermediate cert | what certd signs leaves under | `CERTD_CA_X509_CERT_FILE` |
+| Sealed intermediate key | base64 KMS-ciphertext, unsealed at boot | `CERTD_CA_SEALED_KEY_FILE` |
+
+**Ceremony — mint + seal the intermediate** (on a restricted/air-gapped host
+where the root's `Sign` is enabled):
+
+```sh
+certd ca issue-intermediate \
+  --root-kms-key arn:aws:kms:…:key/ROOT  --root-cert root.crt \
+  --seal-kms-key arn:aws:kms:…:key/SEAL \
+  --cn "tokyo3-ca intermediate" --ttl 2160h \
+  --out-cert intermediate.crt --out-sealed-key intermediate.key.sealed
+```
+
+Then set `CERTD_CA_X509_CERT_FILE=intermediate.crt`,
+`CERTD_CA_SEALED_KEY_FILE=intermediate.key.sealed`, `CERTD_CA_SEAL_KMS_KEY`, and
+`CERTD_CA_ROOT_CERT_FILE=root.crt`. The **root cert is the anchor** — push it to
+`CERTD_API_CLIENT_CA`, `POSTGRES_SSL_CA`, NATS `--tlscacert`, and
+`CERT_AGENTD_CA`. At boot certd unseals the key, verifies the intermediate
+chains to the root (failing closed otherwise), and signs leaves with it; each
+leaf is served as `leaf+intermediate`, so it chains to the pinned root.
+
+**Rotate the intermediate (routine, consumer-invisible).** Re-run the ceremony
+at ~60% of the intermediate's life, drop the new `intermediate.crt` +
+`intermediate.key.sealed`, and **restart certd** (the signing key is fixed at
+boot). Old ≤24h leaves drain — they carry the *old* intermediate, still
+root-signed and in-validity — so nothing breaks and **no consumer changes its
+anchor**. A same-key re-mint (push the intermediate cert's `NotAfter` out
+without changing the key) hot-reloads with no restart.
+
+**Intermediate-key compromise recovery.** Re-run the ceremony immediately. The
+old intermediate self-expires — there is **no X.509 CRL**, so the
+intermediate's lifetime *is* the containment window — while the root and every
+consumer anchor stay untouched. Keep the intermediate short (≈90d file-sealed;
+longer only with hardware key custody). The unsealed key lives in plaintext
+process memory at runtime (no `mlock` — see [THREAT_MODEL.md](THREAT_MODEL.md)
+§S2 #2/#5); local-hardware custody (TPM/enclave) is the stronger option.
+
+**The dev rig stays single-tier.** `docker-compose.yml` uses a file CA key and
+no KMS, so it cannot seal/unseal an intermediate; the rig (and `gen.sh`) remain
+single-tier. Two-tier needs a KMS symmetric key for the seal.
+
 ## 4. Common scenarios
 
 ### Rotate the CA key
@@ -225,6 +286,29 @@ rotate without downtime:
      decommission the old `certd`.
 3. Until a true rollover is wired, treat this as a planned-outage
    operation: cut over consumers atomically.
+
+### Rotate the SSH CA key
+
+SSH certs have no chain — verifiers trust the SSH CA public key directly — but
+`TrustedUserCAKeys` accepts multiple keys, so rotation is a non-breaking
+**overlap**, and certd publishes the current set for verifiers to poll:
+
+1. Generate the new SSH CA key. Point `CERTD_SSH_CA_KEYS_FILE` at a file listing
+   **old ⊕ new** pubkeys (TrustedUserCAKeys format); it is served at
+   `GET /api/v1/ssh/ca-keys`. Verifiers running `cert-agentd` with
+   `CERT_AGENTD_SSH_CA_KEYS_PATH` set pull the set on their poll cadence
+   (default 1h) and rewrite their `TrustedUserCAKeys` — now trusting both. Wait
+   ≥ one poll interval + margin.
+2. Switch certd's SSH signing key (`CERTD_CA_KEY_FILE`/`CERTD_CA_KMS_KEY`) to
+   the new key and **restart** (the signing key is fixed at boot).
+3. New SSH certs sign under the new key; short-lived existing certs drain.
+4. Edit `CERTD_SSH_CA_KEYS_FILE` to **new only**; verifiers narrow on the next
+   poll.
+
+stock `sshd` re-reads the `TrustedUserCAKeys` *file* per authentication, so the
+poller's rewrite is picked up without a reload. With `CERTD_SSH_CA_KEYS_FILE`
+unset the endpoint serves the single live CA key, so the poll still works in
+steady state (no overlap to publish).
 
 ### Add a new tunnel host
 
