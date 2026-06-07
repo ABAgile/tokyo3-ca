@@ -161,6 +161,16 @@ func SignServerCert(rnd io.Reader, caSigner signer.Signer, caCert *x509.Certific
 // signTemplate signs tmpl against caCert with caSigner and re-parses the DER
 // back to a *x509.Certificate. Shared by the workload + server leaf builders.
 func signTemplate(rnd io.Reader, caSigner signer.Signer, caCert *x509.Certificate, pub crypto.PublicKey, tmpl *x509.Certificate) (*x509.Certificate, error) {
+	// A leaf must never outlive its issuer: a chain only verifies while every
+	// cert in it is inside its validity window, so clamp NotAfter to the
+	// issuer's. With a long-lived issuer (a 10y root) this is a no-op; it
+	// matters when the issuer is an intermediate nearing its own expiry — the
+	// leaf is shortened rather than silently outliving the chain. validate()
+	// already rejects an issuer that expires at/before NotBefore, so the clamp
+	// can never invert the validity window.
+	if tmpl.NotAfter.After(caCert.NotAfter) {
+		tmpl.NotAfter = caCert.NotAfter
+	}
 	der, err := x509.CreateCertificate(rnd, tmpl, caCert, pub, caSigner)
 	if err != nil {
 		return nil, fmt.Errorf("x509 create cert: %w", err)
@@ -203,6 +213,9 @@ func validateServer(p ServerCertParams, caCert *x509.Certificate) error {
 	}
 	if !p.ValidBefore.After(p.ValidAfter) {
 		return fmt.Errorf("valid-before (%s) must be after valid-after (%s)", p.ValidBefore, p.ValidAfter)
+	}
+	if !p.ValidAfter.Before(caCert.NotAfter) {
+		return fmt.Errorf("issuer expires at %s, at or before the requested valid-after (%s); nothing valid can be issued", caCert.NotAfter, p.ValidAfter)
 	}
 	return nil
 }
@@ -267,6 +280,9 @@ func validate(p WorkloadCertParams, caCert *x509.Certificate) error {
 	}
 	if !p.ValidBefore.After(p.ValidAfter) {
 		return fmt.Errorf("valid-before (%s) must be after valid-after (%s)", p.ValidBefore, p.ValidAfter)
+	}
+	if !p.ValidAfter.Before(caCert.NotAfter) {
+		return fmt.Errorf("issuer expires at %s, at or before the requested valid-after (%s); nothing valid can be issued", caCert.NotAfter, p.ValidAfter)
 	}
 	return nil
 }

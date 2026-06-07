@@ -119,6 +119,23 @@ func (s *Server) handleSignX509WorkloadCert(w http.ResponseWriter, r *http.Reque
 		ttl = decision.TTL
 	}
 
+	now := time.Now().UTC()
+	// A leaf must never outlive its issuer (x509engine clamps NotAfter to the
+	// issuer's). Refuse once the issuer is within one max-TTL of its own
+	// expiry: rather than silently hand out degraded, near-zero-TTL certs and
+	// mask a missed issuer rotation, fail loud and alert. Rotating the CA
+	// issuer at ~60% of its life keeps issuance clear of this window.
+	if remaining := issuerCert.NotAfter.Sub(now); remaining < maxX509CertTTL {
+		s.emitAudit(r.Context(), audit.ActionX509WorkloadCertDenied, "workload:"+spiffeURI, caller.Caller, 0, r, map[string]any{
+			"spiffe_uri":       spiffeURI,
+			"reason":           "issuer near expiry",
+			"issuer_not_after": issuerCert.NotAfter,
+			"issuer_remaining": remaining.String(),
+		})
+		writeError(w, http.StatusServiceUnavailable, "issuer cert is near expiry; rotate the CA issuer before issuing new workload certs")
+		return
+	}
+
 	// Renewal/anti-theft guard: when a persistent active-cert store is
 	// wired, a renewal must present its identity's current or one-step-
 	// previous serial. A stale/unknown serial — a superseded or fabricated
@@ -202,7 +219,6 @@ func (s *Server) handleSignX509WorkloadCert(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	now := time.Now().UTC()
 	cert, err := x509engine.SignWorkloadCert(rand.Reader, s.caSigner, issuerCert, x509engine.WorkloadCertParams{
 		PublicKey:         pub,
 		SPIFFEURI:         spiffeURI,

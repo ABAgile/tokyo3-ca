@@ -206,6 +206,46 @@ func TestSignWorkloadCert_ValidationErrors(t *testing.T) {
 	}
 }
 
+// TestSignWorkloadCert_ClampsNotAfterToIssuer verifies a leaf is never issued
+// past its issuer's own expiry: a leaf requesting validity beyond the CA's
+// NotAfter is shortened to the CA's NotAfter (so the chain never outlives the
+// issuer). The same clamp covers SignServerCert (both go through signTemplate).
+func TestSignWorkloadCert_ClampsNotAfterToIssuer(t *testing.T) {
+	caSig, caCert := makeCA(t)
+	now := time.Now().UTC()
+	cert, err := x509engine.SignWorkloadCert(rand.Reader, caSig, caCert, x509engine.WorkloadCertParams{
+		PublicKey:   makeSubjectKey(t),
+		SPIFFEURI:   "spiffe://corp/svc/billing",
+		ValidAfter:  now,
+		ValidBefore: caCert.NotAfter.Add(20 * 365 * 24 * time.Hour), // well past the ~10y CA
+		Serial:      big.NewInt(7),
+	})
+	if err != nil {
+		t.Fatalf("SignWorkloadCert: %v", err)
+	}
+	if !cert.NotAfter.Equal(caCert.NotAfter) {
+		t.Errorf("leaf NotAfter = %s, want clamped to issuer NotAfter %s", cert.NotAfter, caCert.NotAfter)
+	}
+}
+
+// TestSignWorkloadCert_RejectsIssuerAtOrPastExpiry verifies issuance is refused
+// when the issuer expires at or before the requested valid-after — there is no
+// validity window left to issue into, so the clamp would otherwise invert it.
+func TestSignWorkloadCert_RejectsIssuerAtOrPastExpiry(t *testing.T) {
+	caSig, caCert := makeCA(t)
+	after := caCert.NotAfter.Add(time.Hour) // starts after the issuer is already dead
+	_, err := x509engine.SignWorkloadCert(rand.Reader, caSig, caCert, x509engine.WorkloadCertParams{
+		PublicKey:   makeSubjectKey(t),
+		SPIFFEURI:   "spiffe://corp/svc/billing",
+		ValidAfter:  after,
+		ValidBefore: after.Add(time.Hour),
+		Serial:      big.NewInt(8),
+	})
+	if err == nil || !strings.Contains(err.Error(), "issuer expires") {
+		t.Errorf("err = %v, want 'issuer expires'", err)
+	}
+}
+
 // ── NewSelfSignedCA ───────────────────────────────────────────────────────────
 
 func TestNewSelfSignedCA_HasExpectedShape(t *testing.T) {

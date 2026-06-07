@@ -4,7 +4,9 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/pem"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -77,6 +79,59 @@ func makeSubjectPubKeyPEM(t *testing.T) string {
 // to produce an audit.Sink the API layer can publish through.
 func wrapCaptureSink(c *captureSink) audit.Sink {
 	return journal.NewJSONSink[audit.Entry](c)
+}
+
+// TestSignX509Workload_RefusesNearExpiryIssuer verifies issuance is refused
+// (503) when the issuer cert is within one max-TTL of its own expiry — the
+// guard that stops certd minting leaves that would outlive a soon-to-expire
+// intermediate.
+func TestSignX509Workload_RefusesNearExpiryIssuer(t *testing.T) {
+	caSig, err := signer.NewEphemeralEd25519()
+	if err != nil {
+		t.Fatalf("ca signer: %v", err)
+	}
+	// Self-sign a CA cert expiring in 1h — inside the 24h max-TTL window.
+	now := time.Now().UTC()
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "near-expiry-ca"},
+		NotBefore:             now.Add(-time.Minute),
+		NotAfter:              now.Add(time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, caSig.Public(), caSig)
+	if err != nil {
+		t.Fatalf("create near-expiry CA: %v", err)
+	}
+	caCert, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatalf("parse near-expiry CA: %v", err)
+	}
+
+	cap := &captureSink{}
+	srv, err := api.New(api.Config{
+		Log:            silentLogger(),
+		CASigner:       caSig,
+		X509IssuerCert: caCert,
+		OIDCVerifier:   stubVerifier{claims: &oidc.Claims{Email: "a@example.com", Groups: []string{"g"}}},
+		Audit:          wrapCaptureSink(cap),
+	})
+	if err != nil {
+		t.Fatalf("api.New: %v", err)
+	}
+
+	rec := postJSON(srv, "/api/v1/x509/sign-workload", "Bearer x", map[string]any{
+		"public_key": makeSubjectPubKeyPEM(t),
+		"spiffe_uri": "spiffe://corp/svc/billing",
+	})
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503; body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "near expiry") {
+		t.Errorf("body = %q, want 'near expiry'", rec.Body.String())
+	}
 }
 
 // ── happy paths ──────────────────────────────────────────────────────────────
