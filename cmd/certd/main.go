@@ -757,6 +757,17 @@ func loadX509Signer(ctx context.Context, log *slog.Logger, caSigner signer.Signe
 	if err != nil {
 		return nil, fmt.Errorf("unseal intermediate key: %w", err)
 	}
+	// The decrypted PKCS#8 PEM is plaintext key material. Wipe the buffer once
+	// it's parsed — LoadFromPKCS8PEM copies what it keeps, so the returned
+	// signer is unaffected. Best-effort (Go's GC may have already moved the
+	// bytes, and the key still lives unprotected on the heap inside the signer
+	// — see THREAT_MODEL.md §S2), but it shrinks the window a memory dump can
+	// catch the serialized key in.
+	defer func() {
+		for i := range keyPEM {
+			keyPEM[i] = 0
+		}
+	}()
 	sig, err := signer.LoadFromPKCS8PEM(keyPEM, "in-memory intermediate (sealed: "+sealedPath+")")
 	if err != nil {
 		return nil, fmt.Errorf("load unsealed intermediate key: %w", err)
