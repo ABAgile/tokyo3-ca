@@ -246,6 +246,22 @@ func TestSignWorkloadCert_RejectsIssuerAtOrPastExpiry(t *testing.T) {
 	}
 }
 
+// TestChainPEMForLeaf_SelfSignedRoot verifies a self-signed root is recognised
+// as such and emits no leaf chain — the single-tier no-op guarantee (the
+// intermediate branch is covered end-to-end in the API layer's chain test).
+func TestChainPEMForLeaf_SelfSignedRoot(t *testing.T) {
+	_, root := makeCA(t)
+	if !x509engine.IsSelfSigned(root) {
+		t.Error("IsSelfSigned(self-signed root) = false, want true")
+	}
+	if got := x509engine.ChainPEMForLeaf(root); got != "" {
+		t.Errorf("ChainPEMForLeaf(root) = %q, want empty", got)
+	}
+	if got := x509engine.ChainPEMForLeaf(nil); got != "" {
+		t.Errorf("ChainPEMForLeaf(nil) = %q, want empty", got)
+	}
+}
+
 // ── NewSelfSignedCA ───────────────────────────────────────────────────────────
 
 func TestNewSelfSignedCA_HasExpectedShape(t *testing.T) {

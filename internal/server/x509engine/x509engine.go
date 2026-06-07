@@ -8,6 +8,7 @@
 package x509engine
 
 import (
+	"bytes"
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/ed25519"
@@ -15,6 +16,7 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
@@ -325,6 +327,26 @@ func NewSelfSignedCA(rnd io.Reader, caSigner signer.Signer, commonName string) (
 		return nil, fmt.Errorf("re-parse self-signed ca: %w", err)
 	}
 	return cert, nil
+}
+
+// IsSelfSigned reports whether c is self-signed — its own issuer, i.e. a root
+// trust anchor — as opposed to an intermediate that a leaf must present in its
+// chain so peers can build a path to the root they pin.
+func IsSelfSigned(c *x509.Certificate) bool {
+	return bytes.Equal(c.RawSubject, c.RawIssuer) && c.CheckSignatureFrom(c) == nil
+}
+
+// ChainPEMForLeaf returns the issuer chain a leaf must carry alongside itself so
+// peers can build a path to the trust anchor: the issuer's own PEM when it is
+// an intermediate (not self-signed), or "" when the issuer is a self-signed
+// root that peers already pin. This is what lets leaf→intermediate→root verify
+// without the intermediate being in every verifier's trust store; in a
+// single-tier deployment (issuer == root) it is empty and the leaf stands alone.
+func ChainPEMForLeaf(issuer *x509.Certificate) string {
+	if issuer == nil || IsSelfSigned(issuer) {
+		return ""
+	}
+	return string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: issuer.Raw}))
 }
 
 // RandomSerial returns a positive 128-bit serial, the size NIST

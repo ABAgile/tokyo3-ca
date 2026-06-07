@@ -77,6 +77,50 @@ func TestNew_RejectsMissingConfig(t *testing.T) {
 	}
 }
 
+func TestRenewer_SignOnce_WritesIssuerChain(t *testing.T) {
+	dir := t.TempDir()
+	certPath := filepath.Join(dir, "workload.crt")
+	keyPath := filepath.Join(dir, "workload.key")
+
+	leaf := "-----BEGIN CERTIFICATE-----\nleaf\n-----END CERTIFICATE-----\n"
+	chain := "-----BEGIN CERTIFICATE-----\nintermediate\n-----END CERTIFICATE-----\n"
+	sig := &stubSigner{respFn: func(req client.SignWorkloadRequest) (*client.SignWorkloadResponse, error) {
+		now := time.Now().UTC()
+		return &client.SignWorkloadResponse{
+			Certificate: leaf,
+			Chain:       chain,
+			Serial:      "1",
+			SPIFFEURI:   req.SPIFFEURI,
+			ValidAfter:  now,
+			ValidBefore: now.Add(time.Hour),
+		}, nil
+	}}
+	r, err := renew.New(renew.Config{
+		Signer:         sig,
+		SPIFFEURI:      "spiffe://td/host/x",
+		CertOutputPath: certPath,
+		KeyOutputPath:  keyPath,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if _, _, err := r.SignOnce(context.Background()); err != nil {
+		t.Fatalf("SignOnce: %v", err)
+	}
+
+	got, err := os.ReadFile(certPath)
+	if err != nil {
+		t.Fatalf("read cert: %v", err)
+	}
+	// The workload file is leaf-first, then the issuer chain — two blocks.
+	if want := leaf + chain; string(got) != want {
+		t.Errorf("cert file = %q, want leaf+chain %q", string(got), want)
+	}
+	if n := strings.Count(string(got), "BEGIN CERTIFICATE"); n != 2 {
+		t.Errorf("cert file has %d CERTIFICATE blocks, want 2 (leaf+intermediate)", n)
+	}
+}
+
 func TestRenewer_SignOnce_GeneratesKeyAndWritesCert(t *testing.T) {
 	dir := t.TempDir()
 	certPath := filepath.Join(dir, "workload.crt")

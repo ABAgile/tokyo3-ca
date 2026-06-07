@@ -205,11 +205,19 @@ func prepareLeaf(ctx context.Context, keyPath, kmsKey, caCertPath, keyType strin
 
 // writeLeafOutputs writes the key (0600), then the cert (0644), then the
 // optional issuer bundle — key-first/cert-last (cert is the commit point).
+//
+// When the issuer is an intermediate (not a self-signed root), the cert file is
+// written as leaf+intermediate so a bootstrapped workload presents the full
+// chain on its very first handshake, exactly like a runtime-renewed cert. In a
+// single-tier deployment the issuer is the root anchor, ChainPEMForLeaf returns
+// "", and the cert file is the leaf alone (today's behaviour).
 func writeLeafOutputs(lc *leafContext, cert *x509.Certificate, outCert, outKey, bundleOut string, force bool) error {
 	if err := writeKeyPEM(outKey, lc.keyPEM, force); err != nil {
 		return err
 	}
-	if err := writeCertPEM(outCert, cert, force); err != nil {
+	leafPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Raw})
+	leafPEM = append(leafPEM, []byte(x509engine.ChainPEMForLeaf(lc.issuer))...)
+	if err := writePEMBytes(outCert, leafPEM, force); err != nil {
 		return err
 	}
 	if bundleOut != "" {

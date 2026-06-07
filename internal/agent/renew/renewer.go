@@ -242,9 +242,10 @@ func (r *Renewer) SignOnce(ctx context.Context) (validAfter, validBefore time.Ti
 	// tls/reloader do). Once the key is persisted, normal renewals rotate
 	// only the cert (the key is stable), so a plain atomic cert write
 	// suffices.
+	certPEM := certWithChain(resp)
 	if writeBundle {
 		if err := output.WriteBundleAtomic(
-			r.cfg.CertOutputPath, []byte(resp.Certificate), 0o644,
+			r.cfg.CertOutputPath, certPEM, 0o644,
 			r.cfg.KeyOutputPath, keyPEM, 0o600,
 		); err != nil {
 			return time.Time{}, time.Time{}, fmt.Errorf("write cert+key bundle: %w", err)
@@ -252,7 +253,7 @@ func (r *Renewer) SignOnce(ctx context.Context) (validAfter, validBefore time.Ti
 		if !r.cfg.RotateKey {
 			r.markKeyPersisted()
 		}
-	} else if err := output.WriteAtomic(r.cfg.CertOutputPath, []byte(resp.Certificate), 0o644); err != nil {
+	} else if err := output.WriteAtomic(r.cfg.CertOutputPath, certPEM, 0o644); err != nil {
 		return time.Time{}, time.Time{}, fmt.Errorf("write cert: %w", err)
 	}
 	r.cfg.Log.Info("workload cert renewed",
@@ -403,6 +404,19 @@ func generateKey(kt KeyType) (crypto.Signer, error) {
 	default:
 		return nil, fmt.Errorf("unsupported key type %q", kt)
 	}
+}
+
+// certWithChain returns the PEM to write to disk: the leaf followed by any
+// issuer chain certd returned (intermediate CA cert(s)), so the consumer's TLS
+// stack presents leaf+intermediate and peers can build a path to the pinned
+// root. Each block certd emits is newline-terminated, so concatenation yields a
+// valid multi-block file and readCurrentSerial still reads the leaf (the first
+// block). Empty Chain (single-tier) leaves the leaf standing alone.
+func certWithChain(resp *client.SignWorkloadResponse) []byte {
+	if resp.Chain == "" {
+		return []byte(resp.Certificate)
+	}
+	return []byte(resp.Certificate + resp.Chain)
 }
 
 // readCurrentSerial returns the decimal serial of the cert currently at

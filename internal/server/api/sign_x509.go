@@ -49,7 +49,11 @@ type signX509Request struct {
 
 // signX509Response is the JSON reply body. Certificate is PEM-encoded.
 type signX509Response struct {
-	Certificate string    `json:"certificate"`
+	Certificate string `json:"certificate"`
+	// Chain is the issuer chain (intermediate CA cert(s)) the workload must
+	// present alongside the leaf so peers can build a path to the pinned root.
+	// Empty in a single-tier deployment, where the issuer is the root anchor.
+	Chain       string    `json:"chain,omitempty"`
 	Serial      string    `json:"serial"` // decimal big-int (X.509 serials don't fit uint64)
 	SPIFFEURI   string    `json:"spiffe_uri"`
 	ValidAfter  time.Time `json:"valid_after"`
@@ -266,6 +270,7 @@ func (s *Server) handleSignX509WorkloadCert(w http.ResponseWriter, r *http.Reque
 
 	writeJSON(w, http.StatusOK, signX509Response{
 		Certificate: string(pemBytes),
+		Chain:       x509engine.ChainPEMForLeaf(issuerCert),
 		Serial:      cert.SerialNumber.String(),
 		SPIFFEURI:   spiffeURI,
 		ValidAfter:  cert.NotBefore.UTC(),

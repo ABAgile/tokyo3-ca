@@ -80,7 +80,11 @@ type SignWorkloadRequest struct {
 // PEM-encoded ("-----BEGIN CERTIFICATE-----"). Serial is a decimal
 // big-int string — X.509 serials don't fit uint64.
 type SignWorkloadResponse struct {
-	Certificate string    `json:"certificate"`
+	Certificate string `json:"certificate"`
+	// Chain is the issuer chain (intermediate CA cert(s)) the workload must
+	// present alongside the leaf so peers can build a path to the pinned root.
+	// Empty in a single-tier deployment (the issuer is the root anchor).
+	Chain       string    `json:"chain,omitempty"`
 	Serial      string    `json:"serial"`
 	SPIFFEURI   string    `json:"spiffe_uri"`
 	ValidAfter  time.Time `json:"valid_after"`

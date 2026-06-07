@@ -134,6 +134,111 @@ func TestSignX509Workload_RefusesNearExpiryIssuer(t *testing.T) {
 	}
 }
 
+// TestSignX509Workload_EmitsIssuerChain verifies that when certd's issuer is an
+// intermediate (two-tier), the sign response carries the intermediate in Chain
+// and leaf+chain verifies to the root the peers pin.
+func TestSignX509Workload_EmitsIssuerChain(t *testing.T) {
+	// Root (self-signed, pathlen 1 so it can have an intermediate beneath it —
+	// Phase C adds a NewSelfSignedRootCA helper for this) + an intermediate
+	// signed by the root.
+	now := time.Now().UTC()
+	rootSig, err := signer.NewEphemeralEd25519()
+	if err != nil {
+		t.Fatalf("root signer: %v", err)
+	}
+	rootTmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "test-root"},
+		NotBefore:             now.Add(-time.Minute),
+		NotAfter:              now.Add(10 * 365 * 24 * time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+		MaxPathLen:            1,
+	}
+	rootDER, err := x509.CreateCertificate(rand.Reader, rootTmpl, rootTmpl, rootSig.Public(), rootSig)
+	if err != nil {
+		t.Fatalf("root: %v", err)
+	}
+	root, err := x509.ParseCertificate(rootDER)
+	if err != nil {
+		t.Fatalf("parse root: %v", err)
+	}
+	intSig, err := signer.NewEphemeralEd25519()
+	if err != nil {
+		t.Fatalf("intermediate signer: %v", err)
+	}
+	intTmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(2),
+		Subject:               pkix.Name{CommonName: "test-intermediate"},
+		NotBefore:             now.Add(-time.Minute),
+		NotAfter:              now.Add(90 * 24 * time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+		MaxPathLenZero:        true,
+	}
+	intDER, err := x509.CreateCertificate(rand.Reader, intTmpl, root, intSig.Public(), rootSig)
+	if err != nil {
+		t.Fatalf("sign intermediate: %v", err)
+	}
+	inter, err := x509.ParseCertificate(intDER)
+	if err != nil {
+		t.Fatalf("parse intermediate: %v", err)
+	}
+
+	cap := &captureSink{}
+	srv, err := api.New(api.Config{
+		Log:            silentLogger(),
+		CASigner:       intSig, // certd signs leaves with the intermediate key
+		X509IssuerCert: inter,  // issuer = the intermediate
+		OIDCVerifier:   stubVerifier{claims: &oidc.Claims{Email: "a@example.com", Groups: []string{"g"}}},
+		Audit:          wrapCaptureSink(cap),
+	})
+	if err != nil {
+		t.Fatalf("api.New: %v", err)
+	}
+
+	rec := postJSON(srv, "/api/v1/x509/sign-workload", "Bearer x", map[string]any{
+		"public_key": makeSubjectPubKeyPEM(t),
+		"spiffe_uri": "spiffe://corp/svc/billing",
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		Certificate string `json:"certificate"`
+		Chain       string `json:"chain"`
+	}
+	decodeJSON(t, rec, &resp)
+
+	wantChain := string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: inter.Raw}))
+	if resp.Chain != wantChain {
+		t.Errorf("Chain = %q, want the intermediate PEM", resp.Chain)
+	}
+
+	// leaf + intermediate must build a path to the pinned root.
+	leafBlock, _ := pem.Decode([]byte(resp.Certificate))
+	if leafBlock == nil {
+		t.Fatal("leaf is not a CERTIFICATE PEM block")
+	}
+	leaf, err := x509.ParseCertificate(leafBlock.Bytes)
+	if err != nil {
+		t.Fatalf("parse leaf: %v", err)
+	}
+	roots := x509.NewCertPool()
+	roots.AddCert(root)
+	inters := x509.NewCertPool()
+	inters.AddCert(inter)
+	if _, err := leaf.Verify(x509.VerifyOptions{
+		Roots:         roots,
+		Intermediates: inters,
+		KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+	}); err != nil {
+		t.Errorf("leaf+intermediate failed to verify to root: %v", err)
+	}
+}
+
 // ── happy paths ──────────────────────────────────────────────────────────────
 
 func TestSignX509Workload_HappyPath(t *testing.T) {
@@ -156,6 +261,7 @@ func TestSignX509Workload_HappyPath(t *testing.T) {
 
 	var resp struct {
 		Certificate string    `json:"certificate"`
+		Chain       string    `json:"chain"`
 		Serial      string    `json:"serial"`
 		SPIFFEURI   string    `json:"spiffe_uri"`
 		ValidAfter  time.Time `json:"valid_after"`
@@ -165,6 +271,10 @@ func TestSignX509Workload_HappyPath(t *testing.T) {
 
 	if resp.SPIFFEURI != "spiffe://corp/svc/billing" {
 		t.Errorf("spiffe_uri = %q", resp.SPIFFEURI)
+	}
+	// Single-tier issuer (self-signed root) → no chain to present.
+	if resp.Chain != "" {
+		t.Errorf("Chain = %q, want empty for a self-signed root issuer", resp.Chain)
 	}
 	if resp.Serial == "" {
 		t.Error("serial empty")
