@@ -71,6 +71,19 @@
 //	CERTD_CA_X509_CERT_CN    Subject CN for the self-signed startup CA cert. Default
 //	                         "tokyo3-ca".
 //
+//	CERTD_CA_SEALED_KEY_FILE Base64 KMS-ciphertext of the X.509 intermediate's PKCS#8 private key
+//	                         (produced by `certd ca issue-intermediate`). When set (with
+//	                         CERTD_CA_SEAL_KMS_KEY), certd unseals it into memory at boot and signs
+//	                         X.509 leaves with the intermediate — so the asymmetric ROOT key stays
+//	                         offline. SSH keeps signing with CERTD_CA_KEY_FILE/KMS. Unset ⇒
+//	                         single-tier: X.509 signs with the same key as SSH.
+//	CERTD_CA_SEAL_KMS_KEY    Symmetric KMS key reference that wraps the sealed intermediate key
+//	                         (Decrypt at boot). Required iff CERTD_CA_SEALED_KEY_FILE is set.
+//	CERTD_CA_ROOT_CERT_FILE  Root cert PEM (the trust anchor consumers pin). When set, certd
+//	                         verifies at boot that CERTD_CA_X509_CERT_FILE (the intermediate)
+//	                         chains to it and is in-validity, failing closed otherwise, and warns
+//	                         as the intermediate nears expiry.
+//
 //	CERTD_NATS_URL   NATS server URL (e.g., nats://nats:4222 or tls://nats:4222). Empty disables
 //	                 JetStream publishing — audit sink becomes [audit.NoopSink], audit source
 //	                 becomes [journal.NoopSource].
@@ -157,6 +170,7 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -487,6 +501,15 @@ func runServe(ctx context.Context) error {
 	}
 	log.Info("ca signer ready", "signer", caSigner.Description())
 
+	// X.509 leaves may sign under a separate, in-memory intermediate key
+	// (unsealed from KMS) so the asymmetric root stays offline; SSH keeps
+	// signing with caSigner. Falls back to caSigner when no sealed key is
+	// configured (single-tier).
+	x509Signer, err := loadX509Signer(ctx, log, caSigner)
+	if err != nil {
+		return fmt.Errorf("load X.509 signer: %w", err)
+	}
+
 	auditSink, err := cli.AuditSink[audit.Entry](rt, audit.Subject)
 	if err != nil {
 		return fmt.Errorf("audit sink: %w", err)
@@ -524,7 +547,7 @@ func runServe(ctx context.Context) error {
 		return fmt.Errorf("mtls store: %w", err)
 	}
 
-	x509IssuerCert, x509IssuerReload, err := loadX509Issuer(log, caSigner)
+	x509IssuerCert, x509IssuerReload, err := loadX509Issuer(log, x509Signer)
 	if err != nil {
 		return fmt.Errorf("x509 issuer cert: %w", err)
 	}
@@ -597,6 +620,7 @@ func runServe(ctx context.Context) error {
 	srv, err := api.New(api.Config{
 		Log:              log,
 		CASigner:         caSigner,
+		X509Signer:       x509Signer,
 		X509IssuerCert:   x509IssuerCert,
 		X509IssuerReload: x509IssuerReload,
 		TrustBundlePath:  envutil.Or("CERTD_CA_TRUST_BUNDLE", os.Getenv("CERTD_CA_X509_CERT_FILE")),
@@ -701,6 +725,45 @@ func loadCASigner(ctx context.Context, log *slog.Logger) (signer.Signer, error) 
 	return resolveCASigner(ctx, keyPath, kmsKey)
 }
 
+// loadX509Signer returns the signer certd uses for X.509 leaf issuance. When a
+// sealed intermediate key is configured (CERTD_CA_SEALED_KEY_FILE +
+// CERTD_CA_SEAL_KMS_KEY), it is unsealed into memory and returned — so the
+// asymmetric root key never touches the online issuance path and certd signs
+// leaves with the intermediate. Otherwise X.509 falls back to caSigner
+// (single-tier: one key signs both SSH and X.509).
+func loadX509Signer(ctx context.Context, log *slog.Logger, caSigner signer.Signer) (signer.Signer, error) {
+	sealedPath := os.Getenv("CERTD_CA_SEALED_KEY_FILE")
+	sealKey := os.Getenv("CERTD_CA_SEAL_KMS_KEY")
+	if sealedPath == "" && sealKey == "" {
+		return caSigner, nil // single-tier
+	}
+	if sealedPath == "" || sealKey == "" {
+		return nil, errors.New("two-tier X.509 needs both CERTD_CA_SEALED_KEY_FILE and CERTD_CA_SEAL_KMS_KEY (one is set, the other is not)")
+	}
+	raw, err := os.ReadFile(sealedPath)
+	if err != nil {
+		return nil, fmt.Errorf("read sealed intermediate key %s: %w", sealedPath, err)
+	}
+	ciphertext, err := base64.StdEncoding.DecodeString(strings.TrimSpace(string(raw)))
+	if err != nil {
+		return nil, fmt.Errorf("sealed intermediate key %s: not base64: %w", sealedPath, err)
+	}
+	sl, err := resolveSealer(ctx, sealKey)
+	if err != nil {
+		return nil, err
+	}
+	keyPEM, err := sl.Decrypt(ctx, ciphertext)
+	if err != nil {
+		return nil, fmt.Errorf("unseal intermediate key: %w", err)
+	}
+	sig, err := signer.LoadFromPKCS8PEM(keyPEM, "in-memory intermediate (sealed: "+sealedPath+")")
+	if err != nil {
+		return nil, fmt.Errorf("load unsealed intermediate key: %w", err)
+	}
+	log.Info("x509 intermediate signer ready (unsealed from KMS)", "signer", sig.Description())
+	return sig, nil
+}
+
 // loadOIDCVerifier returns a token verifier for inbound bearer tokens
 // when CERTD_OIDC_ISSUER + CERTD_OIDC_AUDIENCE are both set. Either
 // alone is an error (asymmetric config), and both unset returns nil
@@ -769,31 +832,77 @@ func loadPortalOIDC(log *slog.Logger) (portal.OIDCConfig, error) {
 	}, nil
 }
 
-// loadX509Issuer returns the CA cert used as the issuer for X.509 / SPIFFE
-// workload issuance, plus an optional hot-reload getter. When
-// CERTD_CA_X509_CERT_FILE is set, the cert is loaded from PEM at that path
-// behind a pemReloader, and the returned getter yields the live cert so an
-// operator's same-key re-mint is picked up without a restart (the reloader
-// refuses a new-key issuer — see issuerLoader). When unset, certd self-signs
-// a fresh cert at startup (dev only) and the getter is nil (fixed issuer).
-func loadX509Issuer(log *slog.Logger, caSigner signer.Signer) (*x509.Certificate, func() *x509.Certificate, error) {
+// issuerRotateWarnWindow is how close to the issuer cert's NotAfter loadX509Issuer
+// starts logging a rotate-soon warning at boot. Comfortably larger than the max
+// leaf TTL so an operator sees it well before the near-expiry sign refusal bites.
+const issuerRotateWarnWindow = 14 * 24 * time.Hour
+
+// loadX509Issuer returns the cert certd signs X.509 leaves under, plus an
+// optional hot-reload getter. Its public key must match x509Signer (the
+// reloader's issuerLoader enforces this, so a new-key issuer is refused live —
+// a signing-key rotation still needs a restart). When CERTD_CA_X509_CERT_FILE
+// is unset, certd self-signs a fresh cert at startup (dev only; getter nil).
+//
+// In a two-tier deployment the issuer is the intermediate and x509Signer is the
+// unsealed intermediate key. When CERTD_CA_ROOT_CERT_FILE is also set, certd
+// verifies at boot that the intermediate chains to that root and is in-validity,
+// failing closed otherwise — so a misconfigured root/intermediate pair is caught
+// at startup rather than breaking every leaf at the first handshake.
+func loadX509Issuer(log *slog.Logger, x509Signer signer.Signer) (*x509.Certificate, func() *x509.Certificate, error) {
 	if path := os.Getenv("CERTD_CA_X509_CERT_FILE"); path != "" {
-		rl, err := newPEMReloader(path, "X.509 issuer cert", log, issuerLoader(caSigner.Public()))
+		rl, err := newPEMReloader(path, "X.509 issuer cert", log, issuerLoader(x509Signer.Public()))
 		if err != nil {
 			return nil, nil, fmt.Errorf("CERTD_CA_X509_CERT_FILE: %w", err)
 		}
 		cert := rl.get()
+		if rootPath := os.Getenv("CERTD_CA_ROOT_CERT_FILE"); rootPath != "" {
+			root, err := loadIssuerCert(rootPath)
+			if err != nil {
+				return nil, nil, fmt.Errorf("CERTD_CA_ROOT_CERT_FILE: %w", err)
+			}
+			if err := verifyIssuerChainsToRoot(cert, root); err != nil {
+				return nil, nil, err
+			}
+			warnIfIssuerNearExpiry(log, cert)
+			log.Info("x509 issuer ready", "source", "file", "path", path, "cn", cert.Subject.CommonName,
+				"chains_to_root", true, "not_after", cert.NotAfter, "hot_reload", true)
+			return cert, rl.get, nil
+		}
 		log.Info("x509 issuer ready", "source", "file", "path", path, "cn", cert.Subject.CommonName, "hot_reload", true)
 		return cert, rl.get, nil
 	}
 	cn := envutil.Or("CERTD_CA_X509_CERT_CN", "tokyo3-ca")
-	cert, err := x509engine.NewSelfSignedCA(rand.Reader, caSigner, cn)
+	cert, err := x509engine.NewSelfSignedCA(rand.Reader, x509Signer, cn)
 	if err != nil {
 		return nil, nil, err
 	}
 	log.Warn("CERTD_CA_X509_CERT_FILE unset — generated self-signed CA cert at startup (not for production)",
 		"cn", cn, "not_after", cert.NotAfter)
 	return cert, nil, nil
+}
+
+// verifyIssuerChainsToRoot confirms the issuer cert (an intermediate) is signed
+// by root and that both are within their validity windows now — a boot-time,
+// fail-closed guard against a misconfigured root/intermediate pair.
+func verifyIssuerChainsToRoot(issuer, root *x509.Certificate) error {
+	roots := x509.NewCertPool()
+	roots.AddCert(root)
+	if _, err := issuer.Verify(x509.VerifyOptions{
+		Roots:     roots,
+		KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageAny},
+	}); err != nil {
+		return fmt.Errorf("CERTD_CA_X509_CERT_FILE does not chain to CERTD_CA_ROOT_CERT_FILE (or one is expired): %w", err)
+	}
+	return nil
+}
+
+// warnIfIssuerNearExpiry logs a rotate-soon warning when the issuer is within
+// issuerRotateWarnWindow of its NotAfter.
+func warnIfIssuerNearExpiry(log *slog.Logger, cert *x509.Certificate) {
+	if remaining := time.Until(cert.NotAfter); remaining < issuerRotateWarnWindow {
+		log.Warn("X.509 issuer cert nearing expiry — rotate the intermediate soon",
+			"not_after", cert.NotAfter, "remaining", remaining.String())
+	}
 }
 
 // loadMTLSStore returns the workload-identity registry parsed from

@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"time"
 
 	"github.com/abagile/tokyo3-base/journal"
 	"golang.org/x/crypto/ssh"
@@ -30,7 +31,8 @@ import (
 // share across goroutines once constructed.
 type Server struct {
 	log              *slog.Logger
-	caSigner         signer.Signer
+	caSigner         signer.Signer            // Signs SSH certs (and X.509 when x509Signer is unset — single-tier).
+	x509Signer       signer.Signer            // Signs X.509 leaves; the unsealed intermediate in a two-tier setup. Never nil after New.
 	x509IssuerCert   *x509.Certificate        // Static issuer fallback; used when x509IssuerReload is nil. nil disables /x509/* routes.
 	x509IssuerReload func() *x509.Certificate // When set, returns the live (hot-reloaded) issuer cert; wins over x509IssuerCert.
 	trustBundlePath  string                   // PEM file served at GET /api/v1/x509/trust-bundle; empty ⇒ 503.
@@ -51,9 +53,14 @@ type Config struct {
 	// Log is the structured logger used for request logging and audit
 	// fallbacks. Required.
 	Log *slog.Logger
-	// CASigner is the CA signing primitive used by the issuance
-	// endpoints. Required.
+	// CASigner is the CA signing primitive used by the SSH issuance
+	// endpoints (and X.509 too when X509Signer is nil). Required.
 	CASigner signer.Signer
+	// X509Signer signs X.509 workload leaves. In a two-tier deployment this
+	// is the unsealed intermediate key (so the root stays offline); the
+	// X509IssuerCert/Reload cert must be over this key. When nil, X.509
+	// issuance falls back to CASigner (single-tier: one key signs both).
+	X509Signer signer.Signer
 	// X509IssuerCert is the CA certificate used as the issuer when
 	// signing X.509 workload certs. Use [x509engine.NewSelfSignedCA]
 	// to construct it from CASigner, or load a pre-issued cert from
@@ -150,9 +157,14 @@ func New(cfg Config) (*Server, error) {
 	if auditSrc == nil {
 		auditSrc = journal.NoopSource{}
 	}
+	x509Signer := cfg.X509Signer
+	if x509Signer == nil {
+		x509Signer = cfg.CASigner // single-tier: X.509 signs with the SSH key
+	}
 	return &Server{
 		log:              cfg.Log,
 		caSigner:         cfg.CASigner,
+		x509Signer:       x509Signer,
 		x509IssuerCert:   cfg.X509IssuerCert,
 		x509IssuerReload: cfg.X509IssuerReload,
 		trustBundlePath:  cfg.TrustBundlePath,
@@ -203,6 +215,12 @@ type healthzResponse struct {
 	OIDCActive   bool   `json:"oidc_active"`
 	MTLSActive   bool   `json:"mtls_active"`
 	X509Active   bool   `json:"x509_active"`
+	// X509Signer is the X.509 leaf signer's description — the unsealed
+	// intermediate in a two-tier setup, or the same as ca_signer single-tier.
+	X509Signer string `json:"x509_signer,omitempty"`
+	// X509IssuerNotAfter is the issuer cert's expiry (RFC3339), for monitoring
+	// intermediate rotation. Empty when X.509 issuance is unconfigured.
+	X509IssuerNotAfter string `json:"x509_issuer_not_after,omitempty"`
 }
 
 func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
@@ -217,6 +235,10 @@ func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 		OIDCActive:   s.oidc != nil,
 		MTLSActive:   s.mtls != nil,
 		X509Active:   s.issuerCert() != nil,
+		X509Signer:   s.x509Signer.Description(),
+	}
+	if issuer := s.issuerCert(); issuer != nil {
+		body.X509IssuerNotAfter = issuer.NotAfter.UTC().Format(time.RFC3339)
 	}
 	_ = json.NewEncoder(w).Encode(body)
 }

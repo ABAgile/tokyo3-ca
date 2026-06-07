@@ -2,8 +2,12 @@ package signer
 
 import (
 	"crypto"
+	"crypto/ecdsa"
 	"crypto/ed25519"
+	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/x509"
+	"encoding/pem"
 	"errors"
 	"io"
 	"os"
@@ -94,6 +98,58 @@ func TestEd25519PEM_RoundTrip(t *testing.T) {
 	// can grep audit logs back to the key source.
 	if !strings.Contains(loaded.Description(), path) {
 		t.Errorf("Description() = %q; expected to contain path %q", loaded.Description(), path)
+	}
+}
+
+func TestLoadFromPKCS8PEM_RoundTrip(t *testing.T) {
+	type equaler interface{ Equal(crypto.PublicKey) bool }
+
+	edPub, edPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("ed25519 keygen: %v", err)
+	}
+	ecPriv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("ecdsa keygen: %v", err)
+	}
+
+	// The unsealed intermediate may be ed25519 or ecdsa-p256; both must load.
+	cases := []struct {
+		name string
+		priv crypto.Signer
+		pub  crypto.PublicKey
+	}{
+		{"ed25519", edPriv, edPub},
+		{"ecdsa-p256", ecPriv, &ecPriv.PublicKey},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			der, err := x509.MarshalPKCS8PrivateKey(tc.priv)
+			if err != nil {
+				t.Fatalf("marshal pkcs8: %v", err)
+			}
+			pemBytes := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der})
+			s, err := LoadFromPKCS8PEM(pemBytes, "test-intermediate")
+			if err != nil {
+				t.Fatalf("LoadFromPKCS8PEM: %v", err)
+			}
+			if !s.Public().(equaler).Equal(tc.pub) {
+				t.Error("loaded public key does not match the original")
+			}
+			if s.Description() != "test-intermediate" {
+				t.Errorf("Description() = %q, want test-intermediate", s.Description())
+			}
+		})
+	}
+}
+
+func TestLoadFromPKCS8PEM_RejectsBadInput(t *testing.T) {
+	if _, err := LoadFromPKCS8PEM([]byte("not pem"), ""); err == nil || !strings.Contains(err.Error(), "no PEM block") {
+		t.Errorf("err = %v, want 'no PEM block'", err)
+	}
+	bad := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: []byte("deadbeef")})
+	if _, err := LoadFromPKCS8PEM(bad, ""); err == nil || !strings.Contains(err.Error(), "parse pkcs8") {
+		t.Errorf("err = %v, want 'parse pkcs8'", err)
 	}
 }
 

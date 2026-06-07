@@ -223,7 +223,7 @@ func (s *Server) handleSignX509WorkloadCert(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	cert, err := x509engine.SignWorkloadCert(rand.Reader, s.caSigner, issuerCert, x509engine.WorkloadCertParams{
+	cert, err := x509engine.SignWorkloadCert(rand.Reader, s.x509Signer, issuerCert, x509engine.WorkloadCertParams{
 		PublicKey:         pub,
 		SPIFFEURI:         spiffeURI,
 		SubjectCommonName: req.SubjectCommonName,

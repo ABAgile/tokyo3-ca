@@ -91,6 +91,44 @@ func parseEd25519PEM(b []byte) (Signer, error) {
 	return &inMemory{priv: priv, descr: "in-memory ed25519"}, nil
 }
 
+// genericInMemory wraps any PKCS#8-loaded [crypto.Signer] (Ed25519, ECDSA, or
+// RSA) held in process memory. Used for the unsealed intermediate CA key, whose
+// algorithm matches whatever the issuing ceremony generated. The embedded
+// signer's own Sign already satisfies how [crypto/x509.CreateCertificate] calls
+// it (raw message for Ed25519, pre-hashed digest for ECDSA/RSA), so no special
+// handling is needed here.
+type genericInMemory struct {
+	crypto.Signer
+	descr string
+}
+
+// Description satisfies [Signer]. Identifies key location; safe to log.
+func (g genericInMemory) Description() string { return g.descr }
+
+// LoadFromPKCS8PEM decodes the first PEM block of b as a PKCS#8 private key and
+// returns an in-memory [Signer] backed by it. Unlike [LoadEd25519FromPEMFile]
+// it accepts any signing key type (Ed25519, ECDSA, RSA) — the unsealed
+// intermediate may be ed25519 or ecdsa-p256. descr is the human-readable
+// key-location string surfaced in audit/portal; a default is used when empty.
+func LoadFromPKCS8PEM(b []byte, descr string) (Signer, error) {
+	block, _ := pem.Decode(b)
+	if block == nil {
+		return nil, errors.New("no PEM block found")
+	}
+	key, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+	if err != nil {
+		return nil, fmt.Errorf("parse pkcs8: %w", err)
+	}
+	cs, ok := key.(crypto.Signer)
+	if !ok {
+		return nil, fmt.Errorf("key type %T is not a crypto.Signer", key)
+	}
+	if descr == "" {
+		descr = "in-memory (pkcs8)"
+	}
+	return genericInMemory{Signer: cs, descr: descr}, nil
+}
+
 // Public satisfies [crypto.Signer]. Returns the Ed25519 public key.
 func (s *inMemory) Public() crypto.PublicKey { return s.priv.Public() }
 
