@@ -624,6 +624,7 @@ func runServe(ctx context.Context) error {
 		X509IssuerCert:   x509IssuerCert,
 		X509IssuerReload: x509IssuerReload,
 		TrustBundlePath:  envutil.Or("CERTD_CA_TRUST_BUNDLE", os.Getenv("CERTD_CA_X509_CERT_FILE")),
+		SSHCAKeysPath:    os.Getenv("CERTD_SSH_CA_KEYS_FILE"),
 		Policy:           policyEngine,
 		OIDCVerifier:     oidcVerifier,
 		MTLSStore:        mtlsStore,

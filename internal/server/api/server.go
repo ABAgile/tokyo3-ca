@@ -36,6 +36,7 @@ type Server struct {
 	x509IssuerCert   *x509.Certificate        // Static issuer fallback; used when x509IssuerReload is nil. nil disables /x509/* routes.
 	x509IssuerReload func() *x509.Certificate // When set, returns the live (hot-reloaded) issuer cert; wins over x509IssuerCert.
 	trustBundlePath  string                   // PEM file served at GET /api/v1/x509/trust-bundle; empty ⇒ 503.
+	sshCAKeysPath    string                   // TrustedUserCAKeys set served at GET /api/v1/ssh/ca-keys; empty ⇒ derive the live key.
 	policy           *policy.Engine           // Role-table enforcer; nil = permissive (pre-auth wiring).
 	oidc             oidc.TokenVerifier       // Bearer-token verifier; nil = no OIDC auth.
 	mtls             mtls.Store               // Cert-principal registry; nil = no mTLS auth.
@@ -78,6 +79,12 @@ type Config struct {
 	// anchor (old⊕new during a rotation overlap). Read per request, so edits
 	// are picked up live. Empty ⇒ the endpoint returns 503.
 	TrustBundlePath string
+	// SSHCAKeysPath is an operator-maintained TrustedUserCAKeys-format file
+	// (one or more SSH CA pubkeys, old⊕new during a rotation overlap) served at
+	// GET /api/v1/ssh/ca-keys so verifiers can pull the current SSH CA key set.
+	// Read per request. Empty (or unreadable/blank) ⇒ the live CA signing key
+	// is served, so the endpoint never returns an empty set.
+	SSHCAKeysPath string
 	// Policy applies the role table to incoming sign requests. When
 	// nil, sign endpoints are permissive — anyone reaching them can
 	// sign anything within the endpoint TTL ceiling. Production builds
@@ -168,6 +175,7 @@ func New(cfg Config) (*Server, error) {
 		x509IssuerCert:   cfg.X509IssuerCert,
 		x509IssuerReload: cfg.X509IssuerReload,
 		trustBundlePath:  cfg.TrustBundlePath,
+		sshCAKeysPath:    cfg.SSHCAKeysPath,
 		policy:           cfg.Policy,
 		oidc:             cfg.OIDCVerifier,
 		mtls:             cfg.MTLSStore,
@@ -193,6 +201,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /api/v1/ssh/sign-host", s.handleSignHostCert)
 	mux.HandleFunc("POST /api/v1/x509/sign-workload", s.handleSignX509WorkloadCert)
 	mux.HandleFunc("GET /api/v1/x509/trust-bundle", s.handleTrustBundle)
+	mux.HandleFunc("GET /api/v1/ssh/ca-keys", s.handleSSHCAKeys)
 	mux.HandleFunc("POST /api/v1/x509/adopt", s.handleAdoptX509)
 	mux.HandleFunc("POST /api/v1/ssh/revoke", s.handleRevoke)
 	mux.HandleFunc("GET /api/v1/ssh/revocations", s.handleRevocations)

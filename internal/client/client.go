@@ -152,6 +152,26 @@ func (c *Client) FetchTrustBundle(ctx context.Context) (string, error) {
 	return out.Bundle, nil
 }
 
+// SSHCAKeysResponse mirrors certd's GET /api/v1/ssh/ca-keys reply.
+// TrustedUserCAKeys is one or more SSH CA pubkeys in TrustedUserCAKeys format
+// (old⊕new during a CA-rotation overlap).
+type SSHCAKeysResponse struct {
+	TrustedUserCAKeys string `json:"trusted_user_ca_keys"`
+}
+
+// FetchSSHCAKeys pulls certd's current trusted SSH CA key set, letting a
+// verifier refresh its TrustedUserCAKeys on a schedule instead of waiting for
+// an out-of-band push. Unauthenticated public material, but the call still
+// rides the client's TLS channel to certd (the SSH counterpart to
+// [Client.FetchTrustBundle]).
+func (c *Client) FetchSSHCAKeys(ctx context.Context) (string, error) {
+	var out SSHCAKeysResponse
+	if err := c.api.R(ctx, http.MethodGet, "/api/v1/ssh/ca-keys", &out); err != nil {
+		return "", fmt.Errorf("ssh ca-keys: %w", err)
+	}
+	return out.TrustedUserCAKeys, nil
+}
+
 // SignUserRequest mirrors certd's POST /api/v1/ssh/sign-user body.
 // Keep in sync with the certd handler — fields drift here silently
 // turn into 400s.

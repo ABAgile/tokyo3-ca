@@ -99,6 +99,14 @@
 //	                                          safe); unchanged bundles are not rewritten.
 //	CERT_AGENTD_TRUST_BUNDLE_REFRESH_SECONDS  Pull cadence. Default 3600 (anchors rotate rarely).
 //
+//	CERT_AGENTD_SSH_CA_KEYS_PATH              When set, the agent periodically GETs certd's
+//	                                          /api/v1/ssh/ca-keys and writes the TrustedUserCAKeys
+//	                                          set here, so an SSH CA rotation propagates as an
+//	                                          automated overlap (the served set lists old⊕new while
+//	                                          leaves drain). Unset ⇒ feature off. Same fail-safe +
+//	                                          skip-unchanged behaviour as the trust-bundle pull.
+//	CERT_AGENTD_SSH_CA_KEYS_REFRESH_SECONDS   Pull cadence. Default 3600 (SSH CA keys rotate rarely).
+//
 //	CERT_AGENTD_INSTANCE    Per-host identifier appended to the NATS subject and added as an
 //	                        "instance" log attribute on every line. Defaults to os.Hostname().
 //	                        Operators may override when hostnames aren't stable (e.g.,
@@ -283,6 +291,14 @@ func runAgent(ctx context.Context) error {
 		return fmt.Errorf("trust-bundle refresher: %w", err)
 	}
 
+	// Optional SSH CA-keys refresher: pull certd's trusted SSH CA key set and
+	// write it to CERT_AGENTD_SSH_CA_KEYS_PATH (nil when unset), so an SSH CA
+	// rotation propagates as an automated overlap with no out-of-band push.
+	sshCAKeysRefresher, err := buildSSHCAKeysRefresher(certdClient, log)
+	if err != nil {
+		return fmt.Errorf("ssh ca-keys refresher: %w", err)
+	}
+
 	// Derive a cancellable child of rt.Ctx so one component's exit
 	// unwinds the others (cancel() in the collector loop below); rt.Ctx
 	// itself is cancelled on signal/shutdown by rt.Shutdown.
@@ -305,6 +321,9 @@ func runAgent(ctx context.Context) error {
 	}
 	if trustBundleRefresher != nil {
 		runners = append(runners, trustBundleRefresher)
+	}
+	if sshCAKeysRefresher != nil {
+		runners = append(runners, sshCAKeysRefresher)
 	}
 	for _, wr := range workloadRenewers {
 		runners = append(runners, wr.Run)
