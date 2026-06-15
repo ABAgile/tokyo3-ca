@@ -77,8 +77,12 @@ func TestPEMReloader_ReloadsOnChange_KeepsLastGoodOnBadFile(t *testing.T) {
 }
 
 func TestNewPEMReloader_FailsFastOnMissingFile(t *testing.T) {
-	_, err := newPEMReloader(filepath.Join(t.TempDir(), "nope.crt"), "issuer",
-		slog.New(slog.DiscardHandler), loadCAPool)
+	sig, err := signer.NewEphemeralEd25519()
+	if err != nil {
+		t.Fatalf("signer: %v", err)
+	}
+	_, err = newPEMReloader(filepath.Join(t.TempDir(), "nope.crt"), "issuer",
+		slog.New(slog.DiscardHandler), issuerLoader(sig.Public()))
 	if err == nil {
 		t.Fatal("expected error for a missing file at construction")
 	}
@@ -139,19 +143,5 @@ func TestBuildServerTLS_ClientCAHotReloadWiring(t *testing.T) {
 	}
 	if sub.GetConfigForClient != nil {
 		t.Error("per-handshake config must not recurse (GetConfigForClient should be nil)")
-	}
-}
-
-func TestLoadCAPool_ParsesIssuer(t *testing.T) {
-	sig, err := signer.NewEphemeralEd25519()
-	if err != nil {
-		t.Fatalf("signer: %v", err)
-	}
-	pool, err := loadCAPool(issuerPEM(t, sig))
-	if err != nil {
-		t.Fatalf("loadCAPool: %v", err)
-	}
-	if pool == nil {
-		t.Fatal("nil pool")
 	}
 }

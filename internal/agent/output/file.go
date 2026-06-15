@@ -40,8 +40,8 @@ func WriteAtomic(path string, b []byte, mode os.FileMode) error {
 // watching reader, the reverse). The consistency GUARANTEE is the reader's
 // responsibility: a loader must read the pair together, verify the key
 // matches the cert (tls.LoadX509KeyPair does this cryptographically), and
-// keep the last-known-good pair on mismatch. tokyo3-base's tls.CertLoader
-// and tls/reloader do exactly that — consumers should use a reloading loader
+// keep the last-known-good pair on mismatch. tokyo3-base's
+// tls/reloader.CertLoader does exactly that — consumers should use a reloading loader
 // (not a one-shot read) for rotated material.
 //
 // What the write ordering here BUYS (not a guarantee, an optimization): the

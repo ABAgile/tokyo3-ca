@@ -238,8 +238,8 @@ func (r *Renewer) SignOnce(ctx context.Context) (validAfter, validBefore time.Ti
 	// write key+cert together (key-first, cert-last) to minimise the
 	// desync window — see output.WriteBundleAtomic. This is not a
 	// cross-file atomic guarantee; the consumer's loader must verify the
-	// pair and keep the last-known-good on mismatch (base tls.CertLoader /
-	// tls/reloader do). Once the key is persisted, normal renewals rotate
+	// pair and keep the last-known-good on mismatch (base
+	// tls/reloader.CertLoader does). Once the key is persisted, normal renewals rotate
 	// only the cert (the key is stable), so a plain atomic cert write
 	// suffices.
 	certPEM := certWithChain(resp)

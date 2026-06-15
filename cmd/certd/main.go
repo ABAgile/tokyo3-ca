@@ -42,8 +42,17 @@
 //	                     rotation can widen it to old⊕new and later narrow it with no restart.
 //
 //	CERTD_WORKLOAD_CA  CA PEM that signs every internal workload cert certd connects to (NATS,
-//	                   future DB). Used as the fallback for CERTD_NATS_CA when that var is
-//	                   unset.
+//	                   DB). Used as the fallback for CERTD_NATS_CA and CERTD_DB_CA when those
+//	                   vars are unset.
+//
+//	CERTD_DB_CERT  Client certificate PEM path certd presents to Postgres for mTLS. Falls back
+//	               to CERTD_WORKLOAD_CERT. Unset ⇒ no client cert; the DSN's sslmode governs
+//	               TLS (server-auth only).
+//	CERTD_DB_KEY   Client key PEM path. Required iff CERTD_DB_CERT resolves. Falls back to
+//	               CERTD_WORKLOAD_KEY.
+//	CERTD_DB_CA    CA PEM for verifying the Postgres server cert. Falls back to CERTD_WORKLOAD_CA.
+//	               The leaf is re-read per handshake and the CA pool on mtime, so a workload-cert
+//	               rotation lands on the next pool dial without a restart.
 //
 //	CERTD_CA_KEY_FILE        PKCS#8-encoded Ed25519 private key PEM path — the CA signing key
 //	                         used for BOTH SSH user/host certs and X.509/SPIFFE workload certs
@@ -188,6 +197,7 @@ import (
 	"github.com/abagile/tokyo3-base/envutil"
 	"github.com/abagile/tokyo3-base/journal"
 	btls "github.com/abagile/tokyo3-base/tls"
+	"github.com/abagile/tokyo3-base/tls/reloader"
 	"github.com/abagile/tokyo3-base/version"
 	"github.com/spf13/cobra"
 
@@ -990,9 +1000,30 @@ func openStore(ctx context.Context, log *slog.Logger) (store.Store, error) {
 	if path, ok := strings.CutPrefix(url, "sqlite:"); ok {
 		return sqlitestore.Open(ctx, path, log)
 	}
-	// tlsCfg nil for now — DSN sslmode covers TLS; mTLS-to-Postgres using
-	// certd's workload identity can be layered in later (Open takes one).
-	return pgstore.Open(ctx, url, nil, log)
+	tlsCfg, err := dbClientTLS()
+	if err != nil {
+		return nil, fmt.Errorf("db client TLS: %w", err)
+	}
+	return pgstore.Open(ctx, url, tlsCfg, log)
+}
+
+// dbClientTLS builds the client-cert TLS config certd presents to Postgres
+// from CERTD_DB_CERT/KEY (falling back to the daemon's workload identity,
+// CERTD_WORKLOAD_CERT/KEY) and CERTD_DB_CA (→ CERTD_WORKLOAD_CA). It returns
+// (nil, nil) when no client cert is configured — the DSN's sslmode then
+// governs TLS (server-auth only, certd's prior behavior). With a cert+key
+// pair the leaf is re-read on every handshake and the CA pool on mtime change
+// (reloader.ClientConfig), so a cert-agentd rotation of the short-TTL workload
+// cert lands on the next pool dial without a restart — no poll loop needed
+// (SetConnMaxLifetime recycles pooled conns within its window).
+func dbClientTLS() (*tls.Config, error) {
+	certFile := envutil.First("CERTD_DB_CERT", "CERTD_WORKLOAD_CERT")
+	keyFile := envutil.First("CERTD_DB_KEY", "CERTD_WORKLOAD_KEY")
+	if certFile == "" || keyFile == "" {
+		return nil, nil
+	}
+	caFile := envutil.First("CERTD_DB_CA", "CERTD_WORKLOAD_CA")
+	return reloader.ClientConfig(certFile, keyFile, caFile)
 }
 
 // readRolesFile reads and decodes a CERTD_ROLES_FILE JSON array.
@@ -1097,7 +1128,7 @@ func buildServerTLS(log *slog.Logger) (*tls.Config, error) {
 	cfg := &tls.Config{MinVersion: tls.VersionTLS12}
 	if certFile != "" {
 		log.Info("tls: using certificate files (hot-reload enabled)", "cert", certFile)
-		loader := btls.NewCertLoader(certFile, keyFile)
+		loader := reloader.NewCertLoader(certFile, keyFile)
 		cfg.GetCertificate = loader.GetCertificate
 	} else {
 		log.Warn("tls: no certificate configured, using self-signed (not for production)")
@@ -1109,21 +1140,16 @@ func buildServerTLS(log *slog.Logger) (*tls.Config, error) {
 	}
 
 	if clientCAFile != "" {
-		caRL, err := newPEMReloader(clientCAFile, "API client CA bundle", log, loadCAPool)
+		// Hot-reload the inbound client-CA bundle: base wires ClientAuth +
+		// ClientCAs + a per-handshake GetConfigForClient so a rotation
+		// widen→narrow lands with no certd restart, keeping the last good
+		// pool on a bad drop-in.
+		caLoader, err := reloader.NewClientCALoader(cfg, clientCAFile, tls.VerifyClientCertIfGiven)
 		if err != nil {
 			return nil, fmt.Errorf("CERTD_API_CLIENT_CA: %w", err)
 		}
-		cfg.ClientAuth = tls.VerifyClientCertIfGiven
-		cfg.ClientCAs = caRL.get()
-		// Re-read the bundle (mtime-gated) on every handshake so a rotation
-		// widen→narrow lands with no certd restart. A per-handshake config is
-		// the only way to swap ClientCAs live; keep-last-good on a bad
-		// drop-in is handled inside the reloader.
-		cfg.GetConfigForClient = func(*tls.ClientHelloInfo) (*tls.Config, error) {
-			c := cfg.Clone()
-			c.GetConfigForClient = nil
-			c.ClientCAs = caRL.get()
-			return c, nil
+		caLoader.OnError = func(err error) {
+			log.Warn("tls: client CA hot-reload kept previous pool", "ca", clientCAFile, "err", err)
 		}
 		log.Info("tls: mTLS client CA loaded (hot-reload)", "ca", clientCAFile)
 	}

@@ -1,20 +1,19 @@
 package main
 
-// Hot-reload plumbing for the two PEM artifacts certd reads at runtime
-// besides its server cert (which base/tls.CertLoader already hot-reloads):
+// Hot-reload plumbing for the X.509 issuer cert certd signs under
+// (CERTD_CA_X509_CERT_FILE). certd's other rotating TLS material goes
+// through base tls/reloader — the server cert via reloader.CertLoader,
+// the inbound client-CA bundle via reloader.NewClientCALoader. The issuer
+// cert has no base equivalent: it's a standalone signing-chain cert
+// carrying a key-match guard, so it keeps its own reloader here.
 //
-//   - CERTD_API_CLIENT_CA — the inbound mTLS client-CA bundle. During a CA
-//     key rotation this widens to old⊕new and later narrows to new-only;
-//     hot-reload means those edits land without a certd restart.
-//   - CERTD_CA_X509_CERT_FILE — the X.509 issuer cert certd signs under.
-//     Hot-reload covers the cheap same-key refresh (re-mint over the same
-//     key on expiry). A new-key issuer is REFUSED live (see issuerLoader):
-//     the signing key isn't hot-reloaded, so swapping in a new-key issuer
-//     would mint chains that don't verify — a key rotation still restarts.
+// Hot-reload covers the cheap same-key refresh (re-mint over the same key
+// on expiry). A new-key issuer is REFUSED live (see issuerLoader): the
+// signing key isn't hot-reloaded, so swapping in a new-key issuer would
+// mint chains that don't verify — a key rotation still restarts.
 //
-// Both go through pemReloader, which is fail-safe: a truncated/absent/invalid
-// drop-in keeps the last good value rather than opening a trust window or
-// breaking issuance.
+// pemReloader is fail-safe: a truncated/absent/invalid drop-in keeps the
+// last good value rather than breaking issuance.
 
 import (
 	"crypto"
@@ -26,8 +25,6 @@ import (
 	"os"
 	"sync"
 	"time"
-
-	btls "github.com/abagile/tokyo3-base/tls"
 )
 
 // pemReloader caches the parsed form of a PEM file, re-reading only when the
@@ -91,9 +88,6 @@ func (r *pemReloader[T]) reloadLocked() error {
 	r.val, r.modTime = v, fi.ModTime()
 	return nil
 }
-
-// loadCAPool parses a (possibly multi-cert) trust bundle into a pool.
-func loadCAPool(data []byte) (*x509.CertPool, error) { return btls.CertPoolFromPEM(data) }
 
 // issuerLoader returns a load func that parses the issuer cert AND refuses
 // any cert whose public key does not match signerPub. That guard is what

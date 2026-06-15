@@ -255,6 +255,17 @@ the server against the *same* anchor (`sslrootcert` in the DSN). The
 `pg-entrypoint.sh` wrapper stages the server key with the perms+owner
 postgres demands, then starts it with `ssl=on` and the cert HBA.
 
+certd can present its client cert two ways. Embedding `sslcert`/`sslkey`
+in `CERTD_DATABASE_URL` works but pins the cert at boot (pgx reads the
+files once when it parses the DSN), so a cert-agentd rotation of
+`certd-db.crt` isn't picked up until restart. Setting
+`CERTD_DB_CERT`/`CERTD_DB_KEY` (falling back to the daemon's
+`CERTD_WORKLOAD_CERT`/`KEY`) plus `CERTD_DB_CA` (→ `CERTD_WORKLOAD_CA`)
+instead routes the connection through `tls/reloader`: the leaf is
+re-read per handshake and the CA pool on mtime, so a rotated cert lands
+on the next pool dial (within `SetConnMaxLifetime`) with no restart —
+matching how certd already hot-reloads its serving and NATS certs.
+
 Because the store is on, the **renewal/anti-theft guard** is active:
 the first renewal of each provisioned identity is recorded as an
 enrollment, and later renewals must present the current/previous serial
