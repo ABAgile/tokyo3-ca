@@ -41,18 +41,17 @@
 //	                     (mtime-gated, keep-last-good on a bad file) on every handshake, so a CA
 //	                     rotation can widen it to old⊕new and later narrow it with no restart.
 //
-//	CERTD_WORKLOAD_CA  CA PEM that signs every internal workload cert certd connects to (NATS,
-//	                   DB). Used as the fallback for CERTD_NATS_CA and CERTD_DB_CA when those
-//	                   vars are unset.
+//	CERTD_WORKLOAD_CA  CA PEM that signs every internal workload cert certd connects to. Used as
+//	                   the fallback for CERTD_NATS_CA and CERTD_DB_CA when those vars are unset.
 //
-//	CERTD_DB_CERT  Client certificate PEM path certd presents to Postgres for mTLS. Falls back
-//	               to CERTD_WORKLOAD_CERT. Unset ⇒ no client cert; the DSN's sslmode governs
-//	               TLS (server-auth only).
-//	CERTD_DB_KEY   Client key PEM path. Required iff CERTD_DB_CERT resolves. Falls back to
-//	               CERTD_WORKLOAD_KEY.
-//	CERTD_DB_CA    CA PEM for verifying the Postgres server cert. Falls back to CERTD_WORKLOAD_CA.
-//	               The leaf is re-read per handshake and the CA pool on mtime, so a workload-cert
-//	               rotation lands on the next pool dial without a restart.
+//	CERTD_DB_CERT  Client certificate PEM path certd presents to Postgres for mTLS. Unset ⇒ no
+//	               client cert; the DSN's sslmode governs TLS (server-auth only). cert/key are a
+//	               DB-role credential — they do NOT borrow the workload identity; set them
+//	               explicitly to use mTLS.
+//	CERTD_DB_KEY   Client key PEM path. Required iff CERTD_DB_CERT is set.
+//	CERTD_DB_CA    CA PEM for verifying the Postgres server cert; falls back to CERTD_WORKLOAD_CA
+//	               (the shared mesh trust root). The leaf is re-read per handshake and the CA pool
+//	               on mtime, so a rotation lands on the next pool dial without a restart.
 //
 //	CERTD_CA_KEY_FILE        PKCS#8-encoded Ed25519 private key PEM path — the CA signing key
 //	                         used for BOTH SSH user/host certs and X.509/SPIFFE workload certs
@@ -195,6 +194,7 @@ import (
 	"github.com/abagile/tokyo3-base/cli"
 	"github.com/abagile/tokyo3-base/crypto"
 	"github.com/abagile/tokyo3-base/envutil"
+	"github.com/abagile/tokyo3-base/guard"
 	"github.com/abagile/tokyo3-base/journal"
 	btls "github.com/abagile/tokyo3-base/tls"
 	"github.com/abagile/tokyo3-base/tls/reloader"
@@ -301,14 +301,14 @@ func runReconcile(ctx context.Context, o reconcileOpts) error {
 	defer rt.Shutdown()
 	log := rt.Log
 
-	db, err := openStore(ctx, log)
+	db, err := openStore(ctx, rt.DB, log)
 	if err != nil {
 		return fmt.Errorf("open store database: %w", err)
 	}
 	if db == nil {
 		return errors.New("reconcile requires CERTD_DATABASE_URL (no persistent store configured)")
 	}
-	defer envutil.CloseIfCloser(db)
+	defer guard.Close(db)
 
 	actor := o.actor
 	if actor == "" {
@@ -524,12 +524,12 @@ func runServe(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("audit sink: %w", err)
 	}
-	defer envutil.CloseIfCloser(auditSink)
+	defer guard.Close(auditSink)
 	auditSrc, err := cli.AuditSource(rt, audit.StreamName, audit.Subject)
 	if err != nil {
 		return fmt.Errorf("audit source: %w", err)
 	}
-	defer envutil.CloseIfCloser(auditSrc)
+	defer guard.Close(auditSrc)
 
 	tlsCfg, err := buildServerTLS(log)
 	if err != nil {
@@ -544,12 +544,12 @@ func runServe(ctx context.Context) error {
 	// Persistent backend (Postgres / sqlite) shared across the role,
 	// principal, and revocation tables — one connection, so SQLite works.
 	// nil when CERTD_DATABASE_URL is unset (in-memory/file dev path).
-	db, err := openStore(ctx, log)
+	db, err := openStore(ctx, rt.DB, log)
 	if err != nil {
 		return fmt.Errorf("open store database: %w", err)
 	}
 	if db != nil {
-		defer envutil.CloseIfCloser(db)
+		defer guard.Close(db)
 	}
 
 	mtlsStore, err := loadMTLSStore(db, log)
@@ -672,11 +672,11 @@ func runServe(ctx context.Context) error {
 	rootCtx := rt.Ctx
 
 	if auditTracker != nil {
-		go func() {
+		guard.Go(log, "audit-tracker", func() {
 			if err := auditTracker.Run(rootCtx); err != nil && !errors.Is(err, context.Canceled) {
 				log.Warn("audit tracker exited", "err", err)
 			}
-		}()
+		})
 	}
 
 	serveErr := make(chan error, 1)
@@ -947,7 +947,7 @@ func warnIfIssuerNearExpiry(log *slog.Logger, cert *x509.Certificate) {
 //     portal's roles page returns 503.
 //
 // The returned store may hold a DB handle; the caller closes it via
-// envutil.CloseIfCloser (a no-op for the in-memory store). The file
+// guard.Close (a no-op for the in-memory store). The file
 // format is a top-level JSON array of [policy.Role] objects.
 func loadRoleStore(db store.Store, log *slog.Logger) (policy.Store, *policy.Engine, error) {
 	rolesFile := os.Getenv("CERTD_ROLES_FILE")
@@ -992,19 +992,18 @@ func loadRoleStore(db store.Store, log *slog.Logger) (policy.Store, *policy.Engi
 // (nil, nil) when the env var is unset so callers fall back to the
 // in-memory/file stores. The returned Store fronts the role, principal, and
 // revocation tables over one connection.
-func openStore(ctx context.Context, log *slog.Logger) (store.Store, error) {
-	url := os.Getenv("CERTD_DATABASE_URL")
-	if url == "" {
+func openStore(ctx context.Context, db cli.DB, log *slog.Logger) (store.Store, error) {
+	if db.URL == "" {
 		return nil, nil
 	}
-	if path, ok := strings.CutPrefix(url, "sqlite:"); ok {
+	if path, ok := strings.CutPrefix(db.URL, "sqlite:"); ok {
 		return sqlitestore.Open(ctx, path, log)
 	}
-	tlsCfg, err := dbClientTLS()
+	tlsCfg, err := dbClientTLS(db)
 	if err != nil {
 		return nil, fmt.Errorf("db client TLS: %w", err)
 	}
-	return pgstore.Open(ctx, url, tlsCfg, log)
+	return pgstore.Open(ctx, db.URL, tlsCfg, log)
 }
 
 // dbClientTLS builds the client-cert TLS config certd presents to Postgres
@@ -1016,14 +1015,11 @@ func openStore(ctx context.Context, log *slog.Logger) (store.Store, error) {
 // (reloader.ClientConfig), so a cert-agentd rotation of the short-TTL workload
 // cert lands on the next pool dial without a restart — no poll loop needed
 // (SetConnMaxLifetime recycles pooled conns within its window).
-func dbClientTLS() (*tls.Config, error) {
-	certFile := envutil.First("CERTD_DB_CERT", "CERTD_WORKLOAD_CERT")
-	keyFile := envutil.First("CERTD_DB_KEY", "CERTD_WORKLOAD_KEY")
-	if certFile == "" || keyFile == "" {
+func dbClientTLS(m cli.DB) (*tls.Config, error) {
+	if m.CertFile == "" || m.KeyFile == "" {
 		return nil, nil
 	}
-	caFile := envutil.First("CERTD_DB_CA", "CERTD_WORKLOAD_CA")
-	return reloader.ClientConfig(certFile, keyFile, caFile)
+	return reloader.ClientConfig(m.CertFile, m.KeyFile, m.CAFile)
 }
 
 // readRolesFile reads and decodes a CERTD_ROLES_FILE JSON array.

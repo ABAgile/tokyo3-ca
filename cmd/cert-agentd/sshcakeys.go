@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/abagile/tokyo3-base/guard"
+
 	"github.com/abagile/tokyo3-ca/internal/agent/output"
 	"github.com/abagile/tokyo3-ca/internal/client"
 )
@@ -64,7 +66,8 @@ func buildSSHCAKeysRefresher(c *client.Client, log *slog.Logger) (func(context.C
 	}
 
 	return func(ctx context.Context) error {
-		refresh(ctx) // once up front: catch a rotation that landed while the agent was down
+		// once up front: catch a rotation that landed while the agent was down
+		guard.Tick(log, "ssh-ca-keys-refresh", func() { refresh(ctx) })
 		t := time.NewTicker(interval)
 		defer t.Stop()
 		for {
@@ -72,7 +75,7 @@ func buildSSHCAKeysRefresher(c *client.Client, log *slog.Logger) (func(context.C
 			case <-ctx.Done():
 				return ctx.Err()
 			case <-t.C:
-				refresh(ctx)
+				guard.Tick(log, "ssh-ca-keys-refresh", func() { refresh(ctx) })
 			}
 		}
 	}, nil
