@@ -254,234 +254,6 @@ func serveCmd() *cobra.Command {
 	}
 }
 
-// ── reconcile ───────────────────────────────────────────────────────────────
-
-type reconcileOpts struct {
-	apply          bool
-	prune          bool
-	rolesOnly      bool
-	principalsOnly bool
-	adopt          bool
-	actor          string
-}
-
-func reconcileCmd() *cobra.Command {
-	o := reconcileOpts{prune: true}
-	cmd := &cobra.Command{
-		Use:   "reconcile",
-		Short: "Reconcile the role/principal tables to the config files (GitOps)",
-		Long: "Diff CERTD_ROLES_FILE / CERTD_MTLS_PRINCIPALS_FILE against the\n" +
-			"persistent store (CERTD_DATABASE_URL) and apply the difference.\n\n" +
-			"Config is authoritative over rows it owns (source=config): they are\n" +
-			"added, updated, and pruned to match the files. Portal-created rows\n" +
-			"(source=portal) are never pruned; a name/SAN collision is reported as\n" +
-			"a conflict and skipped unless --adopt takes ownership of it.\n\n" +
-			"Dry-run by default — prints the plan and changes nothing. Pass --apply\n" +
-			"to write. Every applied change lands with its audit entry in the same\n" +
-			"transaction (delivered to the ca_audit stream by a running certd serve).",
-		RunE: func(cmd *cobra.Command, _ []string) error {
-			return runReconcile(cmd.Context(), o)
-		},
-	}
-	f := cmd.Flags()
-	f.BoolVar(&o.apply, "apply", false, "apply the changes (default: dry-run, print only)")
-	f.BoolVar(&o.prune, "prune", true, "delete config-owned rows absent from the files")
-	f.BoolVar(&o.rolesOnly, "roles-only", false, "reconcile only the role table")
-	f.BoolVar(&o.principalsOnly, "principals-only", false, "reconcile only the principal registry")
-	f.BoolVar(&o.adopt, "adopt", false, "take ownership of portal-created rows that collide with the files")
-	f.StringVar(&o.actor, "actor", "", "audit actor for config:<actor> (default: hostname)")
-	return cmd
-}
-
-func runReconcile(ctx context.Context, o reconcileOpts) error {
-	if o.rolesOnly && o.principalsOnly {
-		return errors.New("--roles-only and --principals-only are mutually exclusive")
-	}
-	rt := cli.App{Name: appName, EnvPrefix: "CERTD"}.Setup(ctx)
-	defer rt.Shutdown()
-	log := rt.Log
-
-	db, err := openStore(ctx, rt.DB, log)
-	if err != nil {
-		return fmt.Errorf("open store database: %w", err)
-	}
-	if db == nil {
-		return errors.New("reconcile requires CERTD_DATABASE_URL (no persistent store configured)")
-	}
-	defer guard.Close(db)
-
-	actor := o.actor
-	if actor == "" {
-		actor, _ = os.Hostname()
-		if actor == "" {
-			actor = "reconcile"
-		}
-	}
-
-	var rolePlan reconcile.RolePlan
-	var principalPlan reconcile.PrincipalPlan
-
-	if !o.principalsOnly {
-		path := os.Getenv("CERTD_ROLES_FILE")
-		if path == "" {
-			return errors.New("CERTD_ROLES_FILE unset; nothing to reconcile for roles (use --principals-only to skip)")
-		}
-		roles, err := readRolesFile(path)
-		if err != nil {
-			return err
-		}
-		recs, err := db.Roles().AllWithSource()
-		if err != nil {
-			return fmt.Errorf("read role table: %w", err)
-		}
-		rolePlan = reconcile.DiffRoles(roles, recs, o.adopt)
-	}
-	if !o.rolesOnly {
-		path := os.Getenv("CERTD_MTLS_PRINCIPALS_FILE")
-		if path == "" {
-			return errors.New("CERTD_MTLS_PRINCIPALS_FILE unset; nothing to reconcile for principals (use --roles-only to skip)")
-		}
-		principals, err := readPrincipalsFile(path)
-		if err != nil {
-			return err
-		}
-		recs, err := db.Principals().AllWithSource()
-		if err != nil {
-			return fmt.Errorf("read principal registry: %w", err)
-		}
-		principalPlan = reconcile.DiffPrincipals(principals, recs, o.adopt)
-	}
-
-	printReconcilePlan(os.Stdout, rolePlan, principalPlan, o.prune)
-	warnConflicts(log, rolePlan.Conflicts, principalPlan.Conflicts, o.adopt)
-
-	if !o.apply {
-		if rolePlan.Empty() && principalPlan.Empty() {
-			log.Info("reconcile: already in sync — nothing to apply")
-		} else {
-			log.Info("reconcile: dry-run — re-run with --apply to write the changes above")
-		}
-		return nil
-	}
-
-	roleApplied, err := rolePlan.ApplyRoles(db.Roles(), o.prune)
-	if err != nil {
-		return fmt.Errorf("apply roles: %w", err)
-	}
-	principalApplied, err := principalPlan.ApplyPrincipals(db.Principals(), o.prune)
-	if err != nil {
-		return fmt.Errorf("apply principals: %w", err)
-	}
-
-	// The applied change is recorded in the structured log (shipped to NATS
-	// via applog when configured) — the audit trail for reconcile runs.
-	log.Info("reconcile: applied",
-		"roles_added", roleApplied.Added, "roles_updated", roleApplied.Updated, "roles_pruned", roleApplied.Pruned,
-		"principals_added", principalApplied.Added, "principals_updated", principalApplied.Updated, "principals_pruned", principalApplied.Pruned,
-		"actor", actor)
-	return nil
-}
-
-// printReconcilePlan renders the human-readable diff.
-func printReconcilePlan(w io.Writer, rp reconcile.RolePlan, pp reconcile.PrincipalPlan, prune bool) {
-	line := func(kind string, items []string) {
-		for _, it := range items {
-			fmt.Fprintf(w, "  %-8s %s\n", kind, it)
-		}
-	}
-	fmt.Fprintln(w, "roles:")
-	line("add", roleNames(rp.Add))
-	line("update", roleNames(rp.Update))
-	if prune {
-		line("prune", rp.Prune)
-	} else {
-		line("orphan", rp.Prune) // would prune, but --prune=false
-	}
-	line("conflict", rp.Conflicts)
-	fmt.Fprintln(w, "principals:")
-	line("add", principalSANs(pp.Add))
-	line("update", principalSANs(pp.Update))
-	if prune {
-		line("prune", pp.Prune)
-	} else {
-		line("orphan", pp.Prune)
-	}
-	line("conflict", pp.Conflicts)
-}
-
-func warnConflicts(log *slog.Logger, roleConflicts, principalConflicts []string, adopt bool) {
-	if adopt || (len(roleConflicts) == 0 && len(principalConflicts) == 0) {
-		return
-	}
-	log.Warn("reconcile: skipping portal-owned rows that collide with the config files; re-run with --adopt to take ownership",
-		"role_conflicts", roleConflicts, "principal_conflicts", principalConflicts)
-}
-
-func roleNames(rs []policy.Role) []string {
-	out := make([]string, len(rs))
-	for i, r := range rs {
-		out[i] = r.Name
-	}
-	return out
-}
-
-func principalSANs(ps []mtls.Principal) []string {
-	out := make([]string, len(ps))
-	for i, p := range ps {
-		out[i] = p.MatchedSAN
-	}
-	return out
-}
-
-// envFloat reads a float env var; empty/unset ⇒ 0 with no error.
-func envFloat(key string) (float64, error) {
-	v := strings.TrimSpace(os.Getenv(key))
-	if v == "" {
-		return 0, nil
-	}
-	return strconv.ParseFloat(v, 64)
-}
-
-// envInt reads an int env var; empty/unset ⇒ 0 with no error.
-func envInt(key string) (int, error) {
-	v := strings.TrimSpace(os.Getenv(key))
-	if v == "" {
-		return 0, nil
-	}
-	return strconv.Atoi(v)
-}
-
-// parseCIDRList parses a comma-separated list of CIDRs (a bare IP is treated
-// as a /32 or /128). Empty input ⇒ nil, nil.
-func parseCIDRList(s string) ([]*net.IPNet, error) {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return nil, nil
-	}
-	var out []*net.IPNet
-	for part := range strings.SplitSeq(s, ",") {
-		part = strings.TrimSpace(part)
-		if part == "" {
-			continue
-		}
-		if !strings.Contains(part, "/") {
-			if ip := net.ParseIP(part); ip != nil {
-				if ip.To4() != nil {
-					part += "/32"
-				} else {
-					part += "/128"
-				}
-			}
-		}
-		_, n, err := net.ParseCIDR(part)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, n)
-	}
-	return out, nil
-}
-
 func runServe(ctx context.Context) error {
 	rt := cli.App{Name: appName, EnvPrefix: "CERTD"}.Setup(ctx)
 	defer rt.Shutdown()
@@ -707,6 +479,185 @@ func runServe(ctx context.Context) error {
 	return nil
 }
 
+// ── reconcile ───────────────────────────────────────────────────────────────
+
+type reconcileOpts struct {
+	apply          bool
+	prune          bool
+	rolesOnly      bool
+	principalsOnly bool
+	adopt          bool
+	actor          string
+}
+
+func reconcileCmd() *cobra.Command {
+	o := reconcileOpts{prune: true}
+	cmd := &cobra.Command{
+		Use:   "reconcile",
+		Short: "Reconcile the role/principal tables to the config files (GitOps)",
+		Long: "Diff CERTD_ROLES_FILE / CERTD_MTLS_PRINCIPALS_FILE against the\n" +
+			"persistent store (CERTD_DATABASE_URL) and apply the difference.\n\n" +
+			"Config is authoritative over rows it owns (source=config): they are\n" +
+			"added, updated, and pruned to match the files. Portal-created rows\n" +
+			"(source=portal) are never pruned; a name/SAN collision is reported as\n" +
+			"a conflict and skipped unless --adopt takes ownership of it.\n\n" +
+			"Dry-run by default — prints the plan and changes nothing. Pass --apply\n" +
+			"to write. Every applied change lands with its audit entry in the same\n" +
+			"transaction (delivered to the ca_audit stream by a running certd serve).",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return runReconcile(cmd.Context(), o)
+		},
+	}
+	f := cmd.Flags()
+	f.BoolVar(&o.apply, "apply", false, "apply the changes (default: dry-run, print only)")
+	f.BoolVar(&o.prune, "prune", true, "delete config-owned rows absent from the files")
+	f.BoolVar(&o.rolesOnly, "roles-only", false, "reconcile only the role table")
+	f.BoolVar(&o.principalsOnly, "principals-only", false, "reconcile only the principal registry")
+	f.BoolVar(&o.adopt, "adopt", false, "take ownership of portal-created rows that collide with the files")
+	f.StringVar(&o.actor, "actor", "", "audit actor for config:<actor> (default: hostname)")
+	return cmd
+}
+
+func runReconcile(ctx context.Context, o reconcileOpts) error {
+	if o.rolesOnly && o.principalsOnly {
+		return errors.New("--roles-only and --principals-only are mutually exclusive")
+	}
+	rt := cli.App{Name: appName, EnvPrefix: "CERTD"}.Setup(ctx)
+	defer rt.Shutdown()
+	log := rt.Log
+
+	db, err := openStore(ctx, rt.DB, log)
+	if err != nil {
+		return fmt.Errorf("open store database: %w", err)
+	}
+	if db == nil {
+		return errors.New("reconcile requires CERTD_DATABASE_URL (no persistent store configured)")
+	}
+	defer guard.Close(db)
+
+	actor := o.actor
+	if actor == "" {
+		actor, _ = os.Hostname()
+		if actor == "" {
+			actor = "reconcile"
+		}
+	}
+
+	var rolePlan reconcile.RolePlan
+	var principalPlan reconcile.PrincipalPlan
+
+	if !o.principalsOnly {
+		path := os.Getenv("CERTD_ROLES_FILE")
+		if path == "" {
+			return errors.New("CERTD_ROLES_FILE unset; nothing to reconcile for roles (use --principals-only to skip)")
+		}
+		roles, err := readRolesFile(path)
+		if err != nil {
+			return err
+		}
+		recs, err := db.Roles().AllWithSource()
+		if err != nil {
+			return fmt.Errorf("read role table: %w", err)
+		}
+		rolePlan = reconcile.DiffRoles(roles, recs, o.adopt)
+	}
+	if !o.rolesOnly {
+		path := os.Getenv("CERTD_MTLS_PRINCIPALS_FILE")
+		if path == "" {
+			return errors.New("CERTD_MTLS_PRINCIPALS_FILE unset; nothing to reconcile for principals (use --roles-only to skip)")
+		}
+		principals, err := readPrincipalsFile(path)
+		if err != nil {
+			return err
+		}
+		recs, err := db.Principals().AllWithSource()
+		if err != nil {
+			return fmt.Errorf("read principal registry: %w", err)
+		}
+		principalPlan = reconcile.DiffPrincipals(principals, recs, o.adopt)
+	}
+
+	printReconcilePlan(os.Stdout, rolePlan, principalPlan, o.prune)
+	warnConflicts(log, rolePlan.Conflicts, principalPlan.Conflicts, o.adopt)
+
+	if !o.apply {
+		if rolePlan.Empty() && principalPlan.Empty() {
+			log.Info("reconcile: already in sync — nothing to apply")
+		} else {
+			log.Info("reconcile: dry-run — re-run with --apply to write the changes above")
+		}
+		return nil
+	}
+
+	roleApplied, err := rolePlan.ApplyRoles(db.Roles(), o.prune)
+	if err != nil {
+		return fmt.Errorf("apply roles: %w", err)
+	}
+	principalApplied, err := principalPlan.ApplyPrincipals(db.Principals(), o.prune)
+	if err != nil {
+		return fmt.Errorf("apply principals: %w", err)
+	}
+
+	// The applied change is recorded in the structured log (shipped to NATS
+	// via applog when configured) — the audit trail for reconcile runs.
+	log.Info("reconcile: applied",
+		"roles_added", roleApplied.Added, "roles_updated", roleApplied.Updated, "roles_pruned", roleApplied.Pruned,
+		"principals_added", principalApplied.Added, "principals_updated", principalApplied.Updated, "principals_pruned", principalApplied.Pruned,
+		"actor", actor)
+	return nil
+}
+
+// printReconcilePlan renders the human-readable diff.
+func printReconcilePlan(w io.Writer, rp reconcile.RolePlan, pp reconcile.PrincipalPlan, prune bool) {
+	line := func(kind string, items []string) {
+		for _, it := range items {
+			fmt.Fprintf(w, "  %-8s %s\n", kind, it)
+		}
+	}
+	fmt.Fprintln(w, "roles:")
+	line("add", roleNames(rp.Add))
+	line("update", roleNames(rp.Update))
+	if prune {
+		line("prune", rp.Prune)
+	} else {
+		line("orphan", rp.Prune) // would prune, but --prune=false
+	}
+	line("conflict", rp.Conflicts)
+	fmt.Fprintln(w, "principals:")
+	line("add", principalSANs(pp.Add))
+	line("update", principalSANs(pp.Update))
+	if prune {
+		line("prune", pp.Prune)
+	} else {
+		line("orphan", pp.Prune)
+	}
+	line("conflict", pp.Conflicts)
+}
+
+func warnConflicts(log *slog.Logger, roleConflicts, principalConflicts []string, adopt bool) {
+	if adopt || (len(roleConflicts) == 0 && len(principalConflicts) == 0) {
+		return
+	}
+	log.Warn("reconcile: skipping portal-owned rows that collide with the config files; re-run with --adopt to take ownership",
+		"role_conflicts", roleConflicts, "principal_conflicts", principalConflicts)
+}
+
+func roleNames(rs []policy.Role) []string {
+	out := make([]string, len(rs))
+	for i, r := range rs {
+		out[i] = r.Name
+	}
+	return out
+}
+
+func principalSANs(ps []mtls.Principal) []string {
+	out := make([]string, len(ps))
+	for i, p := range ps {
+		out[i] = p.MatchedSAN
+	}
+	return out
+}
+
 // ── version ───────────────────────────────────────────────────────────────────
 
 func versionCmd() *cobra.Command {
@@ -720,6 +671,55 @@ func versionCmd() *cobra.Command {
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
+
+// envFloat reads a float env var; empty/unset ⇒ 0 with no error.
+func envFloat(key string) (float64, error) {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return 0, nil
+	}
+	return strconv.ParseFloat(v, 64)
+}
+
+// envInt reads an int env var; empty/unset ⇒ 0 with no error.
+func envInt(key string) (int, error) {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return 0, nil
+	}
+	return strconv.Atoi(v)
+}
+
+// parseCIDRList parses a comma-separated list of CIDRs (a bare IP is treated
+// as a /32 or /128). Empty input ⇒ nil, nil.
+func parseCIDRList(s string) ([]*net.IPNet, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil, nil
+	}
+	var out []*net.IPNet
+	for part := range strings.SplitSeq(s, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if !strings.Contains(part, "/") {
+			if ip := net.ParseIP(part); ip != nil {
+				if ip.To4() != nil {
+					part += "/32"
+				} else {
+					part += "/128"
+				}
+			}
+		}
+		_, n, err := net.ParseCIDR(part)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, n)
+	}
+	return out, nil
+}
 
 // loadCASigner returns the CA signing primitive via the shared signer
 // seam (resolveCASigner): CERTD_CA_KMS_KEY selects a KMS-backed key
@@ -927,11 +927,6 @@ func warnIfIssuerNearExpiry(log *slog.Logger, cert *x509.Certificate) {
 	}
 }
 
-// loadMTLSStore returns the workload-identity registry parsed from
-// CERTD_MTLS_PRINCIPALS_FILE. Returns (nil, nil) when the env var is
-// unset, disabling the mTLS auth path. Future slice swaps the
-// file-backed implementation for a Postgres-backed Store managed by
-// the admin portal — same interface, no API-layer changes.
 // loadRoleStore builds the role table and its [*policy.Engine]. Backend
 // is chosen by env:
 //
@@ -1035,6 +1030,11 @@ func readRolesFile(path string) ([]policy.Role, error) {
 	return roles, nil
 }
 
+// loadMTLSStore returns the workload-identity registry parsed from
+// CERTD_MTLS_PRINCIPALS_FILE. Returns (nil, nil) when the env var is
+// unset, disabling the mTLS auth path. Future slice swaps the
+// file-backed implementation for a Postgres-backed Store managed by
+// the admin portal — same interface, no API-layer changes.
 func loadMTLSStore(db store.Store, log *slog.Logger) (mtls.Store, error) {
 	path := os.Getenv("CERTD_MTLS_PRINCIPALS_FILE")
 
