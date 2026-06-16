@@ -195,8 +195,9 @@ import (
 	"github.com/abagile/tokyo3-base/crypto"
 	"github.com/abagile/tokyo3-base/envutil"
 	"github.com/abagile/tokyo3-base/guard"
+	"github.com/abagile/tokyo3-base/httpauth"
 	"github.com/abagile/tokyo3-base/journal"
-	btls "github.com/abagile/tokyo3-base/tls"
+	"github.com/abagile/tokyo3-base/run"
 	"github.com/abagile/tokyo3-base/tls/reloader"
 	"github.com/abagile/tokyo3-base/version"
 	"github.com/spf13/cobra"
@@ -388,10 +389,10 @@ func runServe(ctx context.Context) error {
 		HostStore:       hostStore,
 		AuditStore:      auditStore,
 		RevocationStore: krlStore,
-		BasicAuth: portal.BasicAuthConfig{
+		BasicAuth: httpauth.BasicAuthConfig{
 			Username: os.Getenv("CERTD_PORTAL_USERNAME"),
 			Password: os.Getenv("CERTD_PORTAL_PASSWORD"),
-			Realm:    os.Getenv("CERTD_PORTAL_REALM"),
+			Realm:    envutil.Or("CERTD_PORTAL_REALM", "certd portal"),
 		},
 		OIDC: portalOIDC,
 	})
@@ -451,29 +452,9 @@ func runServe(ctx context.Context) error {
 		})
 	}
 
-	serveErr := make(chan error, 1)
-	go func() {
-		log.Info("listening", "addr", addr)
-		// Both empty: TLSConfig.GetCertificate (or .Certificates) is the source of truth.
-		err := httpSrv.ListenAndServeTLS("", "")
-		if err != nil && !errors.Is(err, http.ErrServerClosed) {
-			serveErr <- err
-			return
-		}
-		serveErr <- nil
-	}()
-
-	select {
-	case err := <-serveErr:
-		return err
-	case <-rootCtx.Done():
-		log.Info("shutdown requested", "signal", rootCtx.Err())
-	}
-
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer shutdownCancel()
-	if err := httpSrv.Shutdown(shutdownCtx); err != nil {
-		return fmt.Errorf("graceful shutdown: %w", err)
+	log.Info("listening", "addr", addr)
+	if err := run.Group(rootCtx, run.HTTPServer(httpSrv, 10*time.Second, true)); err != nil {
+		return fmt.Errorf("serve: %w", err)
 	}
 	log.Info("stopped")
 	return nil
@@ -1109,48 +1090,13 @@ func readPrincipalsFile(path string) ([]mtls.Principal, error) {
 // in VerifyClientCertIfGiven mode (route-level handlers decide whether
 // to require it).
 func buildServerTLS(log *slog.Logger) (*tls.Config, error) {
-	certFile := os.Getenv("CERTD_API_CERT")
-	keyFile := os.Getenv("CERTD_API_KEY")
-	// Inbound mTLS clients are mesh workloads, so the trust anchor for
-	// their certs is the workload CA — fall back to CERTD_WORKLOAD_CA
-	// when no API-specific client CA is set (same pattern as the NATS
-	// CA). Both unset ⇒ client-cert verification stays off.
-	clientCAFile := envutil.First("CERTD_API_CLIENT_CA", "CERTD_WORKLOAD_CA")
-
-	if (certFile == "") != (keyFile == "") {
-		return nil, fmt.Errorf("CERTD_API_CERT and CERTD_API_KEY must both be set or both unset")
-	}
-
-	cfg := &tls.Config{MinVersion: tls.VersionTLS12}
-	if certFile != "" {
-		log.Info("tls: using certificate files (hot-reload enabled)", "cert", certFile)
-		loader := reloader.NewCertLoader(certFile, keyFile)
-		cfg.GetCertificate = loader.GetCertificate
-	} else {
-		log.Warn("tls: no certificate configured, using self-signed (not for production)")
-		cert, err := btls.SelfSignedCert()
-		if err != nil {
-			return nil, fmt.Errorf("generate self-signed cert: %w", err)
-		}
-		cfg.Certificates = []tls.Certificate{cert}
-	}
-
-	if clientCAFile != "" {
-		// Hot-reload the inbound client-CA bundle: base wires ClientAuth +
-		// ClientCAs + a per-handshake GetConfigForClient so a rotation
-		// widen→narrow lands with no certd restart, keeping the last good
-		// pool on a bad drop-in.
-		caLoader, err := reloader.NewClientCALoader(cfg, clientCAFile, tls.VerifyClientCertIfGiven)
-		if err != nil {
-			return nil, fmt.Errorf("CERTD_API_CLIENT_CA: %w", err)
-		}
-		caLoader.OnError = func(err error) {
-			log.Warn("tls: client CA hot-reload kept previous pool", "ca", clientCAFile, "err", err)
-		}
-		log.Info("tls: mTLS client CA loaded (hot-reload)", "ca", clientCAFile)
-	}
-
-	return cfg, nil
+	return reloader.ServerTLS(reloader.ServerTLSConfig{
+		CertFile:     os.Getenv("CERTD_API_CERT"),
+		KeyFile:      os.Getenv("CERTD_API_KEY"),
+		ClientCAFile: envutil.First("CERTD_API_CLIENT_CA", "CERTD_WORKLOAD_CA"),
+		MinVersion:   tls.VersionTLS12,
+		Log:          log,
+	})
 }
 
 // newAuditTracker wires the portal audit tracker over certd's own

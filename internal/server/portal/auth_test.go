@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/abagile/tokyo3-base/httpauth"
+
 	"github.com/abagile/tokyo3-ca/internal/server/portal"
 )
 
@@ -32,7 +34,7 @@ func TestBasicAuth_RejectsMissingCreds(t *testing.T) {
 	p, _ := portal.New(portal.Config{
 		Version: "v",
 		Now:     time.Now,
-		BasicAuth: portal.BasicAuthConfig{
+		BasicAuth: httpauth.BasicAuthConfig{
 			Username: "admin",
 			Password: "secret",
 		},
@@ -49,7 +51,7 @@ func TestBasicAuth_RejectsMissingCreds(t *testing.T) {
 		t.Errorf("status = %d, want 401", resp.StatusCode)
 	}
 	challenge := resp.Header.Get("WWW-Authenticate")
-	if !strings.HasPrefix(challenge, `Basic realm="certd portal"`) {
+	if !strings.HasPrefix(challenge, `Basic realm="restricted"`) {
 		t.Errorf("WWW-Authenticate = %q, want default realm", challenge)
 	}
 }
@@ -58,7 +60,7 @@ func TestBasicAuth_RejectsWrongPassword(t *testing.T) {
 	p, _ := portal.New(portal.Config{
 		Version: "v",
 		Now:     time.Now,
-		BasicAuth: portal.BasicAuthConfig{
+		BasicAuth: httpauth.BasicAuthConfig{
 			Username: "admin",
 			Password: "secret",
 		},
@@ -82,7 +84,7 @@ func TestBasicAuth_RejectsWrongUsername(t *testing.T) {
 	p, _ := portal.New(portal.Config{
 		Version: "v",
 		Now:     time.Now,
-		BasicAuth: portal.BasicAuthConfig{
+		BasicAuth: httpauth.BasicAuthConfig{
 			Username: "admin",
 			Password: "secret",
 		},
@@ -106,7 +108,7 @@ func TestBasicAuth_AcceptsCorrectCreds(t *testing.T) {
 	p, _ := portal.New(portal.Config{
 		Version: "v",
 		Now:     time.Now,
-		BasicAuth: portal.BasicAuthConfig{
+		BasicAuth: httpauth.BasicAuthConfig{
 			Username: "admin",
 			Password: "secret",
 		},
@@ -132,7 +134,7 @@ func TestBasicAuth_HealthzExempt(t *testing.T) {
 	p, _ := portal.New(portal.Config{
 		Version: "v",
 		Now:     time.Now,
-		BasicAuth: portal.BasicAuthConfig{
+		BasicAuth: httpauth.BasicAuthConfig{
 			Username: "admin",
 			Password: "secret",
 		},
@@ -157,7 +159,7 @@ func TestBasicAuth_PartialConfigDoesNotGate(t *testing.T) {
 	p, _ := portal.New(portal.Config{
 		Version: "v",
 		Now:     time.Now,
-		BasicAuth: portal.BasicAuthConfig{
+		BasicAuth: httpauth.BasicAuthConfig{
 			Username: "admin",
 			// Password intentionally absent.
 		},
@@ -179,7 +181,7 @@ func TestBasicAuth_CustomRealm(t *testing.T) {
 	p, _ := portal.New(portal.Config{
 		Version: "v",
 		Now:     time.Now,
-		BasicAuth: portal.BasicAuthConfig{
+		BasicAuth: httpauth.BasicAuthConfig{
 			Username: "admin",
 			Password: "secret",
 			Realm:    "certd-prod-east",

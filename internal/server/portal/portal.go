@@ -20,6 +20,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/abagile/tokyo3-base/httpauth"
+
 	"github.com/abagile/tokyo3-ca/internal/server/krl"
 	"github.com/abagile/tokyo3-ca/internal/server/mtls"
 	"github.com/abagile/tokyo3-ca/internal/server/policy"
@@ -122,7 +124,7 @@ type Config struct {
 	// identity-aware edge.
 	//
 	// Ignored when OIDC is enabled — native OIDC login supersedes it.
-	BasicAuth BasicAuthConfig
+	BasicAuth httpauth.BasicAuthConfig
 
 	// OIDC, when enabled (see OIDCConfig.enabled), gates the portal behind
 	// native browser OIDC login + an optional admin-group check, and
@@ -189,7 +191,7 @@ func (s *Server) Routes() http.Handler {
 		mux.HandleFunc("POST /auth/logout", s.handleAuthLogout)
 		return s.requirePortalAuth(mux)
 	}
-	return requireBasicAuth(s.cfg.BasicAuth, mux)
+	return httpauth.BasicAuth(s.cfg.BasicAuth, mux, "/healthz")
 }
 
 // indexData is the model passed to the landing page template.
