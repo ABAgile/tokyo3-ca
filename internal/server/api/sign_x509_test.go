@@ -15,9 +15,9 @@ import (
 
 	"github.com/abagile/tokyo3-base/journal"
 
+	"github.com/abagile/tokyo3-base/oidc"
 	"github.com/abagile/tokyo3-ca/internal/audit"
 	"github.com/abagile/tokyo3-ca/internal/server/api"
-	"github.com/abagile/tokyo3-ca/internal/server/oidc"
 	"github.com/abagile/tokyo3-ca/internal/server/policy"
 	"github.com/abagile/tokyo3-ca/internal/server/signer"
 	"github.com/abagile/tokyo3-ca/internal/server/x509engine"

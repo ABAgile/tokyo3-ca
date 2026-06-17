@@ -9,8 +9,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/abagile/tokyo3-base/oidc"
 	"github.com/abagile/tokyo3-ca/internal/server/api"
-	"github.com/abagile/tokyo3-ca/internal/server/oidc"
 	"github.com/abagile/tokyo3-ca/internal/server/policy"
 	"github.com/abagile/tokyo3-ca/internal/server/signer"
 )

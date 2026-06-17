@@ -21,11 +21,34 @@ import (
 	"time"
 
 	"github.com/abagile/tokyo3-base/httpauth"
+	"github.com/abagile/tokyo3-base/oidc"
 
 	"github.com/abagile/tokyo3-ca/internal/server/krl"
 	"github.com/abagile/tokyo3-ca/internal/server/mtls"
 	"github.com/abagile/tokyo3-ca/internal/server/policy"
 )
+
+// OIDCConfig wires native browser-based OIDC login for the portal: an
+// Authorization-Code + PKCE flow against the IdP, an encrypted session cookie,
+// and (optionally) an admin-group gate. When enabled it supersedes the HTTP
+// Basic gate; mutations are then attributed to the signed-in user's email.
+//
+// The flow, cookies, and gate are implemented by base/oidc.Authenticator —
+// this struct is the wiring certd reads from env and passes through.
+type OIDCConfig struct {
+	Issuer       string             // IdP issuer URL (e.g. https://id.example.com)
+	ClientID     string             // portal's registered OIDC client_id (= ID-token audience)
+	ClientSecret string             // confidential-client secret (client_secret_post)
+	RedirectURL  string             // absolute https://<certd>/portal/auth/callback
+	AdminGroup   string             // required group claim for access; "" ⇒ any authenticated user
+	Verifier     oidc.TokenVerifier // validates the returned ID token (audience = ClientID)
+	SessionKey   []byte             // 32-byte KEK sealing the session + flow cookies
+	SessionTTL   time.Duration      // session lifetime; 0 ⇒ base default
+}
+
+func (c OIDCConfig) enabled() bool {
+	return c.Issuer != "" && c.ClientID != "" && c.Verifier != nil && len(c.SessionKey) > 0
+}
 
 // RevocationStore is the subset of [krl.Store] the revocations page
 // needs. Defined here (and not as an alias) so tests can stub the
@@ -75,6 +98,7 @@ type MutableRoleStore interface {
 type Server struct {
 	cfg   Config
 	pages map[string]*template.Template
+	auth  *oidc.Authenticator // native-OIDC login + gate; nil when OIDC is not configured (Basic-auth path)
 }
 
 // Config wires a [Server]. Optional fields default sensibly.
@@ -146,7 +170,29 @@ func New(cfg Config) (*Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("parse templates: %w", err)
 	}
-	return &Server{cfg: cfg, pages: pages}, nil
+	s := &Server{cfg: cfg, pages: pages}
+	if cfg.OIDC.enabled() {
+		auth, err := oidc.NewAuthenticator(oidc.AuthenticatorConfig{
+			Issuer:       cfg.OIDC.Issuer,
+			ClientID:     cfg.OIDC.ClientID,
+			ClientSecret: cfg.OIDC.ClientSecret,
+			RedirectURL:  cfg.OIDC.RedirectURL,
+			AdminGroup:   cfg.OIDC.AdminGroup,
+			Verifier:     cfg.OIDC.Verifier,
+			SessionKey:   cfg.OIDC.SessionKey,
+			SessionTTL:   cfg.OIDC.SessionTTL,
+			CookiePrefix: "certd_portal",
+			CookiePath:   "/portal/",
+			ExemptPaths:  []string{"/healthz"},
+			Now:          cfg.Now,
+			Log:          cfg.Log,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("portal oidc: %w", err)
+		}
+		s.auth = auth
+	}
+	return s, nil
 }
 
 // render dispatches to the per-page template set keyed by name and
@@ -185,11 +231,11 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /audit", s.handleAuditIndex)
 	mux.HandleFunc("GET /revocations", s.handleRevocationsIndex)
 	mux.HandleFunc("POST /revocations", s.handleRevocationsCreate)
-	if s.cfg.OIDC.enabled() {
-		mux.HandleFunc("GET /auth/login", s.handleAuthLogin)
-		mux.HandleFunc("GET /auth/callback", s.handleAuthCallback)
-		mux.HandleFunc("POST /auth/logout", s.handleAuthLogout)
-		return s.requirePortalAuth(mux)
+	if s.auth != nil {
+		mux.HandleFunc("GET /auth/login", s.auth.LoginHandler())
+		mux.HandleFunc("GET /auth/callback", s.auth.CallbackHandler())
+		mux.HandleFunc("POST /auth/logout", s.auth.LogoutHandler())
+		return s.auth.Gate(mux)
 	}
 	return httpauth.BasicAuth(s.cfg.BasicAuth, mux, "/healthz")
 }

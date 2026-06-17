@@ -1,6 +1,6 @@
 // Package mtls authenticates inbound HTTPS callers by their TLS client
 // certificate. It complements the OIDC bearer-token path in
-// [github.com/abagile/tokyo3-ca/internal/server/oidc]: human users
+// [github.com/abagile/tokyo3-base/oidc]: human users
 // authenticate with tokens, workloads (cert-agentd, ssh-proxyd,
 // ssh-tunneld) authenticate with their workload mTLS identity.
 //

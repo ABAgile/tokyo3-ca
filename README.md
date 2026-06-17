@@ -266,7 +266,10 @@ the CA pool on mtime, so a rotated cert lands on the next pool dial
 already hot-reloads its serving and NATS certs. The DB **cert/key** are a
 database-role credential and do **not** fall back to `CERTD_WORKLOAD_*`
 (set them explicitly to enable mTLS to Postgres); only `CERTD_DB_CA`
-falls back to `CERTD_WORKLOAD_CA`, the shared mesh trust root.
+falls back to `CERTD_WORKLOAD_CA`, the shared mesh trust root. Setting
+`CERTD_DB_CA` without a client cert still enables server-auth TLS — the
+Postgres server cert is verified against it (fail-secure), rather than
+left to the DSN's `sslmode`.
 
 Because the store is on, the **renewal/anti-theft guard** is active:
 the first renewal of each provisioned identity is recorded as an

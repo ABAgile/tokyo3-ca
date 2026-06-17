@@ -1,12 +1,9 @@
 package portal
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"log/slog"
-	"sort"
-	"sync"
 	"time"
 
 	"github.com/abagile/tokyo3-base/journal"
@@ -50,16 +47,11 @@ type AuditEvent struct {
 }
 
 // AuditTracker subscribes to certd's audit stream and maintains a
-// bounded ring of the latest events, newest first. Construct via
-// [NewAuditTracker]; the subscriber goroutine is owned by
-// [AuditTracker.Run] — call once after construction.
+// bounded ring of the latest events, newest first. It wraps the shared
+// [journal.Tracker]; construct via [NewAuditTracker] and own the
+// subscriber goroutine via [journal.Tracker.Run].
 type AuditTracker struct {
-	src journal.Source
-	max int
-	log *slog.Logger
-
-	mu     sync.RWMutex
-	events []AuditEvent // newest first
+	*journal.Tracker[AuditEvent]
 }
 
 // AuditTrackerConfig wires a tracker.
@@ -87,52 +79,28 @@ func NewAuditTracker(cfg AuditTrackerConfig) (*AuditTracker, error) {
 	if cfg.MaxEvents <= 0 {
 		cfg.MaxEvents = DefaultMaxAuditEvents
 	}
-	if cfg.Log == nil {
-		cfg.Log = slog.Default()
-	}
-	return &AuditTracker{
-		src: cfg.Source,
-		max: cfg.MaxEvents,
-		log: cfg.Log,
-	}, nil
-}
-
-// Run subscribes to the source and ingests until ctx cancels or the
-// source's channel closes. Per-message decode failures are logged at
-// debug and ignored.
-func (t *AuditTracker) Run(ctx context.Context) error {
-	ch, err := t.src.Subscribe(ctx, t.max, 0)
+	t, err := journal.NewTracker(journal.TrackerConfig[AuditEvent]{
+		Source: cfg.Source,
+		Decode: decodeAuditEvent,
+		Less:   func(a, b AuditEvent) bool { return a.OccurredAt.After(b.OccurredAt) },
+		Max:    cfg.MaxEvents,
+		Label:  "ca_audit",
+		Log:    cfg.Log,
+	})
 	if err != nil {
-		return err
+		return nil, err
 	}
-	t.log.Info("audit tracker subscribed", "replay", t.max)
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case msg, ok := <-ch:
-			if !ok {
-				return nil
-			}
-			t.ingest(msg)
-		}
-	}
+	return &AuditTracker{Tracker: t}, nil
 }
 
 // Events returns a snapshot of the current event ring, newest first.
 // Safe to call from request handlers while Run is active.
-func (t *AuditTracker) Events() []AuditEvent {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-	out := make([]AuditEvent, len(t.events))
-	copy(out, t.events)
-	return out
-}
+func (t *AuditTracker) Events() []AuditEvent { return t.Snapshot() }
 
-// ingest decodes one journal message into an AuditEvent and inserts it
-// into the ring. The ring stays sorted newest-first by OccurredAt — a
-// re-sort is cheap at len ≤ MaxEvents.
-func (t *AuditTracker) ingest(msg journal.Msg) {
+// decodeAuditEvent turns a journal message into an AuditEvent. Returns
+// ok=false to skip a record: a decode failure or a payload missing the
+// fields needed to render a useful row (no action / zero timestamp).
+func decodeAuditEvent(msg journal.Msg) (AuditEvent, bool) {
 	var raw struct {
 		ID         string    `json:"id"`
 		Action     string    `json:"action"`
@@ -143,16 +111,12 @@ func (t *AuditTracker) ingest(msg journal.Msg) {
 		Metadata   string    `json:"metadata,omitempty"`
 	}
 	if err := json.Unmarshal(msg.Data, &raw); err != nil {
-		t.log.Debug("audit tracker: decode failed", "seq", msg.Seq, "err", err)
-		return
+		return AuditEvent{}, false
 	}
 	if raw.Action == "" || raw.OccurredAt.IsZero() {
-		// Malformed in a less obvious way — skip rather than render a
-		// row with no useful content.
-		return
+		return AuditEvent{}, false
 	}
-
-	ev := AuditEvent{
+	return AuditEvent{
 		ID:         raw.ID,
 		Action:     raw.Action,
 		OccurredAt: raw.OccurredAt,
@@ -160,17 +124,5 @@ func (t *AuditTracker) ingest(msg journal.Msg) {
 		Subject:    raw.Subject,
 		IP:         raw.IP,
 		Detail:     raw.Metadata,
-	}
-
-	t.mu.Lock()
-	t.events = append(t.events, ev)
-	// Sort newest-first. The ring is small (≤ MaxEvents) and growth is
-	// one-per-message, so sort.Slice is plenty.
-	sort.Slice(t.events, func(i, j int) bool {
-		return t.events[i].OccurredAt.After(t.events[j].OccurredAt)
-	})
-	if len(t.events) > t.max {
-		t.events = t.events[:t.max]
-	}
-	t.mu.Unlock()
+	}, true
 }

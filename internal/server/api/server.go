@@ -15,12 +15,13 @@ import (
 	"time"
 
 	"github.com/abagile/tokyo3-base/journal"
+	"github.com/abagile/tokyo3-base/oidc"
+	"github.com/abagile/tokyo3-base/ratelimit"
 	"golang.org/x/crypto/ssh"
 
 	"github.com/abagile/tokyo3-ca/internal/audit"
 	"github.com/abagile/tokyo3-ca/internal/server/krl"
 	"github.com/abagile/tokyo3-ca/internal/server/mtls"
-	"github.com/abagile/tokyo3-ca/internal/server/oidc"
 	"github.com/abagile/tokyo3-ca/internal/server/policy"
 	"github.com/abagile/tokyo3-ca/internal/server/portal"
 	"github.com/abagile/tokyo3-ca/internal/server/signer"
@@ -45,7 +46,7 @@ type Server struct {
 	portal           *portal.Server           // Admin web UI; nil disables /portal/* routes.
 	krl              krl.Store                // Revocation registry; nil disables /api/v1/ssh/revoke + /revocations.
 	activeCerts      store.ActiveCertStore    // X.509 renewal/anti-theft guard state; nil disables the guard.
-	rateLimiter      *rateLimiter             // Per-source-IP request limiter; nil disables rate limiting.
+	rateLimiter      *ratelimit.Limiter       // Per-source-IP request limiter; nil disables rate limiting.
 	version          string                   // build-time version string, surfaced in /healthz; empty allowed.
 }
 
@@ -184,8 +185,13 @@ func New(cfg Config) (*Server, error) {
 		portal:           cfg.Portal,
 		krl:              cfg.KRL,
 		activeCerts:      cfg.ActiveCertStore,
-		rateLimiter:      newRateLimiter(cfg.RateLimitRPS, cfg.RateLimitBurst, cfg.TrustedProxies),
-		version:          cfg.Version,
+		rateLimiter: ratelimit.New(ratelimit.Config{
+			RPS:            cfg.RateLimitRPS,
+			Burst:          cfg.RateLimitBurst,
+			TrustedProxies: cfg.TrustedProxies,
+			Log:            cfg.Log,
+		}),
+		version: cfg.Version,
 	}, nil
 }
 
@@ -209,7 +215,7 @@ func (s *Server) Routes() http.Handler {
 	if s.portal != nil {
 		mux.Handle("/portal/", http.StripPrefix("/portal", s.portal.Routes()))
 	}
-	return s.rateLimit(mux)
+	return s.rateLimiter.Middleware(mux, "/healthz")
 }
 
 // healthzResponse is the body returned by GET /healthz. Stable for

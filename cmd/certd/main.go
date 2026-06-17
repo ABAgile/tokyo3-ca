@@ -50,8 +50,10 @@
 //	               explicitly to use mTLS.
 //	CERTD_DB_KEY   Client key PEM path. Required iff CERTD_DB_CERT is set.
 //	CERTD_DB_CA    CA PEM for verifying the Postgres server cert; falls back to CERTD_WORKLOAD_CA
-//	               (the shared mesh trust root). The leaf is re-read per handshake and the CA pool
-//	               on mtime, so a rotation lands on the next pool dial without a restart.
+//	               (the shared mesh trust root). Honored even when no client cert is set
+//	               (server-auth TLS), so a configured CA always verifies the server rather than
+//	               leaving it to the DSN's sslmode. The leaf is re-read per handshake and the CA
+//	               pool on mtime, so a rotation lands on the next pool dial without a restart.
 //
 //	CERTD_CA_KEY_FILE        PKCS#8-encoded Ed25519 private key PEM path — the CA signing key
 //	                         used for BOTH SSH user/host certs and X.509/SPIFFE workload certs
@@ -184,10 +186,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net"
 	"net/http"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 
@@ -197,6 +197,7 @@ import (
 	"github.com/abagile/tokyo3-base/guard"
 	"github.com/abagile/tokyo3-base/httpauth"
 	"github.com/abagile/tokyo3-base/journal"
+	"github.com/abagile/tokyo3-base/oidc"
 	"github.com/abagile/tokyo3-base/run"
 	"github.com/abagile/tokyo3-base/tls/reloader"
 	"github.com/abagile/tokyo3-base/version"
@@ -207,7 +208,6 @@ import (
 	"github.com/abagile/tokyo3-ca/internal/server/api"
 	"github.com/abagile/tokyo3-ca/internal/server/krl"
 	"github.com/abagile/tokyo3-ca/internal/server/mtls"
-	"github.com/abagile/tokyo3-ca/internal/server/oidc"
 	"github.com/abagile/tokyo3-ca/internal/server/policy"
 	"github.com/abagile/tokyo3-ca/internal/server/portal"
 	"github.com/abagile/tokyo3-ca/internal/server/signer"
@@ -262,15 +262,15 @@ func runServe(ctx context.Context) error {
 
 	addr := envutil.Or("CERTD_ADDR", ":8443")
 
-	rlRPS, err := envFloat("CERTD_RATE_LIMIT_RPS")
+	rlRPS, err := envutil.Float("CERTD_RATE_LIMIT_RPS")
 	if err != nil {
 		return fmt.Errorf("CERTD_RATE_LIMIT_RPS: %w", err)
 	}
-	rlBurst, err := envInt("CERTD_RATE_LIMIT_BURST")
+	rlBurst, err := envutil.Int("CERTD_RATE_LIMIT_BURST")
 	if err != nil {
 		return fmt.Errorf("CERTD_RATE_LIMIT_BURST: %w", err)
 	}
-	trustedProxies, err := parseCIDRList(os.Getenv("CERTD_TRUSTED_PROXIES"))
+	trustedProxies, err := envutil.CIDRList("CERTD_TRUSTED_PROXIES")
 	if err != nil {
 		return fmt.Errorf("CERTD_TRUSTED_PROXIES: %w", err)
 	}
@@ -653,55 +653,6 @@ func versionCmd() *cobra.Command {
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
-// envFloat reads a float env var; empty/unset ⇒ 0 with no error.
-func envFloat(key string) (float64, error) {
-	v := strings.TrimSpace(os.Getenv(key))
-	if v == "" {
-		return 0, nil
-	}
-	return strconv.ParseFloat(v, 64)
-}
-
-// envInt reads an int env var; empty/unset ⇒ 0 with no error.
-func envInt(key string) (int, error) {
-	v := strings.TrimSpace(os.Getenv(key))
-	if v == "" {
-		return 0, nil
-	}
-	return strconv.Atoi(v)
-}
-
-// parseCIDRList parses a comma-separated list of CIDRs (a bare IP is treated
-// as a /32 or /128). Empty input ⇒ nil, nil.
-func parseCIDRList(s string) ([]*net.IPNet, error) {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return nil, nil
-	}
-	var out []*net.IPNet
-	for part := range strings.SplitSeq(s, ",") {
-		part = strings.TrimSpace(part)
-		if part == "" {
-			continue
-		}
-		if !strings.Contains(part, "/") {
-			if ip := net.ParseIP(part); ip != nil {
-				if ip.To4() != nil {
-					part += "/32"
-				} else {
-					part += "/128"
-				}
-			}
-		}
-		_, n, err := net.ParseCIDR(part)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, n)
-	}
-	return out, nil
-}
-
 // loadCASigner returns the CA signing primitive via the shared signer
 // seam (resolveCASigner): CERTD_CA_KMS_KEY selects a KMS-backed key
 // (needs a KMS-bound build), CERTD_CA_KEY_FILE a PKCS#8 Ed25519 PEM
@@ -984,18 +935,16 @@ func openStore(ctx context.Context, db cli.DB, log *slog.Logger) (store.Store, e
 
 // dbClientTLS builds the client-cert TLS config certd presents to Postgres
 // from CERTD_DB_CERT/KEY (falling back to the daemon's workload identity,
-// CERTD_WORKLOAD_CERT/KEY) and CERTD_DB_CA (→ CERTD_WORKLOAD_CA). It returns
-// (nil, nil) when no client cert is configured — the DSN's sslmode then
-// governs TLS (server-auth only, certd's prior behavior). With a cert+key
-// pair the leaf is re-read on every handshake and the CA pool on mtime change
-// (reloader.ClientConfig), so a cert-agentd rotation of the short-TTL workload
-// cert lands on the next pool dial without a restart — no poll loop needed
-// (SetConnMaxLifetime recycles pooled conns within its window).
+// CERTD_WORKLOAD_CERT/KEY) and CERTD_DB_CA (→ CERTD_WORKLOAD_CA). With a
+// cert+key pair the leaf is re-read on every handshake and the CA pool on
+// mtime change, so a cert-agentd rotation of the short-TTL workload cert lands
+// on the next pool dial without a restart — no poll loop needed
+// (SetConnMaxLifetime recycles pooled conns within its window). When only
+// CERTD_DB_CA is set (no client cert), the returned config still verifies the
+// Postgres server against that CA (fail-secure); both unset ⇒ (nil, nil), the
+// DSN's sslmode then governs TLS.
 func dbClientTLS(m cli.DB) (*tls.Config, error) {
-	if m.CertFile == "" || m.KeyFile == "" {
-		return nil, nil
-	}
-	return reloader.ClientConfig(m.CertFile, m.KeyFile, m.CAFile)
+	return reloader.ClientTLS(m.CertFile, m.KeyFile, m.CAFile)
 }
 
 // readRolesFile reads and decodes a CERTD_ROLES_FILE JSON array.
