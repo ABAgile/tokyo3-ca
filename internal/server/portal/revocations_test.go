@@ -46,7 +46,7 @@ func TestPortal_RevocationsIndex_ListsEntries(t *testing.T) {
 		`<code>user:eve@example.com</code>`,
 		`compromised`,
 		`left team`,
-		`<form method="post" action="/revocations">`,
+		`<form method="post" action="/portal/revocations">`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("body missing %q\n--- body ---\n%s", want, body)
@@ -135,7 +135,7 @@ func TestPortal_Index_FlipsRevocationsToReadyWhenStoreWired(t *testing.T) {
 	srv := httptest.NewServer(p.Routes())
 	defer srv.Close()
 	body := getBody(t, srv.URL+"/")
-	if !strings.Contains(body, `<a href="/revocations">Revocations</a>`) {
+	if !strings.Contains(body, `<a href="/portal/revocations">Revocations</a>`) {
 		t.Errorf("Revocations nav entry not clickable when store wired:\n%s", body)
 	}
 }

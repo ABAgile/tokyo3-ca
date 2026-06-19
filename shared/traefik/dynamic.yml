@@ -1,0 +1,59 @@
+# dynamic.yml — traefik file-provider config for the local-test rig.
+#
+# traefik is the host-facing HTTPS edge. It terminates TLS with the mkcert
+# edge cert (traefik.crt) so `curl https://localhost:8443/healthz` and a
+# browser hitting the portal both trust it with no --cacert (mkcert's root is
+# in the OS trust store). It then RE-ENCRYPTS to certd over the internal mesh
+# CA: the backend hop is https://certd:8443, and traefik verifies certd's
+# listener cert against certd-x509-ca.crt (serversTransport below). So the two
+# anchors stay cleanly split — mkcert at the edge, the internal CA behind it.
+#
+# WHY edge-terminate only the human/browser surface: certd's sign API is mTLS
+# (it authenticates callers by their verified client-cert SAN → principal).
+# Terminating that here would strip the client cert and break principal auth,
+# so cert-agentd talks to certd DIRECTLY on the compose network and never
+# transits traefik. This file fronts only the server-auth surface (portal,
+# healthz, OIDC); a cert-less client that reaches the sign API through traefik
+# simply gets certd's normal 401 (no principal), same as a missing cert.
+#
+# Static config is passed as CLI flags in docker-compose.yml; this file is the
+# dynamic half (providers.file, watched for hot-reload).
+
+tls:
+  # defaultCertificate covers the no-SNI / IP-SNI case (e.g. curl 127.0.0.1);
+  # `certificates` covers SNI by name (localhost). Both are the mkcert edge cert.
+  stores:
+    default:
+      defaultCertificate:
+        certFile: /shared/certs/traefik.crt
+        keyFile: /shared/certs/traefik.key
+  certificates:
+    - certFile: /shared/certs/traefik.crt
+      keyFile: /shared/certs/traefik.key
+
+http:
+  routers:
+    certd:
+      # Host-based (not PathPrefix): traefik needs a domain in the rule to match
+      # TLS SNI to a certificate — a bare PathPrefix logs "no domain found in
+      # rule". certd.localhost is the portal vhost; localhost + 127.0.0.1 keep
+      # the `curl https://localhost:8443/healthz` UX working. All three resolve
+      # to the loopback edge and route to the one certd backend.
+      rule: "Host(`certd.localhost`) || Host(`localhost`) || Host(`127.0.0.1`)"
+      entryPoints:
+        - websecure
+      service: certd
+      tls: {}
+  services:
+    certd:
+      loadBalancer:
+        servers:
+          - url: "https://certd:8443"
+        serversTransport: certd-backend
+  serversTransports:
+    # Verify certd's listener cert against the internal mesh CA. The backend
+    # URL host (certd) is used as the TLS ServerName, and certd's issue-server'd
+    # cert carries SAN=certd — so it validates with no insecureSkipVerify.
+    certd-backend:
+      rootCAs:
+        - /shared/certs/certd-x509-ca.crt

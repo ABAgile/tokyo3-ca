@@ -182,7 +182,7 @@ func New(cfg Config) (*Server, error) {
 			SessionKey:   cfg.OIDC.SessionKey,
 			SessionTTL:   cfg.OIDC.SessionTTL,
 			CookiePrefix: "certd_portal",
-			CookiePath:   "/portal/",
+			CookiePath:   basePath + "/",
 			ExemptPaths:  []string{"/healthz"},
 			Now:          cfg.Now,
 			Log:          cfg.Log,
@@ -408,7 +408,7 @@ func (s *Server) handleRoleCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.cfg.Log.Info("portal: role created", "name", role.Name, "caller", rw.caller)
-	http.Redirect(w, r, "/roles/"+role.Name, http.StatusSeeOther)
+	http.Redirect(w, r, basePath+"/roles/"+role.Name, http.StatusSeeOther)
 }
 
 func (s *Server) handleRoleEditForm(w http.ResponseWriter, r *http.Request) {
@@ -460,7 +460,7 @@ func (s *Server) handleRoleUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.cfg.Log.Info("portal: role updated", "old_name", oldName, "name", role.Name, "caller", rw.caller)
-	http.Redirect(w, r, "/roles/"+role.Name, http.StatusSeeOther)
+	http.Redirect(w, r, basePath+"/roles/"+role.Name, http.StatusSeeOther)
 }
 
 func (s *Server) handleRoleDelete(w http.ResponseWriter, r *http.Request) {
@@ -488,7 +488,7 @@ func (s *Server) handleRoleDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.cfg.Log.Info("portal: role deleted", "name", name, "caller", rw.caller)
-	http.Redirect(w, r, "/roles", http.StatusSeeOther)
+	http.Redirect(w, r, basePath+"/roles", http.StatusSeeOther)
 }
 
 // hostsIndexData is the model for the hosts page.
@@ -589,7 +589,7 @@ func (s *Server) handleRevocationsCreate(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	s.cfg.Log.Info("portal: cert revoked", "serial", serial, "key_id", keyID, "reason", reason)
-	http.Redirect(w, r, "/revocations", http.StatusSeeOther)
+	http.Redirect(w, r, basePath+"/revocations", http.StatusSeeOther)
 }
 
 func (s *Server) renderRevocationError(w http.ResponseWriter, r *http.Request, msg, serial, keyID, reason string) {
@@ -842,6 +842,12 @@ func sortStrings(s []string) {
 	}
 }
 
+// basePath is the prefix the api server mounts the portal under (it
+// StripPrefixes the same value before dispatching). Handlers register
+// prefix-relative routes; rendered links prepend this via the "url"
+// template func so they resolve under /portal/ instead of the root.
+const basePath = "/portal"
+
 // parsePages builds one *template.Template per page. Each set
 // contains the shared base layout plus that page's specific
 // {{define "title"}} / {{define "body"}} blocks. Per-set isolation
@@ -849,6 +855,13 @@ func sortStrings(s []string) {
 // pages share template names in a single set.
 func parsePages() (map[string]*template.Template, error) {
 	funcs := template.FuncMap{
+		// url prefixes an internal (root-relative) path with the portal's
+		// mount prefix so rendered links resolve under /portal/ rather than the
+		// server root. The handlers themselves stay prefix-relative (the api
+		// server StripPrefixes /portal), so only the rendered HREFs need this.
+		"url": func(p string) string {
+			return basePath + p
+		},
 		"fmtTime": func(t time.Time) string {
 			return t.UTC().Format(time.RFC3339)
 		},
@@ -928,7 +941,7 @@ chrome works end-to-end.</p>
 <tbody>
 {{range .Pages}}
 <tr>
-  <td>{{if eq .Status "ready"}}<a href="{{.Path}}">{{.Name}}</a>{{else}}{{.Name}}{{end}}</td>
+  <td>{{if eq .Status "ready"}}<a href="{{url .Path}}">{{.Name}}</a>{{else}}{{.Name}}{{end}}</td>
   <td>{{.Description}}</td>
   <td class="status-{{.Status}}">{{.Status}}</td>
 </tr>
@@ -940,12 +953,12 @@ chrome works end-to-end.</p>
 const rolesTemplate = `{{define "page"}}{{template "base" .}}{{end}}
 {{define "title"}}roles{{end}}
 {{define "body"}}
-<p><a href="/">&larr; home</a></p>
+<p><a href="{{url "/"}}">&larr; home</a></p>
 <h1>Roles</h1>
 <p>Every configured role. Click a name for principals, host patterns,
 and TTL caps. The role table is in-memory — restarting certd resets
 it unless backed by a JSON file via <code>CERTD_ROLES_FILE</code>.</p>
-<p><a href="/roles/new">+ New role</a></p>
+<p><a href="{{url "/roles/new"}}">+ New role</a></p>
 {{if .Roles}}
 <table>
 <thead>
@@ -959,7 +972,7 @@ it unless backed by a JSON file via <code>CERTD_ROLES_FILE</code>.</p>
 <tbody>
 {{range .Roles}}
 <tr>
-  <td><a href="/roles/{{.Name}}">{{.Name}}</a></td>
+  <td><a href="{{url "/roles"}}/{{.Name}}">{{.Name}}</a></td>
   <td><code>{{.GroupClaim}}</code></td>
   <td>{{if .AllowedPrincipals}}{{range $i, $p := .AllowedPrincipals}}{{if $i}}, {{end}}<code>{{$p}}</code>{{end}}{{else}}<em>none</em>{{end}}</td>
   <td>{{if .HostPatterns}}{{range $i, $p := .HostPatterns}}{{if $i}}, {{end}}<code>{{$p}}</code>{{end}}{{else}}<em>none</em>{{end}}</td>
@@ -975,15 +988,15 @@ it unless backed by a JSON file via <code>CERTD_ROLES_FILE</code>.</p>
 const roleDetailTemplate = `{{define "page"}}{{template "base" .}}{{end}}
 {{define "title"}}role · {{.Name}}{{end}}
 {{define "body"}}
-<p><a href="/roles">&larr; roles</a></p>
+<p><a href="{{url "/roles"}}">&larr; roles</a></p>
 {{if not .Found}}
 <h1>Not found</h1>
 <p>No role named <code>{{.Name}}</code> is configured.</p>
 {{else}}
 <h1>Role: {{.Role.Name}}</h1>
 <p>
-  <a href="/roles/{{.Role.Name}}/edit">Edit</a> ·
-  <form method="post" action="/roles/{{.Role.Name}}/delete" style="display:inline" onsubmit="return confirm('Delete role {{.Role.Name}}?');">
+  <a href="{{url "/roles"}}/{{.Role.Name}}/edit">Edit</a> ·
+  <form method="post" action="{{url "/roles"}}/{{.Role.Name}}/delete" style="display:inline" onsubmit="return confirm('Delete role {{.Role.Name}}?');">
     <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
     <button type="submit" class="link-button">Delete</button>
   </form>
@@ -1014,10 +1027,10 @@ const roleDetailTemplate = `{{define "page"}}{{template "base" .}}{{end}}
 const roleFormTemplate = `{{define "page"}}{{template "base" .}}{{end}}
 {{define "title"}}{{if eq .Mode "create"}}new role{{else}}edit · {{.OriginalName}}{{end}}{{end}}
 {{define "body"}}
-<p><a href="/roles">&larr; roles</a></p>
+<p><a href="{{url "/roles"}}">&larr; roles</a></p>
 <h1>{{if eq .Mode "create"}}New role{{else}}Edit role: {{.OriginalName}}{{end}}</h1>
 {{if .Error}}<div class="error">{{.Error}}</div>{{end}}
-<form method="post" action="{{.FormAction}}">
+<form method="post" action="{{url .FormAction}}">
   <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
   <label>Name
     <input type="text" name="name" value="{{.Form.Name}}" required autocomplete="off">
@@ -1053,7 +1066,7 @@ const roleFormTemplate = `{{define "page"}}{{template "base" .}}{{end}}
 const hostsTemplate = `{{define "page"}}{{template "base" .}}{{end}}
 {{define "title"}}hosts{{end}}
 {{define "body"}}
-<p><a href="/">&larr; home</a></p>
+<p><a href="{{url "/"}}">&larr; home</a></p>
 <h1>Hosts</h1>
 <p>Workload mTLS principals registered with certd. Each entry maps a
 TLS SAN (SPIFFE URI or email) to a workload identity + the group
@@ -1086,7 +1099,7 @@ every signing request that traverses the mTLS path.</p>
 const auditTemplate = `{{define "page"}}{{template "base" .}}{{end}}
 {{define "title"}}audit{{end}}
 {{define "body"}}
-<p><a href="/">&larr; home</a></p>
+<p><a href="{{url "/"}}">&larr; home</a></p>
 <h1>Audit</h1>
 <p>Live tail of certd's own audit stream — cert issuance, denial, and
 revocation events. Newest first. The buffer caps at the tracker's
@@ -1125,7 +1138,7 @@ MaxEvents (default 500); to dig deeper, query JetStream directly.
 const revocationsTemplate = `{{define "page"}}{{template "base" .}}{{end}}
 {{define "title"}}revocations{{end}}
 {{define "body"}}
-<p><a href="/">&larr; home</a></p>
+<p><a href="{{url "/"}}">&larr; home</a></p>
 <h1>Revocations</h1>
 <p>Revoked SSH certs. ssh-proxyd polls this set every
 <code>CERTD_REVOCATIONS_POLL_SECONDS</code> (default 30s) and refuses
@@ -1135,7 +1148,7 @@ of which field a consumer keys on.</p>
 
 <h2>Revoke a cert</h2>
 {{if .Error}}<div class="error">{{.Error}}</div>{{end}}
-<form method="post" action="/revocations">
+<form method="post" action="{{url "/revocations"}}">
   <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
   <label>Serial (decimal; leave blank if revoking by Key ID only)
     <input type="text" name="serial" value="{{.FormSerial}}" autocomplete="off">

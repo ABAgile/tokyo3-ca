@@ -29,8 +29,9 @@
 #   ./shared/
 #     certs/
 #       gen.sh              # mkcert + openssl + ssh-keygen, host-side
-#       ca.crt              # mkcert root — verifies certd's HTTPS API only
-#       certd.{crt,key}     # certd HTTPS API server cert (mkcert-signed)
+#       ca.crt              # mkcert root — anchors the traefik edge cert only
+#       traefik.{crt,key}   # traefik host-facing edge cert (mkcert-signed)
+#       certd.{crt,key}     # certd HTTPS API server cert (certd-issued)
 #       certd-signing.key   # certd CA signing key, PKCS#8 PEM (X.509 + SSH)
 #       certd-signing.key.pub   # OpenSSH-format CA pubkey (TrustedUserCAKeys)
 #       certd-x509-ca.crt   # certd X.509 issuer — the ONE internal-mTLS CA;
@@ -50,6 +51,8 @@
 #       pg-entrypoint.sh    # stages server-key perms + enables ssl/HBA
 #       pg_hba_cert.conf    # mTLS-only HBA: hostssl cert, reject plain
 #       db-init.sh          # creates the auth_app role (cert CN → role)
+#     traefik/              # host-facing HTTPS edge (mounted at /shared/traefik)
+#       dynamic.yml         # file-provider: edge TLS termination + re-encrypt to certd
 #
 # ── Pre-flight + quick start ──────────────────────────────────────────────────
 #
@@ -77,6 +80,47 @@
 #                                     # AND the named volumes (full reset)
 
 services:
+
+  # ── traefik: host-facing HTTPS edge (mkcert termination) ─────────────────────
+  # The single mkcert hop, relocated to the edge. traefik publishes :8443 to the
+  # host, terminates TLS with the mkcert-signed edge cert (traefik.crt) — so
+  # `curl https://localhost:8443/healthz` and the browser portal trust it with
+  # no --cacert — then RE-ENCRYPTS to certd over the internal mesh CA, verifying
+  # certd's listener cert against certd-x509-ca.crt (see shared/traefik/
+  # dynamic.yml). mkcert no longer touches certd's own cert; the internal CA now
+  # covers every hop behind this edge.
+  #
+  # Only the human/browser surface (portal, healthz, OIDC) is edge-terminated.
+  # certd's sign API is mTLS — terminating it here would strip the caller's
+  # client cert and break SAN→principal auth — so cert-agentd talks to certd
+  # DIRECTLY (certd:8443) and never transits traefik.
+  #
+  # No Docker socket: routing/TLS/backend-CA all come from the watched file
+  # provider (dynamic.yml); static config is the CLI flags below.
+  traefik:
+    image: traefik:${TRAEFIK_VERSION:-v3.3}
+    depends_on:
+      certd:
+        condition: service_healthy
+    command:
+      - "--entrypoints.websecure.address=:8443"
+      - "--entrypoints.ping.address=:8082"
+      - "--ping=true"
+      - "--ping.entryPoint=ping"
+      - "--providers.file.filename=/shared/traefik/dynamic.yml"
+      - "--providers.file.watch=true"
+      - "--log.level=INFO"
+    volumes:
+      - shared_data:/shared:ro
+    ports:
+      - "8443:8443"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8082/ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 6
+      start_period: 5s
+    restart: unless-stopped
 
   # ── postgres: certd's mTLS-only store ───────────────────────────────────────
   # certd's persistent backend (role table, mTLS principals, KRL, active-cert
@@ -266,8 +310,9 @@ services:
       # Persistent X.509 issuer cert (self-signed over the signing key).
       # Without it certd self-generates an EPHEMERAL issuer at boot, so
       # certd-issued leaves stop chain-validating across a certd restart.
-      # This is the trust anchor workloads verify certd-issued peers against
-      # — distinct from ca.crt (mkcert root, for certd's own HTTPS cert).
+      # This is the trust anchor workloads verify certd-issued peers against —
+      # and now certd's OWN listener cert chains here too (issue-server'd, no
+      # longer mkcert). ca.crt (mkcert root) only anchors the traefik edge cert.
       CERTD_CA_X509_CERT_FILE: /shared/certs/certd-x509-ca.crt
       # NATS over mTLS (the server requires --tlsverify). certd connects at
       # BOOT to publish audit + ship logs. Its publisher cert (certd-nats.crt)
@@ -290,13 +335,24 @@ services:
       # spiffe://tokyo3/authd/* certs. Seeds the DB on first boot.
       CERTD_ROLES_FILE: /shared/policy/roles.json
       CERTD_MTLS_PRINCIPALS_FILE: /shared/policy/principals.json
+      # Admin portal (server-rendered roles/hosts/audit/revocations UI at
+      # /portal/). Reached through the traefik edge at https://certd.localhost:8443/portal/.
+      # OIDC needs a real IdP, so the rig uses the HTTP Basic gate instead:
+      # setting USERNAME + PASSWORD both arms it (either one empty ⇒ unguarded).
+      # Dev creds only — override via the host env before `make docker-up`.
+      CERTD_PORTAL_USERNAME: ${CERTD_PORTAL_USERNAME:-admin}
+      CERTD_PORTAL_PASSWORD: ${CERTD_PORTAL_PASSWORD:-certd-dev}
+      CERTD_PORTAL_REALM: certd portal
       # Debug only (local dev rig): exposes net/http/pprof + a 30s
       # goroutine/OS-thread stats line in the logs, to chase the
       # pids.current growth. Never set this in a deployed certd.
       # CERTD_DEBUG_ADDR: ":6060"
-    ports:
-      - "8443:8443"
-      # - "6060:6060"    # pprof (debug only)
+    # No host port: traefik owns the host-facing :8443 edge now and proxies to
+    # this listener over the compose network (certd:8443). cert-agentd also
+    # reaches it directly at certd:8443. Containers resolve `certd` regardless
+    # of any published port, so nothing here needs to be exposed to the host.
+    # ports:
+    #   - "6060:6060"    # pprof (debug only)
     healthcheck:
       # /healthz returns 200 with ca_pubkey_hash + audit_active flag.
       # busybox wget (Alpine 3.21) supports --no-check-certificate
@@ -340,9 +396,10 @@ services:
         cp /shared/certs/cert-agentd.key   /state/svid.key
         # The mTLS trust anchor — NOT mkcert's ca.crt. This is what the agent
         # and the sibling workloads it provisions (/certs/authd-*) verify
-        # certd-issued peers (NATS, Postgres) against. mkcert's ca.crt stays
-        # out of the agent's volume; it only verifies certd's HTTPS/portal
-        # endpoint, which the agent reads straight from /shared.
+        # certd-issued peers (NATS, Postgres) against — and now certd's own API
+        # listener too (the agent reads certd-x509-ca.crt from /shared for that
+        # hop, see CERT_AGENTD_WORKLOAD_CA). mkcert's ca.crt no longer appears on
+        # any agent path; it anchors only the traefik host-facing edge.
         cp /shared/certs/certd-x509-ca.crt /state/svid_bundle.pem
         chmod 644 /state/svid.pem /state/svid_bundle.pem
         chmod 600 /state/svid.key
@@ -374,11 +431,12 @@ services:
       # rewritten in place on renewal.
       CERT_AGENTD_WORKLOAD_CERT: /certs/svid.pem
       CERT_AGENTD_WORKLOAD_KEY: /certs/svid.key
-      # WORKLOAD_CA verifies certd's HTTPS *API* server cert, which is
-      # mkcert-signed (the portal listener). That's the one mkcert hop, so read
-      # ca.crt straight from /shared — it's deliberately NOT in the agent's
-      # own /certs volume (that holds the mTLS CA instead; see NATS_CA).
-      CERT_AGENTD_WORKLOAD_CA: /shared/certs/ca.crt
+      # WORKLOAD_CA verifies certd's HTTPS *API* server cert. The agent reaches
+      # certd DIRECTLY (certd:8443, not through traefik), and certd's listener
+      # cert is now certd-issued — so the agent verifies it against the internal
+      # mesh CA, the same anchor it uses for every other hop. mkcert (ca.crt) is
+      # gone from this path entirely; it now lives only at the traefik edge.
+      CERT_AGENTD_WORKLOAD_CA: /shared/certs/certd-x509-ca.crt
       CERT_AGENTD_SPIFFE_URI: spiffe://tokyo3/authd/agent
       CERT_AGENTD_TTL_SECONDS: "120"
       # Body-groups sent on every sign request. INERT now that certd verifies

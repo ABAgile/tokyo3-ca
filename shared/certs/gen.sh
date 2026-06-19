@@ -68,14 +68,17 @@ mkc_server() {
   ok
 }
 
-# ── certd HTTPS server cert (mkcert) ─────────────────────────────────────────
-# certd's PUBLIC API cert is the ONE exception to the single-CA rule: it stays
-# mkcert-signed so `curl https://localhost:8443/healthz` works from the host
-# with no --cacert (mkcert's root is in the OS trust store), and cert-agentd
-# verifies the API via ca.crt. Everything ELSE (the internal nats/postgres
-# mesh) is certd-issued — see the `certd ca issue-*` block after the issuer
-# cert below.
-mkc_server "certd"        certd  localhost  127.0.0.1
+# ── traefik edge HTTPS cert (mkcert) ─────────────────────────────────────────
+# The ONE mkcert-signed cert left. traefik terminates the host-facing HTTPS
+# edge with it, so `curl https://localhost:8443/healthz` works from the host
+# with no --cacert (mkcert's root is in the OS trust store). traefik then
+# re-encrypts to certd over the internal mesh CA (see the serversTransport in
+# shared/traefik/dynamic.yml). Everything BEHIND the edge — including certd's
+# OWN listener cert (issue-server'd below) — is certd-issued and chains to
+# certd-x509-ca.crt. SANs cover the host names the browser/curl hit the edge by:
+# certd.localhost is the portal vhost (the traefik router Host-matches it),
+# localhost + 127.0.0.1 keep the bare `curl https://localhost:8443/healthz` UX.
+mkc_server "traefik"      certd.localhost  localhost  127.0.0.1
 
 # ── certd's CA signing key (X.509 + SSH) ─────────────────────────────────────
 # One Ed25519 key signs everything certd issues: X.509/SPIFFE workload
@@ -168,6 +171,11 @@ issue_workload() {
 }
 
 # Server certs — clients verify these by hostname, so they carry DNS SANs.
+# certd's own listener cert is now in here too (no longer mkcert): cert-agentd
+# reaches it DIRECTLY at https://certd:8443 and verifies it against the internal
+# CA, and traefik re-encrypts to the same SAN. The mkcert hop lives only at the
+# traefik edge above.
+issue_server "certd"     certd     localhost
 issue_server "nats"      nats      localhost
 issue_server "postgres"  postgres  localhost
 

@@ -227,7 +227,7 @@ func TestPortal_Index_FlipsAuditToReadyWhenAuditStoreWired(t *testing.T) {
 	srv := httptest.NewServer(p.Routes())
 	defer srv.Close()
 	body := getBody(t, srv.URL+"/")
-	if !strings.Contains(body, `<a href="/audit">Audit</a>`) {
+	if !strings.Contains(body, `<a href="/portal/audit">Audit</a>`) {
 		t.Errorf("Audit entry not clickable when AuditStore is wired:\n%s", body)
 	}
 }

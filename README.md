@@ -104,8 +104,9 @@ slots into the same shape):
 shared/
   certs/
     gen.sh                # mkcert + openssl + ssh-keygen + certd ca issue-{server,workload}
-    ca.crt                # mkcert root — verifies certd's HTTPS API only
-    certd.{crt,key}       # certd HTTPS API server cert (mkcert-signed)
+    ca.crt                # mkcert root — anchors the traefik edge cert only
+    traefik.{crt,key}     # traefik host-facing edge cert (mkcert-signed)
+    certd.{crt,key}       # certd HTTPS API server cert (certd-issued)
     certd-signing.key     # CA signing key, PKCS#8 PEM (signs X.509 + SSH)
     certd-signing.key.pub # OpenSSH-format CA pubkey (TrustedUserCAKeys)
     certd-x509-ca.crt     # X.509 issuer → CERTD_CA_X509_CERT_FILE; the ONE
@@ -125,6 +126,8 @@ shared/
     pg-entrypoint.sh      # stages server-key perms + enables ssl/HBA
     pg_hba_cert.conf      # mTLS-only HBA: hostssl cert, reject plain
     db-init.sh            # creates the auth_app/auth_admin login roles (CN → role)
+  traefik/                # host-facing HTTPS edge (mounted at /shared/traefik)
+    dynamic.yml           # file-provider: edge TLS termination + re-encrypt to certd
 ```
 
 **Volume model.** `make docker-up` tar-pipes `./shared/` into a
@@ -139,10 +142,12 @@ cert. It's seeded as the SPIFFE **X.509-SVID layout** — `svid.pem` /
 `svid.key` (from `cert-agentd.{crt,key}`) plus `svid_bundle.pem` (the
 mTLS CA, from `certd-x509-ca.crt`) — the generic workload-credential
 naming, so `/certs` reads as a standard SVID dir for the agent and the
-sibling workloads it provisions. Note it's **not** mkcert's `ca.crt`:
-the agent's volume holds only the mTLS anchor. mkcert's root verifies
-just certd's HTTPS/portal endpoint, which the agent reads from `/shared`
-(`CERT_AGENTD_WORKLOAD_CA=/shared/certs/ca.crt`).
+sibling workloads it provisions. mkcert's `ca.crt` appears on no agent
+path at all: the agent reaches certd **directly** (`certd:8443`, not via
+traefik), and certd's listener cert is now certd-issued — so the agent
+verifies even that hop against the internal CA
+(`CERT_AGENTD_WORKLOAD_CA=/shared/certs/certd-x509-ca.crt`). The one
+mkcert hop left is the traefik host-facing edge.
 
 **Policy & workloads (sample).** The rig enforces the
 `shared/policy/roles.json` role table (`CERTD_ROLES_FILE`, which now
@@ -174,7 +179,7 @@ server and client certs. There is no per-channel CA and no bundle. The
 other two artifacts each have exactly one narrow job:
 
 - `certd-x509-ca.crt` — certd's **X.509 issuer cert** (`CERTD_CA_X509_CERT_FILE`). The ONE CA for the internal mesh: NATS's `--tlscacert`, Postgres's `ssl_ca_file`, and every client's server-verify CA all point here. The nats/postgres *server* certs chain to it too, so it works in both directions. `gen.sh` mints every mesh cert offline via `certd ca issue-server` (DNS SANs for the nats/postgres listeners) and `certd ca issue-workload` (SPIFFE SVIDs for certd's own, natsbox's, and cert-agentd's client identities) — the same code path production uses to seed infra/workloads — so they chain here from first boot.
-- `ca.crt` — mkcert root. Verifies certd's **public HTTPS API/portal cert** only (so `curl https://localhost:8443` works with no `--cacert`, and cert-agentd verifies that one hop via `CERT_AGENTD_WORKLOAD_CA`, read from `/shared`). It is *not* used for any internal mTLS link and is deliberately kept out of cert-agentd's own `/certs` volume — that holds `certd-x509-ca.crt` instead.
+- `ca.crt` — mkcert root. Anchors the **traefik host-facing edge cert** (`traefik.crt`) only. traefik publishes `:8443` to the host and terminates TLS with that mkcert cert (whose SANs cover `certd.localhost` — the portal vhost the router Host-matches — plus `localhost`/`127.0.0.1`, so both `curl https://localhost:8443` and the browser portal trust it with no `--cacert`), then re-encrypts to certd over the internal CA. mkcert no longer touches certd's own listener cert — that's certd-issued now and chains to `certd-x509-ca.crt` like every other mesh cert, so cert-agentd (which reaches certd directly, bypassing traefik) verifies it with the same single anchor. The mkcert root is *not* used for any internal link and stays out of cert-agentd's `/certs` volume. **Why edge-terminate only here:** certd's sign API is mTLS; terminating it at traefik would strip the caller's client cert and break SAN→principal auth, so machine traffic never transits the edge.
 - `certd-signing.key.pub` — OpenSSH-format **SSH CA** pubkey (`TrustedUserCAKeys`). SSH world only; never goes in a TLS trust bundle.
 
 > **Optional two-tier CA.** The single anchor above is the default and what this
@@ -328,9 +333,11 @@ and deletable). `applog` publishes with core NATS, so without the
 `app_log` stream those lines are silently dropped.
 
 **Healthchecks.** certd (HTTPS `/healthz`) and cert-agentd
-(filesystem mtime of the cert file, recent renewal proof). `natsbox`
-is healthy once both streams exist, and stays running so you can
-`docker compose exec natsbox sh` for the full `nats` CLI.
+(filesystem mtime of the cert file, recent renewal proof). `traefik`
+(the host-facing HTTPS edge) is healthy once its `/ping` entrypoint
+answers, and waits on certd being healthy first. `natsbox` is healthy
+once both streams exist, and stays running so you can `docker compose
+exec natsbox sh` for the full `nats` CLI.
 
 **Debugging (pprof).** Set `CERTD_DEBUG_ADDR` to expose
 `net/http/pprof` on its own plaintext listener plus a 30s
@@ -427,7 +434,12 @@ internal/
   is optional: omitting `api.Config.Portal` leaves `/portal/*` routes
   unmounted (404). Per-page template sets keep page-specific
   `{{define "title"}}`/`{{define "body"}}` blocks from clobbering each
-  other.
+  other. In the docker rig it's reachable through the traefik edge at
+  **`https://certd.localhost:8443/portal/`** and gated by the HTTP Basic
+  credentials (`CERTD_PORTAL_USERNAME`/`CERTD_PORTAL_PASSWORD`, default
+  `admin` / `certd-dev` — override via the host env). OIDC needs a real
+  IdP, so the rig uses the Basic gate; setting only one of the two creds
+  leaves the portal unguarded.
 - **Native OIDC portal login.** When the `CERTD_PORTAL_OIDC_*` env is
   set, the portal runs a browser Authorization-Code + PKCE flow against
   the IdP (`/portal/auth/login` → `/authorize` → `/portal/auth/callback`),

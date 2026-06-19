@@ -144,7 +144,7 @@ func TestPortal_Index_RendersLandingPage(t *testing.T) {
 	// Planned pages do NOT get clickable links — only "ready" ones do.
 	// Every entry on the scaffold is "planned", so no anchors should
 	// appear pointing at the page paths.
-	for _, planned := range []string{`href="/roles"`, `href="/audit"`, `href="/hosts"`} {
+	for _, planned := range []string{`href="/portal/roles"`, `href="/portal/audit"`, `href="/portal/hosts"`} {
 		if strings.Contains(body, planned) {
 			t.Errorf("planned page has clickable link: %s", planned)
 		}
@@ -199,7 +199,7 @@ func TestPortal_Index_FlipsRolesToReadyWhenRoleStoreWired(t *testing.T) {
 	srv := httptest.NewServer(p.Routes())
 	defer srv.Close()
 	body := getBody(t, srv.URL+"/")
-	if !strings.Contains(body, `<a href="/roles">Roles</a>`) {
+	if !strings.Contains(body, `<a href="/portal/roles">Roles</a>`) {
 		t.Errorf("Roles entry not clickable when RoleStore is wired:\n%s", body)
 	}
 }
@@ -227,8 +227,8 @@ func TestPortal_RolesIndex_ListsConfiguredRoles(t *testing.T) {
 	body := getBody(t, srv.URL+"/roles")
 	for _, want := range []string{
 		`<h1>Roles</h1>`,
-		`<a href="/roles/eng-prod">eng-prod</a>`,
-		`<a href="/roles/sre">sre</a>`,
+		`<a href="/portal/roles/eng-prod">eng-prod</a>`,
+		`<a href="/portal/roles/sre">sre</a>`,
 		`<code>eng</code>`,
 		`<code>alice</code>`,
 		`<code>deployer</code>`,
@@ -373,8 +373,8 @@ func TestPortal_RoleCreate_AddsRoleAndRedirects(t *testing.T) {
 	if resp.StatusCode != http.StatusSeeOther {
 		t.Fatalf("status = %d, want 303; body=%s", resp.StatusCode, readAll(t, resp))
 	}
-	if loc := resp.Header.Get("Location"); loc != "/roles/eng-prod" {
-		t.Errorf("Location = %q, want /roles/eng-prod", loc)
+	if loc := resp.Header.Get("Location"); loc != "/portal/roles/eng-prod" {
+		t.Errorf("Location = %q, want /portal/roles/eng-prod", loc)
 	}
 
 	// Store now holds the role with parsed fields.
@@ -498,8 +498,8 @@ func TestPortal_RoleUpdate_AllowsRename(t *testing.T) {
 		"group_claim": {"eng"},
 	})
 	defer resp.Body.Close()
-	if loc := resp.Header.Get("Location"); loc != "/roles/engineering" {
-		t.Errorf("Location = %q, want /roles/engineering", loc)
+	if loc := resp.Header.Get("Location"); loc != "/portal/roles/engineering" {
+		t.Errorf("Location = %q, want /portal/roles/engineering", loc)
 	}
 	if _, ok := store.ByName("eng"); ok {
 		t.Error("old name still present")
@@ -523,8 +523,8 @@ func TestPortal_RoleDelete_RemovesAndRedirects(t *testing.T) {
 	if resp.StatusCode != http.StatusSeeOther {
 		t.Fatalf("status = %d, want 303", resp.StatusCode)
 	}
-	if loc := resp.Header.Get("Location"); loc != "/roles" {
-		t.Errorf("Location = %q, want /roles", loc)
+	if loc := resp.Header.Get("Location"); loc != "/portal/roles" {
+		t.Errorf("Location = %q, want /portal/roles", loc)
 	}
 	if _, ok := store.ByName("eng"); ok {
 		t.Error("eng still present after delete")
@@ -574,7 +574,7 @@ func TestPortal_Index_FlipsHostsToReadyWhenHostStoreWired(t *testing.T) {
 	srv := httptest.NewServer(p.Routes())
 	defer srv.Close()
 	body := getBody(t, srv.URL+"/")
-	if !strings.Contains(body, `<a href="/hosts">Hosts</a>`) {
+	if !strings.Contains(body, `<a href="/portal/hosts">Hosts</a>`) {
 		t.Errorf("Hosts entry not clickable when HostStore is wired:\n%s", body)
 	}
 }
