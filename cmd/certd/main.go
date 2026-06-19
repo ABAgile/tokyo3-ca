@@ -708,7 +708,7 @@ func loadX509Signer(ctx context.Context, log *slog.Logger, caSigner signer.Signe
 	// it's parsed — LoadFromPKCS8PEM copies what it keeps, so the returned
 	// signer is unaffected. Best-effort (Go's GC may have already moved the
 	// bytes, and the key still lives unprotected on the heap inside the signer
-	// — see THREAT_MODEL.md §S2), but it shrinks the window a memory dump can
+	// — see docs/THREAT_MODEL.md §S2), but it shrinks the window a memory dump can
 	// catch the serialized key in.
 	defer func() {
 		for i := range keyPEM {

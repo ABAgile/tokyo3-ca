@@ -29,13 +29,13 @@ and key type: ecdsa-p256 / ed25519), and optionally
 renews an SSH user cert + writes an ssh_config drop-in.
 
 Phase 7 hardening landed:
-[THREAT_MODEL.md](THREAT_MODEL.md) (per-surface threats +
-mitigations), [OPERATIONS.md](OPERATIONS.md) (deploy/scenario
+[docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) (per-surface threats +
+mitigations), [docs/OPERATIONS.md](docs/OPERATIONS.md) (deploy/scenario
 runbooks), benchmark suite (`go test -bench=. -benchmem ./...`),
 CSRF + HTTP Basic auth gates on the portal, and a remote-signer
 abstraction operators wire KMS adapters against.
 
-Operational caveats are tracked in [OPERATIONS.md §7](OPERATIONS.md):
+Operational caveats are tracked in [docs/OPERATIONS.md §7](docs/OPERATIONS.md):
 in-memory role / mTLS-principal / revocation stores (no
 hot-reload, no persistence yet), portal session ring caps at 200,
 no per-org rate limiting at the API edge.
@@ -177,6 +177,8 @@ safely reload a rotating pair. Both `roles.json` and `principals.json`
 *seed* the Postgres store on first boot. OIDC stays off (no human
 callers in the rig); production layers it on alongside the mTLS path.
 
+> **Full picture:** [docs/architecture.md](docs/architecture.md) — key/cert hierarchy, what-signs-what, the trust-topology table, and the non-obvious gotchas in one place.
+
 **One root anchor, plus two edge anchors.** Every internal mTLS link
 — certd ⇄ Postgres, certd ⇄ NATS, cert-agentd ⇄ NATS, and all provisioned
 workload certs — verifies against a **single** anchor, `certd-x509-ca.crt`,
@@ -201,7 +203,7 @@ below), so that one anchor is now the **root**:
 > `CERTD_CA_SEAL_KEY` to a KMS key ref. SSH keeps its own signer
 > (`certd-signing.key`) and gains a matching pollable CA-key set
 > (`GET /api/v1/ssh/ca-keys`, `CERTD_SSH_CA_KEYS_FILE`). See
-> [docs/two-tier-ca.md](docs/two-tier-ca.md) and OPERATIONS.md §3.
+> [docs/two-tier-ca.md](docs/two-tier-ca.md) and docs/OPERATIONS.md §3.
 
 Watch it work:
 
@@ -240,7 +242,7 @@ anchor atomically, so a CA rotation propagates without an out-of-band
 push — the trust counterpart to leaf renewal. certd itself hot-reloads
 `CERTD_API_CLIENT_CA` (per handshake) and a same-key `CERTD_CA_X509_CERT_FILE`
 re-mint (per sign), keep-last-good on a bad drop-in; a new-key issuer is
-refused live (restart after a signing-key rotation). See OPERATIONS.md §3
+refused live (restart after a signing-key rotation). See docs/OPERATIONS.md §3
 "Rotation note".
 
 ```sh
@@ -292,7 +294,7 @@ enrollment, and later renewals must present the current/previous serial
 recorded cert is still valid is treated as a possible clone and **locks
 the identity** until an operator clears its row (it stays denied past
 expiry — no auto-heal). A fresh DB has no rows, so the bootstrap
-(self-issued) certs enroll cleanly — see OPERATIONS.md *Bootstrap a
+(self-issued) certs enroll cleanly — see docs/OPERATIONS.md *Bootstrap a
 workload with a self-issued mTLS cert* and *Recover a locked workload
 identity*.
 
@@ -544,7 +546,7 @@ internal/
   wild, so the guard is moot (caller auth + role policy still apply) —
   emitting `x509.workload_cert.reenroll`; it auto-heals within one cert
   TTL. A **locked** identity does *not* auto-heal — an operator clears its
-  `active_workload_cert` row to reset (OPERATIONS.md *Recover a locked
+  `active_workload_cert` row to reset (docs/OPERATIONS.md *Recover a locked
   workload identity*). **Adoption ack:** once cert-agentd has durably
   persisted a renewed cert it calls `POST /api/v1/x509/adopt` with the new
   serial, and certd collapses the grace (drops `previous`) — shrinking the
@@ -690,16 +692,24 @@ disconnected and resume on reconnect. See the per-binary godoc in
 [`cmd/cert-agentd/main.go`](cmd/cert-agentd/main.go) for the
 authoritative env-var reference.
 
+## Documentation
+
+[docs/](docs/README.md) is the docs map — architecture (key/cert hierarchy +
+trust topology), the two-tier design rationale, the store design, operations
+runbooks, and the threat model, with a canonical-source table so each fact has
+one owner. Start at [docs/architecture.md](docs/architecture.md) to understand
+the system; [docs/README.md](docs/README.md) routes to everything else.
+
 ## Operations
 
-See [OPERATIONS.md](OPERATIONS.md) for deployment topology, the
+See [docs/OPERATIONS.md](docs/OPERATIONS.md) for deployment topology, the
 initial-deploy checklist, scenario playbooks (rotate CA key,
 revoke a cert, recover from NATS outage, diagnose replay errors),
 cert-agentd lifecycle notes, and monitoring hooks.
 
 ## Security
 
-See [THREAT_MODEL.md](THREAT_MODEL.md) for the per-surface threat
+See [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) for the per-surface threat
 inventory + mitigations. Reviewers should walk the document's
 checklist when auditing changes that touch the HTTP API, the
 signer, audit emissions, or the portal.

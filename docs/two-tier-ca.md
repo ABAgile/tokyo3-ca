@@ -3,7 +3,8 @@
 - **Status:** implemented — and the default in the docker rig (local `file:` seal; production uses a KMS seal key)
 - **Date:** 2026-06-07
 - **Scope:** `certd` X.509 issuance hierarchy + `cert-agentd` trust distribution; SSH CA key distribution.
-- **Related:** [OPERATIONS.md](../OPERATIONS.md) §2–4, [THREAT_MODEL.md](../THREAT_MODEL.md),
+- **See also:** [architecture.md](architecture.md) — the live key/cert hierarchy + trust-topology map (this doc is the *design rationale*; that one is the *as-built* picture).
+- **Related:** [OPERATIONS.md](OPERATIONS.md) §2–4, [THREAT_MODEL.md](THREAT_MODEL.md),
   `internal/server/x509engine`, `cmd/certd/ca*.go`, `internal/agent/renew`.
 
 ---

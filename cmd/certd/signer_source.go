@@ -51,7 +51,7 @@ func resolveCASigner(ctx context.Context, keyRef string) (signer.Signer, error) 
 	// Non-file: ⇒ a KMS key reference (passed verbatim, so an "arn:aws:kms:..."
 	// ARN reaches the binding whole).
 	if kmsClientFactory == nil {
-		return nil, errors.New("KMS signing requested ($CERTD_CA_KEY / --key, non-file:) but no KMS client factory is registered in this build (the AWS binding registers automatically; see internal/server/signer/kms/doc.go and OPERATIONS.md §2.1)")
+		return nil, errors.New("KMS signing requested ($CERTD_CA_KEY / --key, non-file:) but no KMS client factory is registered in this build (the AWS binding registers automatically; see internal/server/signer/kms/doc.go and docs/OPERATIONS.md §2.1)")
 	}
 	client, err := kmsClientFactory(ctx, keyRef)
 	if err != nil {

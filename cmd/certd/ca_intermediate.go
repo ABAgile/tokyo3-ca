@@ -6,7 +6,7 @@ package main
 // one cert here (the intermediate); thereafter `certd serve` unseals the
 // intermediate key into memory and signs every leaf with it, so the root key
 // never touches the online issuance path. Run on a restricted/air-gapped host
-// where the root's Sign is enabled. See docs/two-tier-ca.md and OPERATIONS.md.
+// where the root's Sign is enabled. See docs/two-tier-ca.md and docs/OPERATIONS.md.
 
 import (
 	"crypto/rand"

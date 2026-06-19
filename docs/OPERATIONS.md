@@ -209,6 +209,8 @@ See *Rotate the CA key* below for the full cutover sequence.
 
 ### Two-tier: offline root + sealed intermediate (optional)
 
+> Hierarchy + trust-topology map: [architecture.md](architecture.md).
+
 By default certd is single-tier: one signing key signs every SSH and X.509
 leaf, and `CERTD_CA_X509_CERT_FILE` is both the issuer and the anchor consumers
 pin. The optional **two-tier** mode keeps the asymmetric **root** offline and
@@ -217,7 +219,7 @@ into memory at boot — so the root's `Sign` never sits on the online issuance
 path, and a certd compromise yields only a bounded, cheaply-rotated
 intermediate. SSH is unaffected (it keeps signing with
 `CERTD_CA_KEY`). Full rationale + design:
-[docs/two-tier-ca.md](docs/two-tier-ca.md).
+[two-tier-ca.md](two-tier-ca.md).
 
 **Artifacts** (two-tier splits single-tier's signing-key + issuer apart):
 

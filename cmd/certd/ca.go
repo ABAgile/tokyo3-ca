@@ -6,7 +6,7 @@ package main
 // binary so they reuse the one signer-loading seam (loadSigner, below)
 // and the same x509engine code certd issues leaves with. When KMS
 // support lands in the signer seam, bootstrap + rotate inherit it for
-// free. See OPERATIONS.md §2.1 for the production procedure.
+// free. See docs/OPERATIONS.md §2.1 for the production procedure.
 
 import (
 	"crypto/rand"
