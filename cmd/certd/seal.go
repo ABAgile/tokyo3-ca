@@ -8,11 +8,13 @@ package main
 // offline and the intermediate key never persists in plaintext on the certd
 // host. This mirrors the signing kms.Client seam in signer_source.go: a
 // registry indirection the deployment KMS binding fills (the AWS binding in
-// kms_seal_aws.go registers automatically).
+// seal_aws_kms.go registers automatically).
 
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 )
 
 // sealer wraps and unwraps small blobs (the intermediate key) under a symmetric
@@ -24,27 +26,40 @@ type sealer interface {
 	Decrypt(ctx context.Context, ciphertext []byte) ([]byte, error)
 }
 
-// sealerFactory builds a [sealer] from a symmetric KMS key reference. nil in the
-// default SDK-free binary; the deployment KMS binding sets it via
-// RegisterSealerFactory from an init().
-var sealerFactory func(ctx context.Context, keyRef string) (sealer, error)
+// sealerFactory builds a [sealer] from a scheme-specific key reference.
+type sealerFactory func(ctx context.Context, keyRef string) (sealer, error)
 
-// RegisterSealerFactory wires a sealer factory into the seal seam. Call it once,
-// from an init() in the deployment build that pulls the cloud SDK. Exported so
-// that build can reach it.
-func RegisterSealerFactory(f func(ctx context.Context, keyRef string) (sealer, error)) {
-	sealerFactory = f
+// sealerFactories maps a key-reference scheme to its binding. Each binding
+// registers from an init(): the AWS KMS binding under "aws", the dev local-file
+// binding under "file". The scheme is the prefix before the first ':' in
+// CERTD_CA_SEAL_KEY / --seal-key when that prefix is a recognised scheme;
+// anything else (a bare KMS alias / uuid, or an "arn:aws:kms:..." ARN) defaults
+// to "aws", so existing KMS configs keep working with no scheme prefix.
+var sealerFactories = map[string]sealerFactory{}
+
+// RegisterSealerFactory wires a sealer factory for a scheme. Call it once, from
+// an init() in the binding file. Exported so those files can reach it.
+func RegisterSealerFactory(scheme string, f sealerFactory) {
+	sealerFactories[scheme] = f
 }
 
-// resolveSealer builds a [sealer] from a symmetric KMS key reference. Returns a
-// clear error when sealing is requested but no binding was compiled into this
-// build.
+// resolveSealer selects a [sealer] by the scheme of keyRef and builds it. The
+// scheme prefix is stripped before the ref reaches the binding (so the AWS
+// binding still sees a bare key ref, and the file binding sees a bare path).
 func resolveSealer(ctx context.Context, keyRef string) (sealer, error) {
 	if keyRef == "" {
-		return nil, errors.New("no seal key: set --seal-kms-key / $CERTD_CA_SEAL_KMS_KEY (the symmetric KMS key that wraps the intermediate key)")
+		return nil, errors.New("no seal key: set --seal-key / $CERTD_CA_SEAL_KEY (a KMS key ref, or file:<path> for a local dev key)")
 	}
-	if sealerFactory == nil {
-		return nil, errors.New("KMS sealing requested but no sealer factory is registered in this build (the AWS binding registers automatically)")
+	scheme, ref := "aws", keyRef
+	if i := strings.IndexByte(keyRef, ':'); i > 0 {
+		switch keyRef[:i] {
+		case "aws", "file":
+			scheme, ref = keyRef[:i], keyRef[i+1:]
+		}
 	}
-	return sealerFactory(ctx, keyRef)
+	f := sealerFactories[scheme]
+	if f == nil {
+		return nil, fmt.Errorf("no sealer registered for scheme %q (this build lacks the binding)", scheme)
+	}
+	return f(ctx, ref)
 }

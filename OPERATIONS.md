@@ -35,8 +35,8 @@ host that needs renewable credentials.
 ## 2. Initial deploy checklist
 
 1. **Generate or import the CA key.**
-   - Dev: `openssl genpkey -algorithm ed25519 -out ca.key`; `CERTD_CA_KEY_FILE=ca.key`.
-   - Prod: provision an asymmetric SIGN_VERIFY key in your KMS (AWS KMS, GCP KMS, Vault Transit, or HSM); set `CERTD_CA_KMS_KEY` (the AWS binding is compiled in by default). See **§3 Production CA bootstrap (KMS)** below.
+   - Dev: `openssl genpkey -algorithm ed25519 -out ca.key`; `CERTD_CA_KEY=file:ca.key`.
+   - Prod: provision an asymmetric SIGN_VERIFY key in your KMS (AWS KMS, GCP KMS, Vault Transit, or HSM); set `CERTD_CA_KEY` to its key ref (the AWS binding is compiled in by default). See **§3 Production CA bootstrap (KMS)** below.
 2. **Pin a persistent X.509 issuer cert.** Set `CERTD_CA_X509_CERT_FILE` to a stable self-signed CA cert over the signing key. **Do not skip this in production:** when unset, certd self-signs a *fresh, ephemeral* issuer at every boot, so previously-issued leaf certs stop chain-validating after a restart. This cert (not the API server cert, not the SSH CA pubkey) is the trust anchor every workload pins to verify a certd-issued mTLS peer. See §3 for minting it with a KMS key.
 3. **Configure mTLS for the API.**
    - `CERTD_API_CERT` + `CERTD_API_KEY` = the server certificate the workloads validate (a TLS *server* cert with a DNS SAN — typically from your platform CA / cert-manager, **not** from certd itself).
@@ -82,7 +82,7 @@ keyid=$(aws kms create-key --key-spec ECC_NIST_EDWARDS25519 \
   --query KeyMetadata.KeyId --output text)
 aws kms create-alias --alias-name alias/tokyo3-ca-signing \
   --target-key-id "$keyid"
-# Use the alias ARN as CERTD_CA_KMS_KEY so key rotation doesn't churn config:
+# Use the alias ARN as CERTD_CA_KEY so key rotation doesn't churn config:
 #   arn:aws:kms:<region>:<acct>:alias/tokyo3-ca-signing
 
 # AWS — ECDSA P-256 (portable fallback; also set workload key_type=ecdsa-p256)
@@ -102,17 +102,17 @@ no `Decrypt`, no export, no scheduling-for-deletion from the app role.
 ### Step 2 — choose the runtime signing model
 
 Both `certd serve` and `certd ca` resolve the CA key through one seam
-(`resolveCASigner`): `CERTD_CA_KMS_KEY` selects a KMS key,
-`CERTD_CA_KEY_FILE` a PKCS#8 file, neither ⇒ ephemeral (dev). Two
-options:
+(`resolveCASigner`) from a single scheme-tagged `CERTD_CA_KEY`:
+`file:<path>` is a PKCS#8 file, anything else (a bare ARN / alias) is a
+KMS key ref; unset ⇒ ephemeral (dev). Two options:
 
 - **Model A — online KMS signing (recommended).** The key never leaves
   KMS; every issuance calls KMS `Sign`. The AWS KMS binding ships in-repo
-  (`cmd/certd/kms_aws.go`) and is **compiled in by default** — no flag,
+  (`cmd/certd/aws_kms.go`) and is **compiled in by default** — no flag,
   no operator Go code:
 
   ```sh
-  export CERTD_CA_KMS_KEY=arn:aws:kms:us-east-1:111:key/abc
+  export CERTD_CA_KEY=arn:aws:kms:us-east-1:111:key/abc
   certd serve                              # serve + ca sign through KMS
   ```
 
@@ -134,7 +134,7 @@ options:
 - **Model B — KMS-wrapped key file (works with the default binary).**
   Generate the Ed25519 key, envelope-encrypt it with a KMS *symmetric*
   key, store the ciphertext in your secret store. At deploy, KMS
-  `Decrypt` it into a tmpfs path and point `CERTD_CA_KEY_FILE` there.
+  `Decrypt` it into a tmpfs path and point `CERTD_CA_KEY=file:<path>` there.
   The key is protected at rest but is present in process memory / tmpfs
   at runtime — weaker than Model A. Acceptable when your KMS has no
   asymmetric signing or you can't run a custom build.
@@ -148,7 +148,7 @@ and `x509engine.NewSelfSignedCA` path `serve` uses:
 
 ```sh
 # Model A (KMS): the key never leaves KMS; this is its one Sign.
-certd ca bootstrap --kms-key arn:aws:kms:us-east-1:111:key/abc \
+certd ca bootstrap --key arn:aws:kms:us-east-1:111:key/abc \
   --cn "tokyo3-ca prod" --out /etc/tokyo3-ca/issuer.crt
 
 # Model B (file key): the SAME command against the shipped binary,
@@ -164,7 +164,7 @@ Model B you can equivalently `openssl req -x509 -new -key <decrypted>.key
 
 ### Step 4 — wire and distribute
 
-1. `CERTD_CA_KMS_KEY` on a KMS-bound build (Model A) **or** `CERTD_CA_KEY_FILE` (Model B).
+1. `CERTD_CA_KEY` — a KMS key ref on a KMS-bound build (Model A) **or** `file:<path>` (Model B).
 2. `CERTD_CA_X509_CERT_FILE=/etc/tokyo3-ca/issuer.crt` — the cert from step 3.
 3. Push `issuer.crt` to **every workload's trust bundle** (`CERT_AGENTD_WORKLOAD_CA` on agents; `AUTH_DB_CA` / `AUTH_NATS_CA` / `AUTH_WORKLOAD_CA` etc. on consumers) so they validate certd-issued peers. This is a *different* file from the bundle that verifies certd's HTTPS server cert.
 4. Verify the chain before going live:
@@ -201,7 +201,7 @@ certd ca bundle --out trust-bundle.crt issuer-new.crt
 The `CERTD_API_CLIENT_CA` widen→narrow and the served trust bundle both
 hot-reload (and agents auto-pull), so the only restart a key rotation
 still needs is the one that swaps certd onto the new **signing key**
-(`CERTD_CA_KMS_KEY` / `CERTD_CA_KEY_FILE`) — the signing key is loaded
+(`CERTD_CA_KEY`) — the signing key is loaded
 once at boot, and the issuer reloader deliberately refuses a new-key
 issuer until that restart so chains never break mid-flight.
 
@@ -216,7 +216,7 @@ signs X.509 leaves with a short-lived **intermediate** whose key certd unseals
 into memory at boot — so the root's `Sign` never sits on the online issuance
 path, and a certd compromise yields only a bounded, cheaply-rotated
 intermediate. SSH is unaffected (it keeps signing with
-`CERTD_CA_KEY_FILE`/`CERTD_CA_KMS_KEY`). Full rationale + design:
+`CERTD_CA_KEY`). Full rationale + design:
 [docs/two-tier-ca.md](docs/two-tier-ca.md).
 
 **Artifacts** (two-tier splits single-tier's signing-key + issuer apart):
@@ -225,7 +225,7 @@ intermediate. SSH is unaffected (it keeps signing with
 |---|---|---|
 | Root key | asymmetric; signs only the intermediate | offline / ceremony-only (KMS or air-gapped file) |
 | Root cert | the trust anchor consumers pin | `CERTD_CA_ROOT_CERT_FILE` + every consumer CA bundle |
-| Seal key | symmetric; wraps the intermediate key | KMS (`CERTD_CA_SEAL_KMS_KEY`) |
+| Seal key | symmetric; wraps the intermediate key | KMS (`CERTD_CA_SEAL_KEY`); `file:<path>` selects a local AES-256 key for dev rigs (logs a loud warning — not for production) |
 | Intermediate cert | what certd signs leaves under | `CERTD_CA_X509_CERT_FILE` |
 | Sealed intermediate key | base64 KMS-ciphertext, unsealed at boot | `CERTD_CA_SEALED_KEY_FILE` |
 
@@ -234,14 +234,14 @@ where the root's `Sign` is enabled):
 
 ```sh
 certd ca issue-intermediate \
-  --root-kms-key arn:aws:kms:…:key/ROOT  --root-cert root.crt \
-  --seal-kms-key arn:aws:kms:…:key/SEAL \
+  --root-key arn:aws:kms:…:key/ROOT  --root-cert root.crt \
+  --seal-key arn:aws:kms:…:key/SEAL \
   --cn "tokyo3-ca intermediate" --ttl 2160h \
   --out-cert intermediate.crt --out-sealed-key intermediate.key.sealed
 ```
 
 Then set `CERTD_CA_X509_CERT_FILE=intermediate.crt`,
-`CERTD_CA_SEALED_KEY_FILE=intermediate.key.sealed`, `CERTD_CA_SEAL_KMS_KEY`, and
+`CERTD_CA_SEALED_KEY_FILE=intermediate.key.sealed`, `CERTD_CA_SEAL_KEY`, and
 `CERTD_CA_ROOT_CERT_FILE=root.crt`. The **root cert is the anchor** — push it to
 `CERTD_API_CLIENT_CA`, `POSTGRES_SSL_CA`, NATS `--tlscacert`, and
 `CERT_AGENTD_CA`. At boot certd unseals the key, verifies the intermediate
@@ -264,9 +264,10 @@ longer only with hardware key custody). The unsealed key lives in plaintext
 process memory at runtime (no `mlock` — see [THREAT_MODEL.md](THREAT_MODEL.md)
 §S2 #2/#5); local-hardware custody (TPM/enclave) is the stronger option.
 
-**The dev rig stays single-tier.** `docker-compose.yml` uses a file CA key and
-no KMS, so it cannot seal/unseal an intermediate; the rig (and `gen.sh`) remain
-single-tier. Two-tier needs a KMS symmetric key for the seal.
+**The dev rig runs two-tier by default.** `gen.sh` mints the root + sealed
+intermediate and `docker-compose.yml` wires `CERTD_CA_SEAL_KEY=file:/shared/certs/seal.key`
+— a local AES-256 seal (certd logs a loud warning), so the rig exercises two-tier
+end to end without KMS. Production sets `CERTD_CA_SEAL_KEY` to a KMS key ref.
 
 ## 4. Common scenarios
 
@@ -299,7 +300,7 @@ SSH certs have no chain — verifiers trust the SSH CA public key directly — b
    `CERT_AGENTD_SSH_CA_KEYS_PATH` set pull the set on their poll cadence
    (default 1h) and rewrite their `TrustedUserCAKeys` — now trusting both. Wait
    ≥ one poll interval + margin.
-2. Switch certd's SSH signing key (`CERTD_CA_KEY_FILE`/`CERTD_CA_KMS_KEY`) to
+2. Switch certd's SSH signing key (`CERTD_CA_KEY`) to
    the new key and **restart** (the signing key is fixed at boot).
 3. New SSH certs sign under the new key; short-lived existing certs drain.
 4. Edit `CERTD_SSH_CA_KEYS_FILE` to **new only**; verifiers narrow on the next
@@ -392,7 +393,7 @@ issued through certd's sign endpoint, the first certd renewal does
 ```sh
 certd ca issue-workload \
   --spiffe-uri spiffe://td/host/db-1 \   # the identity it will renew under
-  --ca-cert issuer.crt --kms-key arn:… \ # (or --key ca.key) — signs through KMS
+  --ca-cert issuer.crt --key arn:… \     # (or --key file:ca.key) — signs through KMS
   --out-cert svid.pem --out-key svid.key --bundle-out svid_bundle.pem
 ```
 
@@ -472,7 +473,7 @@ keeps retrying (each 403 is a sign failure → retry on
   reach the sign endpoint) → **re-bootstrap + restart**:
   ```sh
   certd ca issue-workload --spiffe-uri spiffe://<trust-domain>/<path> \
-    --ca-cert issuer.crt --kms-key …  \
+    --ca-cert issuer.crt --key …  \
     --out-cert svid.pem --out-key svid.key --bundle-out svid_bundle.pem
   ```
   drop `svid.{pem,key}` onto the host (the agent's writable `/certs` /

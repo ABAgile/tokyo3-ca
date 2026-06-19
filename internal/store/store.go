@@ -12,7 +12,7 @@
 // renewal/anti-theft protocol the active-cert table will back.
 //
 // Invariant: these stores never hold private key material — the CA signing
-// key lives in CERTD_CA_KEY_FILE / KMS, and issued leaf keys never reach
+// key lives in CERTD_CA_KEY (file: or KMS), and issued leaf keys never reach
 // certd. This package holds policy + registries + revocation + active-cert
 // state only.
 package store

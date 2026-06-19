@@ -31,9 +31,13 @@ func (fakeSealer) Decrypt(_ context.Context, ciphertext []byte) ([]byte, error) 
 
 func withFakeSealer(t *testing.T) {
 	t.Helper()
-	prev := sealerFactory
-	t.Cleanup(func() { sealerFactory = prev })
-	RegisterSealerFactory(func(context.Context, string) (sealer, error) { return fakeSealer{}, nil })
+	// The tests use a scheme-less seal ref ("fake"), which resolveSealer routes
+	// to the "aws" default — so register the fake there.
+	prev := sealerFactories
+	t.Cleanup(func() { sealerFactories = prev })
+	sealerFactories = map[string]sealerFactory{
+		"aws": func(context.Context, string) (sealer, error) { return fakeSealer{}, nil },
+	}
 }
 
 // setupTestRoot writes a path-length-1 root key + cert — what issue-intermediate
@@ -72,9 +76,9 @@ func TestIssueIntermediate_HappyPath(t *testing.T) {
 	outSealed := filepath.Join(dir, "intermediate.key.sealed")
 
 	if err := runCmd(caCmd(), "issue-intermediate",
-		"--root-key", rootKeyPath,
+		"--root-key", "file:"+rootKeyPath,
 		"--root-cert", rootCertPath,
-		"--seal-kms-key", "fake",
+		"--seal-key", "fake",
 		"--cn", "test-int",
 		"--out-cert", outCert,
 		"--out-sealed-key", outSealed,
@@ -130,9 +134,9 @@ func TestIssueIntermediate_RejectsPathLenZeroRoot(t *testing.T) {
 	keyPath, certPath := setupTestCA(t)
 	dir := t.TempDir()
 	err := runCmd(caCmd(), "issue-intermediate",
-		"--root-key", keyPath,
+		"--root-key", "file:"+keyPath,
 		"--root-cert", certPath,
-		"--seal-kms-key", "fake",
+		"--seal-key", "fake",
 		"--out-cert", filepath.Join(dir, "i.crt"),
 		"--out-sealed-key", filepath.Join(dir, "i.key"),
 	)

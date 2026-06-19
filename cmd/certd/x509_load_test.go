@@ -21,7 +21,7 @@ type pubEqualer interface{ Equal(crypto.PublicKey) bool }
 
 func TestLoadX509Signer_SingleTierFallback(t *testing.T) {
 	t.Setenv("CERTD_CA_SEALED_KEY_FILE", "")
-	t.Setenv("CERTD_CA_SEAL_KMS_KEY", "")
+	t.Setenv("CERTD_CA_SEAL_KEY", "")
 	caSig, err := signer.NewEphemeralEd25519()
 	if err != nil {
 		t.Fatalf("ca signer: %v", err)
@@ -37,7 +37,7 @@ func TestLoadX509Signer_SingleTierFallback(t *testing.T) {
 
 func TestLoadX509Signer_RequiresBothEnv(t *testing.T) {
 	t.Setenv("CERTD_CA_SEALED_KEY_FILE", filepath.Join(t.TempDir(), "k"))
-	t.Setenv("CERTD_CA_SEAL_KMS_KEY", "")
+	t.Setenv("CERTD_CA_SEAL_KEY", "")
 	caSig, _ := signer.NewEphemeralEd25519()
 	_, err := loadX509Signer(context.Background(), slog.New(slog.DiscardHandler), caSig)
 	if err == nil || !strings.Contains(err.Error(), "needs both") {
@@ -59,7 +59,7 @@ func TestLoadX509Signer_UnsealsIntermediate(t *testing.T) {
 		t.Fatalf("write sealed: %v", err)
 	}
 	t.Setenv("CERTD_CA_SEALED_KEY_FILE", sealedPath)
-	t.Setenv("CERTD_CA_SEAL_KMS_KEY", "fake")
+	t.Setenv("CERTD_CA_SEAL_KEY", "fake")
 
 	caSig, _ := signer.NewEphemeralEd25519()
 	got, err := loadX509Signer(context.Background(), slog.New(slog.DiscardHandler), caSig)

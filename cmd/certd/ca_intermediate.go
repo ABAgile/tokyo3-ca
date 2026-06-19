@@ -22,19 +22,20 @@ import (
 )
 
 func caIssueIntermediateCmd() *cobra.Command {
-	var rootKeyPath, rootKMSKey, rootCertPath, sealKMSKey, cn, keyType, outCert, outSealedKey string
+	var rootKeyRef, rootCertPath, sealKey, cn, keyType, outCert, outSealedKey string
 	var ttl time.Duration
 	var force bool
 	c := &cobra.Command{
 		Use:   "issue-intermediate",
-		Short: "Mint an intermediate CA from the offline root and seal its key (KMS)",
+		Short: "Mint an intermediate CA from the offline root and seal its key (KMS or local file)",
 		Long: "Generates an intermediate-CA keypair, signs the intermediate cert with the root " +
-			"key (--root-key or --root-kms-key) against --root-cert, and seals the intermediate " +
-			"private key under a symmetric KMS key (--seal-kms-key). Writes the public " +
-			"intermediate cert (--out-cert → CERTD_CA_X509_CERT_FILE) and the base64 sealed-key " +
-			"ciphertext (--out-sealed-key → CERTD_CA_SEALED_KEY_FILE). certd serve unseals the " +
-			"key into memory at boot and signs leaves with it; the root stays offline. The " +
-			"intermediate's validity is clamped to the root's NotAfter.",
+			"key (--root-key) against --root-cert, and seals the intermediate " +
+			"private key under the seal key (--seal-key: a KMS key ref, or file:<path> for a " +
+			"local AES-256 dev key). Writes the public intermediate cert (--out-cert → " +
+			"CERTD_CA_X509_CERT_FILE) and the base64 sealed-key ciphertext (--out-sealed-key → " +
+			"CERTD_CA_SEALED_KEY_FILE). certd serve unseals the key into memory at boot and signs " +
+			"leaves with it; the root stays offline. The intermediate's validity is clamped to " +
+			"the root's NotAfter.",
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if rootCertPath == "" {
 				return errors.New("--root-cert (the root cert) is required; default is $CERTD_CA_ROOT_CERT_FILE")
@@ -42,7 +43,7 @@ func caIssueIntermediateCmd() *cobra.Command {
 			if outCert == "" || outSealedKey == "" {
 				return errors.New("--out-cert and --out-sealed-key are required")
 			}
-			rootSig, err := resolveCASigner(cmd.Context(), rootKeyPath, rootKMSKey)
+			rootSig, err := resolveCASigner(cmd.Context(), rootKeyRef)
 			if err != nil {
 				return err
 			}
@@ -53,9 +54,9 @@ func caIssueIntermediateCmd() *cobra.Command {
 			// The intermediate chains to the root over the root key — if
 			// --root-cert isn't that key's cert, the chain won't verify.
 			if !publicKeysEqual(rootCert.PublicKey, rootSig.Public()) {
-				return errors.New("--root-cert public key does not match the root signing key (--root-key/--root-kms-key); the intermediate would not chain")
+				return errors.New("--root-cert public key does not match the root signing key (--root-key); the intermediate would not chain")
 			}
-			sealer, err := resolveSealer(cmd.Context(), sealKMSKey)
+			sealer, err := resolveSealer(cmd.Context(), sealKey)
 			if err != nil {
 				return err
 			}
@@ -99,10 +100,9 @@ func caIssueIntermediateCmd() *cobra.Command {
 			return nil
 		},
 	}
-	c.Flags().StringVar(&rootKeyPath, "root-key", os.Getenv("CERTD_CA_ROOT_KEY_FILE"), "Root CA signing key (PKCS#8 PEM); default $CERTD_CA_ROOT_KEY_FILE")
-	c.Flags().StringVar(&rootKMSKey, "root-kms-key", os.Getenv("CERTD_CA_ROOT_KMS_KEY"), "Root KMS key reference; default $CERTD_CA_ROOT_KMS_KEY. Wins over --root-key")
+	c.Flags().StringVar(&rootKeyRef, "root-key", os.Getenv("CERTD_CA_ROOT_KEY"), "Root CA signing key: file:<path> for a PKCS#8 PEM, or a KMS key ref; default $CERTD_CA_ROOT_KEY")
 	c.Flags().StringVar(&rootCertPath, "root-cert", os.Getenv("CERTD_CA_ROOT_CERT_FILE"), "Root cert PEM (the intermediate's parent); default $CERTD_CA_ROOT_CERT_FILE")
-	c.Flags().StringVar(&sealKMSKey, "seal-kms-key", os.Getenv("CERTD_CA_SEAL_KMS_KEY"), "Symmetric KMS key that seals the intermediate private key; default $CERTD_CA_SEAL_KMS_KEY")
+	c.Flags().StringVar(&sealKey, "seal-key", os.Getenv("CERTD_CA_SEAL_KEY"), "Seal key for the intermediate private key: a KMS key ref, or file:<path> for a local AES-256 dev key; default $CERTD_CA_SEAL_KEY")
 	c.Flags().StringVar(&cn, "cn", "tokyo3-ca intermediate", "Subject CommonName for the intermediate cert")
 	c.Flags().StringVar(&keyType, "key-type", "ed25519", "Intermediate key algorithm: ed25519 | ecdsa-p256")
 	c.Flags().DurationVar(&ttl, "ttl", 90*24*time.Hour, "Intermediate validity (clamped to the root's NotAfter); rotate at ~60% of this")

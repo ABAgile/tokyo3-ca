@@ -115,7 +115,7 @@ func TestIssueWorkload_HappyPath(t *testing.T) {
 			keyOut := filepath.Join(dir, "svid.key")
 			if err := runCmd(caIssueWorkloadCmd(),
 				"--spiffe-uri", "spiffe://tokyo3/authd/agent", "--cn", "auth_app",
-				"--key-type", keyType, "--ca-cert", caCertPath, "--key", keyPath,
+				"--key-type", keyType, "--ca-cert", caCertPath, "--key", "file:"+keyPath,
 				"--out-cert", certOut, "--out-key", keyOut,
 			); err != nil {
 				t.Fatalf("Execute: %v", err)
@@ -138,7 +138,7 @@ func TestIssueWorkload_RequiresSpiffeURI(t *testing.T) {
 	keyPath, caCertPath := setupTestCA(t)
 	dir := t.TempDir()
 	if err := runCmd(caIssueWorkloadCmd(),
-		"--ca-cert", caCertPath, "--key", keyPath,
+		"--ca-cert", caCertPath, "--key", "file:"+keyPath,
 		"--out-cert", filepath.Join(dir, "c"), "--out-key", filepath.Join(dir, "k"),
 	); err == nil {
 		t.Fatal("expected error when --spiffe-uri is missing")
@@ -150,7 +150,7 @@ func TestIssueWorkload_RejectsCACertKeyMismatch(t *testing.T) {
 	_, otherCA := setupTestCA(t) // issuer over a DIFFERENT key
 	dir := t.TempDir()
 	if err := runCmd(caIssueWorkloadCmd(),
-		"--spiffe-uri", "spiffe://x/y", "--ca-cert", otherCA, "--key", keyPath,
+		"--spiffe-uri", "spiffe://x/y", "--ca-cert", otherCA, "--key", "file:"+keyPath,
 		"--out-cert", filepath.Join(dir, "c"), "--out-key", filepath.Join(dir, "k"),
 	); err == nil {
 		t.Fatal("expected error when --ca-cert key != signing key")
@@ -165,7 +165,7 @@ func TestIssueServer_HappyPath(t *testing.T) {
 	keyOut := filepath.Join(dir, "nats.key")
 	if err := runCmd(caIssueServerCmd(),
 		"--dns", "nats", "--dns", "localhost", "--ip", "127.0.0.1",
-		"--ca-cert", caCertPath, "--key", keyPath,
+		"--ca-cert", caCertPath, "--key", "file:"+keyPath,
 		"--out-cert", certOut, "--out-key", keyOut,
 	); err != nil {
 		t.Fatalf("Execute: %v", err)
@@ -189,7 +189,7 @@ func TestIssueServer_RequiresSAN(t *testing.T) {
 	keyPath, caCertPath := setupTestCA(t)
 	dir := t.TempDir()
 	if err := runCmd(caIssueServerCmd(),
-		"--ca-cert", caCertPath, "--key", keyPath,
+		"--ca-cert", caCertPath, "--key", "file:"+keyPath,
 		"--out-cert", filepath.Join(dir, "c"), "--out-key", filepath.Join(dir, "k"),
 	); err == nil {
 		t.Fatal("expected error when neither --dns nor --ip is given")
@@ -200,7 +200,7 @@ func TestIssueServer_RejectsBadIP(t *testing.T) {
 	keyPath, caCertPath := setupTestCA(t)
 	dir := t.TempDir()
 	if err := runCmd(caIssueServerCmd(),
-		"--ip", "not-an-ip", "--ca-cert", caCertPath, "--key", keyPath,
+		"--ip", "not-an-ip", "--ca-cert", caCertPath, "--key", "file:"+keyPath,
 		"--out-cert", filepath.Join(dir, "c"), "--out-key", filepath.Join(dir, "k"),
 	); err == nil {
 		t.Fatal("expected error for an invalid --ip")

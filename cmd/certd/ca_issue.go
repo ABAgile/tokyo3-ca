@@ -40,7 +40,7 @@ import (
 // ── certd ca issue-workload ───────────────────────────────────────────────────
 
 func caIssueWorkloadCmd() *cobra.Command {
-	var spiffeURI, cn, keyType, caCertPath, keyPath, kmsKey, outCert, outKey, bundleOut string
+	var spiffeURI, cn, keyType, caCertPath, keyRef, outCert, outKey, bundleOut string
 	var ttl time.Duration
 	var force bool
 	c := &cobra.Command{
@@ -58,7 +58,7 @@ func caIssueWorkloadCmd() *cobra.Command {
 			if outCert == "" || outKey == "" {
 				return errors.New("--out-cert and --out-key are required")
 			}
-			lc, err := prepareLeaf(cmd.Context(), keyPath, kmsKey, caCertPath, keyType)
+			lc, err := prepareLeaf(cmd.Context(), keyRef, caCertPath, keyType)
 			if err != nil {
 				return err
 			}
@@ -83,7 +83,7 @@ func caIssueWorkloadCmd() *cobra.Command {
 	}
 	c.Flags().StringVar(&spiffeURI, "spiffe-uri", "", "SPIFFE URI SAN for the workload identity (required); must match what the workload renews under")
 	c.Flags().StringVar(&cn, "cn", "", "Optional Subject CommonName (e.g. a Postgres role for CN→role cert auth)")
-	addLeafFlags(c, &keyType, &caCertPath, &keyPath, &kmsKey, &outCert, &outKey, &bundleOut, &ttl, &force)
+	addLeafFlags(c, &keyType, &caCertPath, &keyRef, &outCert, &outKey, &bundleOut, &ttl, &force)
 	return c
 }
 
@@ -91,7 +91,7 @@ func caIssueWorkloadCmd() *cobra.Command {
 
 func caIssueServerCmd() *cobra.Command {
 	var dnsNames, ipAddrs []string
-	var spiffeURI, cn, keyType, caCertPath, keyPath, kmsKey, outCert, outKey, bundleOut string
+	var spiffeURI, cn, keyType, caCertPath, keyRef, outCert, outKey, bundleOut string
 	var ttl time.Duration
 	var force bool
 	c := &cobra.Command{
@@ -116,7 +116,7 @@ func caIssueServerCmd() *cobra.Command {
 				}
 				ips = append(ips, ip)
 			}
-			lc, err := prepareLeaf(cmd.Context(), keyPath, kmsKey, caCertPath, keyType)
+			lc, err := prepareLeaf(cmd.Context(), keyRef, caCertPath, keyType)
 			if err != nil {
 				return err
 			}
@@ -145,17 +145,16 @@ func caIssueServerCmd() *cobra.Command {
 	c.Flags().StringArrayVar(&ipAddrs, "ip", nil, "IP SAN (repeatable)")
 	c.Flags().StringVar(&spiffeURI, "spiffe-uri", "", "Optional SPIFFE URI SAN to also embed on the server cert")
 	c.Flags().StringVar(&cn, "cn", "", "Optional Subject CommonName; defaults to the first --dns")
-	addLeafFlags(c, &keyType, &caCertPath, &keyPath, &kmsKey, &outCert, &outKey, &bundleOut, &ttl, &force)
+	addLeafFlags(c, &keyType, &caCertPath, &keyRef, &outCert, &outKey, &bundleOut, &ttl, &force)
 	return c
 }
 
 // addLeafFlags registers the signer-source + output flags both issue-* commands share.
-func addLeafFlags(c *cobra.Command, keyType, caCertPath, keyPath, kmsKey, outCert, outKey, bundleOut *string, ttl *time.Duration, force *bool) {
+func addLeafFlags(c *cobra.Command, keyType, caCertPath, keyRef, outCert, outKey, bundleOut *string, ttl *time.Duration, force *bool) {
 	c.Flags().StringVar(keyType, "key-type", "ed25519", "Leaf key algorithm: ed25519 | ecdsa-p256")
 	c.Flags().DurationVar(ttl, "ttl", 720*time.Hour, "Cert validity; for a bootstrap leaf, only needs to outlast the gap until first renewal")
 	c.Flags().StringVar(caCertPath, "ca-cert", os.Getenv("CERTD_CA_X509_CERT_FILE"), "Issuer cert PEM (the leaf's parent); default $CERTD_CA_X509_CERT_FILE")
-	c.Flags().StringVar(keyPath, "key", os.Getenv("CERTD_CA_KEY_FILE"), "CA signing key (PKCS#8 PEM); default $CERTD_CA_KEY_FILE")
-	c.Flags().StringVar(kmsKey, "kms-key", os.Getenv("CERTD_CA_KMS_KEY"), "KMS key reference; default $CERTD_CA_KMS_KEY. Wins over --key")
+	c.Flags().StringVar(keyRef, "key", os.Getenv("CERTD_CA_KEY"), "CA signing key: file:<path> for a PKCS#8 PEM, or a KMS key ref; default $CERTD_CA_KEY")
 	c.Flags().StringVar(outCert, "out-cert", "", "Output path for the cert, 0644 (required)")
 	c.Flags().StringVar(outKey, "out-key", "", "Output path for the private key, 0600 (required)")
 	c.Flags().StringVar(bundleOut, "bundle-out", "", "Optional: also write the issuer cert here as the workload's trust anchor")
@@ -175,11 +174,11 @@ type leafContext struct {
 
 // prepareLeaf resolves the CA signer, loads + key-checks the issuer cert, and
 // generates the leaf keypair + serial — the shared front half of both commands.
-func prepareLeaf(ctx context.Context, keyPath, kmsKey, caCertPath, keyType string) (*leafContext, error) {
+func prepareLeaf(ctx context.Context, keyRef, caCertPath, keyType string) (*leafContext, error) {
 	if caCertPath == "" {
 		return nil, errors.New("--ca-cert (the issuer cert) is required; default is $CERTD_CA_X509_CERT_FILE")
 	}
-	sig, err := resolveCASigner(ctx, keyPath, kmsKey)
+	sig, err := resolveCASigner(ctx, keyRef)
 	if err != nil {
 		return nil, err
 	}
@@ -190,7 +189,7 @@ func prepareLeaf(ctx context.Context, keyPath, kmsKey, caCertPath, keyType strin
 	// The leaf chains to the issuer over the signing key — if --ca-cert isn't
 	// that key's cert, the chain won't verify.
 	if !publicKeysEqual(issuer.PublicKey, sig.Public()) {
-		return nil, errors.New("--ca-cert public key does not match the signing key (--key/--kms-key); the leaf would not chain")
+		return nil, errors.New("--ca-cert public key does not match the signing key (--key); the leaf would not chain")
 	}
 	pub, keyPEM, err := generateLeafKey(keyType)
 	if err != nil {

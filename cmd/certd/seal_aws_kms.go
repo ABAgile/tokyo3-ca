@@ -1,14 +1,12 @@
 // AWS KMS binding for the intermediate-key seal seam (seal.go). Wraps the
 // intermediate CA private key under a *symmetric* KMS key via Encrypt/Decrypt —
-// the counterpart to kms_aws.go's asymmetric signing client. Compiled in by
+// the counterpart to aws_kms.go's asymmetric signing client. Compiled in by
 // default for the same reason: KMS is the primary deployment target. Setting
-// CERTD_CA_SEAL_KMS_KEY (or --seal-kms-key) makes `ca issue-intermediate` seal
-// and `serve` unseal through this key, with the symmetric key never leaving the
-// HSM.
-//
-// To make KMS optional later, the same `//go:build awskms` tag that gates
-// kms_aws.go would gate this file — the registry indirection in seal.go keeps
-// that split a one-liner.
+// A bare CERTD_CA_SEAL_KEY (or --seal-key) — a KMS alias / uuid / arn, with no
+// recognised scheme prefix — routes here (the "aws" default in resolveSealer),
+// so `ca issue-intermediate` seals and `serve` unseals through this key with
+// the symmetric key never leaving the HSM. The dev "file:" scheme routes to the
+// local binding (seal_local.go) instead.
 
 package main
 
@@ -21,7 +19,7 @@ import (
 )
 
 func init() {
-	RegisterSealerFactory(func(ctx context.Context, keyRef string) (sealer, error) {
+	RegisterSealerFactory("aws", func(ctx context.Context, keyRef string) (sealer, error) {
 		cfg, err := config.LoadDefaultConfig(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("load AWS config: %w", err)

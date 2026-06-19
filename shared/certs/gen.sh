@@ -80,14 +80,14 @@ mkc_server() {
 # localhost + 127.0.0.1 keep the bare `curl https://localhost:8443/healthz` UX.
 mkc_server "traefik"      certd.localhost  localhost  127.0.0.1
 
-# ── certd's CA signing key (X.509 + SSH) ─────────────────────────────────────
-# One Ed25519 key signs everything certd issues: X.509/SPIFFE workload
-# certs AND SSH user/host certs (certd loads it as a crypto.Signer, then
-# wraps it for SSH). certd's CERTD_CA_KEY_FILE loader expects PKCS#8 PEM
-# (-----BEGIN PRIVATE KEY-----), so mint it with openssl — NOT
-# `ssh-keygen -t`, which emits the incompatible openssh-key-v1 envelope.
-# certd-signing.key.pub is the OpenSSH-format CA public key SSH hosts pin
-# via TrustedUserCAKeys; derive it from the private key with `ssh-keygen -y`.
+# ── certd's SSH CA signing key ───────────────────────────────────────────────
+# In two-tier mode this Ed25519 key signs SSH user/host certs ONLY — X.509 is
+# signed by the sealed intermediate (root.key / certd-x509-int.*, below), so
+# certd serve loads this purely as its SSH signer (CERTD_CA_KEY_FILE) and never
+# holds the root. certd's loader expects PKCS#8 PEM (-----BEGIN PRIVATE KEY-----),
+# so mint it with openssl — NOT `ssh-keygen -t`, which emits the incompatible
+# openssh-key-v1 envelope. certd-signing.key.pub is the OpenSSH-format CA public
+# key SSH hosts pin via TrustedUserCAKeys; derive it with `ssh-keygen -y`.
 #
 # Generated once; rotation invalidates every cert it ever signed (rarely
 # what you want for a dev rig). A pre-existing key in the wrong format
@@ -96,62 +96,94 @@ if [[ -f "$OUT/certd-signing.key" ]] && grep -q "BEGIN PRIVATE KEY" "$OUT/certd-
   step "certd-signing"
   skip "exists (PKCS#8) — delete certd-signing.key to rotate"
 else
-  step "certd-signing (CA key, PKCS#8)"
-  # Rotating the key invalidates everything it ever signed, including the
-  # X.509 issuer cert below — regenerate that too (rm forces it).
-  rm -f "$OUT/certd-signing.key" "$OUT/certd-signing.key.pub" "$OUT/certd-x509-ca.crt"
+  step "certd-signing (SSH CA key, PKCS#8)"
+  # SSH-only signer now (two-tier: X.509 is signed by the sealed intermediate,
+  # not this key). Rotating it only affects SSH certs.
+  rm -f "$OUT/certd-signing.key" "$OUT/certd-signing.key.pub"
   openssl genpkey -algorithm ed25519 -out "$OUT/certd-signing.key" >/dev/null 2>&1
   chmod 600 "$OUT/certd-signing.key"
   echo "$(ssh-keygen -y -f "$OUT/certd-signing.key") certd-user-ca" > "$OUT/certd-signing.key.pub"
   ok
 fi
 
-# ── certd's X.509 CA issuer cert (CERTD_CA_X509_CERT_FILE) ────────────────────
-# The PUBLIC trust anchor for every X.509/SPIFFE leaf certd issues: a
-# self-signed CA cert over the signing key above. Workloads doing mTLS put
-# THIS cert in their trust bundle to verify a peer whose leaf was issued by
-# certd — it is NOT ca.crt (that's mkcert's root, used only for certd's HTTPS
-# server cert + the agent's bootstrap cert) and NOT certd-signing.key.pub
-# (that's the OpenSSH-format SSH CA key). Same key, three public faces.
-#
-# certd, if started without CERTD_CA_X509_CERT_FILE, self-generates this at
-# boot and never persists it — fine until two certd-issued workloads must
-# verify each other across a certd restart. Persisting it here gives a stable
-# anchor. Generated once; regenerated only when the signing key rotated (the
-# rm above) — a fresh issuer cert over the SAME key still validates existing
-# leaves (chains verify against the key, not the exact cert bytes).
-if [[ -f "$OUT/certd-x509-ca.crt" ]]; then
-  step "certd-x509-ca"
-  skip "exists — delete certd-x509-ca.crt to regenerate"
-else
-  step "certd-x509-ca (issuer cert)"
-  openssl req -x509 -new -key "$OUT/certd-signing.key" -out "$OUT/certd-x509-ca.crt" \
-    -days 3650 -subj "/CN=tokyo3-ca" \
-    -addext "basicConstraints=critical,CA:TRUE,pathlen:0" \
-    -addext "keyUsage=critical,keyCertSign,cRLSign,digitalSignature" >/dev/null 2>&1
-  ok
-fi
-
-# ── Internal mTLS mesh certs (certd-issued, chain to certd-x509-ca.crt) ───────
-# Every cert below is signed by the CA key above, so the ONE anchor
-# certd-x509-ca.crt verifies them all — no per-channel CA bundle. They all go
-# through `certd ca issue-{server,workload}`: the SAME offline path production
-# uses to seed infra/workloads, built by the same x509engine the sign endpoint
-# uses, so dev and prod bootstrap share one code path. Issued offline so the
-# services that connect at boot (certd → NATS + Postgres) already hold a cert
-# the mesh trusts. Build certd once into the scratch dir and reuse it.
+# ── Build certd (the intermediate ceremony + issue-{server,workload} below) ──
+# Built once into a scratch dir and reused. issue-intermediate, issue-server and
+# issue-workload all run through this binary — the same offline path production
+# uses to seed the hierarchy + infra, built by the same x509engine the sign
+# endpoint uses, so dev and prod bootstrap share one code path.
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 REPO_ROOT="$(cd "$DIR/../.." && pwd)"
 CERTD_BIN="$TMP/certd"
-step "build certd (ca issue-*)"
+step "build certd (ca subcommands)"
 (cd "$REPO_ROOT" && go build -o "$CERTD_BIN" ./cmd/certd) >/dev/null 2>&1
 ok
+
+# ── Two-tier X.509 hierarchy: root + sealed intermediate (default) ───────────
+# The rig runs certd's two-tier mode BY DEFAULT (docs/two-tier-ca.md):
+#
+#   root.key            offline root key — signs the intermediate (and, for the
+#                       dev rig only, the static bootstrap leaves below). certd
+#                       serve NEVER loads it.
+#   certd-x509-ca.crt   self-signed ROOT (pathlen:1) — the ONE anchor every
+#                       consumer pins (POSTGRES_SSL_CA, NATS --tlscacert,
+#                       CERTD_API_CLIENT_CA, cert-agentd's bundle, traefik
+#                       backend CA). Same filename as the old single-tier issuer
+#                       so every consumer reference is unchanged — it just holds
+#                       the root now, not the issuer.
+#   seal.key            32-byte AES key sealing the intermediate private key.
+#                       DEV ONLY — a local key beside the ciphertext is not real
+#                       protection (certd logs a loud warning on use); production
+#                       uses a KMS seal key. Consumed via CERTD_CA_SEAL_KEY=file:.
+#   certd-x509-int.{crt,key.sealed}
+#                       the intermediate — cert (certd's CERTD_CA_X509_CERT_FILE,
+#                       what it signs leaves under) + AES-sealed key certd serve
+#                       unseals into memory at boot.
+#
+# Generated once (like the SSH key — rotating the root invalidates everything);
+# delete root.key to force a fresh hierarchy. certd-signing.key stays the
+# separate SSH CA key, so certd serve never holds the root.
+if [[ -f "$OUT/root.key" && -f "$OUT/certd-x509-ca.crt" && -f "$OUT/seal.key" && -f "$OUT/certd-x509-int.key.sealed" ]]; then
+  step "two-tier root+intermediate"
+  skip "exist — delete root.key to rotate"
+else
+  rm -f "$OUT/root.key" "$OUT/certd-x509-ca.crt" "$OUT/seal.key" \
+        "$OUT/certd-x509-int.crt" "$OUT/certd-x509-int.key.sealed"
+  step "root.key + certd-x509-ca.crt (self-signed root, pathlen:1)"
+  openssl genpkey -algorithm ed25519 -out "$OUT/root.key" >/dev/null 2>&1
+  chmod 600 "$OUT/root.key"
+  openssl req -x509 -new -key "$OUT/root.key" -out "$OUT/certd-x509-ca.crt" \
+    -days 3650 -subj "/CN=tokyo3-ca root" \
+    -addext "basicConstraints=critical,CA:TRUE,pathlen:1" \
+    -addext "keyUsage=critical,keyCertSign,cRLSign" >/dev/null 2>&1
+  ok
+  step "seal.key (local AES-256 seal — DEV ONLY)"
+  openssl rand -out "$OUT/seal.key" 32 >/dev/null 2>&1
+  chmod 600 "$OUT/seal.key"
+  ok
+  step "certd-x509-int (intermediate, root-signed + sealed)"
+  "$CERTD_BIN" ca issue-intermediate \
+    --root-key "file:$OUT/root.key" --root-cert "$OUT/certd-x509-ca.crt" \
+    --seal-key "file:$OUT/seal.key" \
+    --out-cert "$OUT/certd-x509-int.crt" \
+    --out-sealed-key "$OUT/certd-x509-int.key.sealed" --force >/dev/null 2>&1
+  ok
+fi
+
+# ── Internal mTLS mesh certs (bootstrap, root-signed) ────────────────────────
+# Issued offline so the services that connect at boot (certd → NATS + Postgres)
+# already hold a trusted cert. For the dev rig these STATIC bootstrap leaves are
+# signed directly by the root (root.key) — it's a local file here, so this skips
+# needing the sealed intermediate's plaintext key offline. They are leaf-only
+# and chain straight to certd-x509-ca.crt (the root anchor). The certs certd
+# issues at RUNTIME (cert-agentd renewals, authd workloads) are signed by the
+# unsealed INTERMEDIATE and presented as leaf+intermediate — both validate
+# against the same root anchor every consumer pins.
 
 # issue_server NAME DNS... — TLS server cert (DNS SANs + loopback IP, serverAuth).
 issue_server() {
   local name=$1; shift
   step "$name (issue-server)"
-  local args=(ca issue-server --ca-cert "$OUT/certd-x509-ca.crt" --key "$OUT/certd-signing.key"
+  local args=(ca issue-server --ca-cert "$OUT/certd-x509-ca.crt" --key "file:$OUT/root.key"
     --out-cert "$OUT/$name.crt" --out-key "$OUT/$name.key" --ip 127.0.0.1 --force)
   for d in "$@"; do args+=(--dns "$d"); done
   "$CERTD_BIN" "${args[@]}" >/dev/null 2>&1
@@ -163,7 +195,7 @@ issue_workload() {
   local name=$1 spiffe=$2 cn=${3:-}
   step "$name (issue-workload)"
   local args=(ca issue-workload --spiffe-uri "$spiffe" --key-type ed25519
-    --ca-cert "$OUT/certd-x509-ca.crt" --key "$OUT/certd-signing.key"
+    --ca-cert "$OUT/certd-x509-ca.crt" --key "file:$OUT/root.key"
     --out-cert "$OUT/$name.crt" --out-key "$OUT/$name.key" --force)
   [[ -n "$cn" ]] && args+=(--cn "$cn")
   "$CERTD_BIN" "${args[@]}" >/dev/null 2>&1

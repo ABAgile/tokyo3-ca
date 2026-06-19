@@ -35,7 +35,7 @@ func caCmd() *cobra.Command {
 // ── certd ca bootstrap ──────────────────────────────────────────────────────
 
 func caBootstrapCmd() *cobra.Command {
-	var keyPath, kmsKey, cn, out string
+	var keyRef, cn, out string
 	var force bool
 	c := &cobra.Command{
 		Use:   "bootstrap",
@@ -45,7 +45,7 @@ func caBootstrapCmd() *cobra.Command {
 			"The signing key never leaves its store (file or KMS); this performs exactly one " +
 			"signature. Run once per CA generation; commit the result to config management.",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			sig, err := resolveCASigner(cmd.Context(), keyPath, kmsKey)
+			sig, err := resolveCASigner(cmd.Context(), keyRef)
 			if err != nil {
 				return err
 			}
@@ -56,8 +56,7 @@ func caBootstrapCmd() *cobra.Command {
 			return writeCertPEM(out, cert, force)
 		},
 	}
-	c.Flags().StringVar(&keyPath, "key", os.Getenv("CERTD_CA_KEY_FILE"), "CA signing key (PKCS#8 PEM); default $CERTD_CA_KEY_FILE")
-	c.Flags().StringVar(&kmsKey, "kms-key", os.Getenv("CERTD_CA_KMS_KEY"), "KMS key reference (ARN / resource name); default $CERTD_CA_KMS_KEY. Wins over --key")
+	c.Flags().StringVar(&keyRef, "key", os.Getenv("CERTD_CA_KEY"), "CA signing key: file:<path> for a PKCS#8 PEM, or a KMS key ref (ARN / resource name); default $CERTD_CA_KEY")
 	c.Flags().StringVar(&cn, "cn", "tokyo3-ca", "Subject CommonName for the issuer cert")
 	c.Flags().StringVar(&out, "out", os.Getenv("CERTD_CA_X509_CERT_FILE"), "Output path; default $CERTD_CA_X509_CERT_FILE, or stdout if empty")
 	c.Flags().BoolVar(&force, "force", false, "Overwrite --out if it already exists")
@@ -67,14 +66,14 @@ func caBootstrapCmd() *cobra.Command {
 // ── certd ca rotate ─────────────────────────────────────────────────────────
 
 func caRotateCmd() *cobra.Command {
-	var newKeyPath, newKMSKey, cn, out, bundleOut string
+	var newKeyRef, cn, out, bundleOut string
 	var oldCerts []string
 	var force bool
 	c := &cobra.Command{
 		Use:   "rotate",
 		Short: "Mint a new issuer cert from a new signing key and emit an overlap trust bundle",
 		Long: "Key rotation is the disruptive case: leaves signed by the new key only validate " +
-			"against the new issuer cert. Mint the new issuer cert from --key or --kms-key, then " +
+			"against the new issuer cert. Mint the new issuer cert from --key, then " +
 			"write a trust bundle (--bundle-out) concatenating the old issuer cert(s) (--old) with " +
 			"the new one. Distribute the bundle to every consumer BEFORE cutting issuance over to " +
 			"the new key; once all old-key leaves have expired, drop the old cert with " +
@@ -82,13 +81,13 @@ func caRotateCmd() *cobra.Command {
 			"Rotating the issuer cert over the SAME key needs no bundle — `certd ca bootstrap " +
 			"--force` re-mints it and existing leaves still validate (chains verify against the key).",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			if newKeyPath == "" && newKMSKey == "" {
-				return errors.New("the new signing key is required: pass --key or --kms-key")
+			if newKeyRef == "" {
+				return errors.New("the new signing key is required: pass --key (file:<path> or a KMS key ref)")
 			}
 			if out == "" {
 				return errors.New("--out (the new issuer cert path) is required")
 			}
-			sig, err := resolveCASigner(cmd.Context(), newKeyPath, newKMSKey)
+			sig, err := resolveCASigner(cmd.Context(), newKeyRef)
 			if err != nil {
 				return err
 			}
@@ -116,8 +115,7 @@ func caRotateCmd() *cobra.Command {
 			return writeBundle(bundleOut, pemParts, force)
 		},
 	}
-	c.Flags().StringVar(&newKeyPath, "key", "", "New CA signing key (PKCS#8 PEM) to rotate to (--key or --kms-key required)")
-	c.Flags().StringVar(&newKMSKey, "kms-key", "", "New KMS key reference to rotate to; wins over --key")
+	c.Flags().StringVar(&newKeyRef, "key", "", "New CA signing key to rotate to (required): file:<path> for a PKCS#8 PEM, or a KMS key ref")
 	c.Flags().StringVar(&cn, "cn", "tokyo3-ca", "Subject CommonName for the new issuer cert")
 	c.Flags().StringVar(&out, "out", "", "Output path for the new issuer cert (required)")
 	c.Flags().StringArrayVar(&oldCerts, "old", nil, "Existing issuer cert(s) to keep in the overlap bundle (repeatable)")

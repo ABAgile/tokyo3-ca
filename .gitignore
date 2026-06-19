@@ -44,3 +44,4 @@ shared/certs/*.crt
 shared/certs/*.key
 shared/certs/*.pub
 shared/certs/*.srl
+shared/certs/*.sealed

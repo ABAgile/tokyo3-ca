@@ -14,7 +14,7 @@ Unset ⇒ the in-memory/file path (dev default). Implemented under
   own bundles, on-disk cert serial) is separate local state on each agent
   host, not this DB.
 - **No private key material in this DB, ever.** The CA signing key lives in
-  `CERTD_CA_KEY_FILE` / KMS (`RemoteSigner`); issued leaf keys never reach
+  `CERTD_CA_KEY` (file: or KMS, `RemoteSigner`); issued leaf keys never reach
   certd. This DB holds policy + registries + revocation + the active-cert
   anti-rollback state. (Stated as a header comment in the migrations so
   nobody adds a `private_key` column.)

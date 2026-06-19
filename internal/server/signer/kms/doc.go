@@ -1,9 +1,9 @@
 package kms
 
 // Bindings adapt a cloud KMS SDK to [Client]. The AWS KMS binding ships
-// in-repo at cmd/certd/kms_aws.go and is compiled in by default (KMS is
+// in-repo at cmd/certd/aws_kms.go and is compiled in by default (KMS is
 // the primary deployment target); it registers itself into certd's
-// signer seam so CERTD_CA_KMS_KEY just works on the stock binary. The
+// signer seam so a KMS CERTD_CA_KEY ref just works on the stock binary. The
 // Algorithm string values match AWS SigningAlgorithmSpec, so that
 // binding is a cast rather than a mapping table.
 //

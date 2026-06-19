@@ -103,15 +103,20 @@ slots into the same shape):
 ```
 shared/
   certs/
-    gen.sh                # mkcert + openssl + ssh-keygen + certd ca issue-{server,workload}
+    gen.sh                # mkcert + openssl + ssh-keygen + certd ca issue-{intermediate,server,workload}
     ca.crt                # mkcert root — anchors the traefik edge cert only
     traefik.{crt,key}     # traefik host-facing edge cert (mkcert-signed)
-    certd.{crt,key}       # certd HTTPS API server cert (certd-issued)
-    certd-signing.key     # CA signing key, PKCS#8 PEM (signs X.509 + SSH)
-    certd-signing.key.pub # OpenSSH-format CA pubkey (TrustedUserCAKeys)
-    certd-x509-ca.crt     # X.509 issuer → CERTD_CA_X509_CERT_FILE; the ONE
-                          #   internal-mTLS CA — every cert below chains to it
-    nats.{crt,key}        # NATS TLS server cert (certd-issued)
+    certd.{crt,key}       # certd HTTPS API server cert (root-signed bootstrap leaf)
+    certd-signing.key     # SSH CA signing key, PKCS#8 PEM (SSH certs only)
+    certd-signing.key.pub # OpenSSH-format SSH CA pubkey (TrustedUserCAKeys)
+    root.key              # two-tier ROOT key — signs the intermediate + bootstrap
+                          #   leaves offline; certd serve never loads it
+    certd-x509-ca.crt     # self-signed ROOT (pathlen:1) → CERTD_CA_ROOT_CERT_FILE;
+                          #   the ONE anchor every consumer pins
+    seal.key              # 32-byte AES key sealing the intermediate (DEV ONLY)
+    certd-x509-int.crt    # intermediate issuer → CERTD_CA_X509_CERT_FILE
+    certd-x509-int.key.sealed  # intermediate key, AES-sealed; unsealed at boot
+    nats.{crt,key}        # NATS TLS server cert (root-signed bootstrap leaf)
     postgres.{crt,key}    # postgres TLS server cert (certd-issued)
     certd-nats.{crt,key}  # certd's NATS publisher client cert (certd-issued)
     certd-db.{crt,key}    # certd's Postgres client cert, CN=certd (certd-issued)
@@ -172,27 +177,31 @@ safely reload a rotating pair. Both `roles.json` and `principals.json`
 *seed* the Postgres store on first boot. OIDC stays off (no human
 callers in the rig); production layers it on alongside the mTLS path.
 
-**One internal CA, plus two edge anchors.** Every internal mTLS link
+**One root anchor, plus two edge anchors.** Every internal mTLS link
 — certd ⇄ Postgres, certd ⇄ NATS, cert-agentd ⇄ NATS, and all provisioned
-workload certs — uses a **single** anchor, `certd-x509-ca.crt`, for both
-server and client certs. There is no per-channel CA and no bundle. The
-other two artifacts each have exactly one narrow job:
+workload certs — verifies against a **single** anchor, `certd-x509-ca.crt`,
+for both server and client certs. There is no per-channel CA and no bundle.
+The rig runs certd's **two-tier hierarchy by default** (see the callout
+below), so that one anchor is now the **root**:
 
-- `certd-x509-ca.crt` — certd's **X.509 issuer cert** (`CERTD_CA_X509_CERT_FILE`). The ONE CA for the internal mesh: NATS's `--tlscacert`, Postgres's `ssl_ca_file`, and every client's server-verify CA all point here. The nats/postgres *server* certs chain to it too, so it works in both directions. `gen.sh` mints every mesh cert offline via `certd ca issue-server` (DNS SANs for the nats/postgres listeners) and `certd ca issue-workload` (SPIFFE SVIDs for certd's own, natsbox's, and cert-agentd's client identities) — the same code path production uses to seed infra/workloads — so they chain here from first boot.
+- `certd-x509-ca.crt` — the self-signed **root** (pathlen:1), the ONE anchor consumers pin: NATS's `--tlscacert`, Postgres's `ssl_ca_file`, `CERTD_API_CLIENT_CA`, cert-agentd's bundle, and traefik's backend CA all point here. certd signs X.509 leaves with a sealed **intermediate** (`certd-x509-int.crt` = `CERTD_CA_X509_CERT_FILE`) that chains to this root, and presents leaves as leaf+intermediate; the nats/postgres *server* certs chain here too, so it works in both directions. `gen.sh` mints the root + intermediate offline, then issues the static bootstrap mesh certs (server/workload) directly under the root — the runtime certs certd issues (cert-agentd renewals, authd workloads) are intermediate-signed. Both validate to this same root, which is the only file any consumer references (the filename is unchanged from the old single-tier issuer, so nothing downstream moved).
 - `ca.crt` — mkcert root. Anchors the **traefik host-facing edge cert** (`traefik.crt`) only. traefik publishes `:8443` to the host and terminates TLS with that mkcert cert (whose SANs cover `certd.localhost` — the portal vhost the router Host-matches — plus `localhost`/`127.0.0.1`, so both `curl https://localhost:8443` and the browser portal trust it with no `--cacert`), then re-encrypts to certd over the internal CA. mkcert no longer touches certd's own listener cert — that's certd-issued now and chains to `certd-x509-ca.crt` like every other mesh cert, so cert-agentd (which reaches certd directly, bypassing traefik) verifies it with the same single anchor. The mkcert root is *not* used for any internal link and stays out of cert-agentd's `/certs` volume. **Why edge-terminate only here:** certd's sign API is mTLS; terminating it at traefik would strip the caller's client cert and break SAN→principal auth, so machine traffic never transits the edge.
 - `certd-signing.key.pub` — OpenSSH-format **SSH CA** pubkey (`TrustedUserCAKeys`). SSH world only; never goes in a TLS trust bundle.
 
-> **Optional two-tier CA.** The single anchor above is the default and what this
-> rig uses. certd can instead run a two-tier X.509 hierarchy — an offline root
-> signing a short-lived, KMS-sealed **intermediate** that certd unseals into
-> memory and signs leaves with — so the root key never sits on the online
-> issuance path. Consumers then pin the **root** (`CERTD_CA_ROOT_CERT_FILE`) and
-> each leaf carries the intermediate in its chain. Opt in with
-> `CERTD_CA_SEALED_KEY_FILE` + `CERTD_CA_SEAL_KMS_KEY` + `CERTD_CA_ROOT_CERT_FILE`;
-> it needs KMS for the seal, so this docker rig stays single-tier. SSH gains a
-> matching pollable CA-key set (`GET /api/v1/ssh/ca-keys`,
-> `CERTD_SSH_CA_KEYS_FILE`). See [docs/two-tier-ca.md](docs/two-tier-ca.md) and
-> OPERATIONS.md §3.
+> **Two-tier CA (rig default).** certd runs a two-tier X.509 hierarchy — an
+> offline root (`root.key`, used only by `gen.sh`) signs a short-lived
+> **intermediate** whose key is sealed; certd unseals it into memory at boot and
+> signs leaves with it, so the root key never sits on the online issuance path.
+> Consumers pin the **root** (`CERTD_CA_ROOT_CERT_FILE` = `certd-x509-ca.crt`)
+> and each runtime leaf carries the intermediate in its chain. Wired via
+> `CERTD_CA_SEALED_KEY_FILE` + `CERTD_CA_SEAL_KEY` + `CERTD_CA_ROOT_CERT_FILE`.
+> **The seal is the one dev shortcut:** `CERTD_CA_SEAL_KEY=file:/shared/certs/seal.key`
+> uses a local AES-256 key (certd logs a loud warning) instead of KMS — the key
+> sits beside the ciphertext, so it's not real protection; production sets
+> `CERTD_CA_SEAL_KEY` to a KMS key ref. SSH keeps its own signer
+> (`certd-signing.key`) and gains a matching pollable CA-key set
+> (`GET /api/v1/ssh/ca-keys`, `CERTD_SSH_CA_KEYS_FILE`). See
+> [docs/two-tier-ca.md](docs/two-tier-ca.md) and OPERATIONS.md §3.
 
 Watch it work:
 

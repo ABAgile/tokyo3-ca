@@ -243,8 +243,8 @@ clean:
 clean-all: clean
 	docker compose down -v --remove-orphans 2>/dev/null || true
 	docker volume rm $(SHARED_VOLUME) $(AGENT_STATE_VOLUME) 2>/dev/null || true
-	rm -f shared/certs/*.crt shared/certs/*.key shared/certs/*.pub shared/certs/*.srl
-	@echo "  removed shared/certs/*.{crt,key,pub,srl} + named volumes"
+	rm -f shared/certs/*.crt shared/certs/*.key shared/certs/*.pub shared/certs/*.srl shared/certs/*.sealed
+	@echo "  removed shared/certs/*.{crt,key,pub,srl,sealed} + named volumes"
 
 # ── Help ──────────────────────────────────────────────────────────────────────
 

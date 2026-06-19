@@ -32,11 +32,16 @@
 #       ca.crt              # mkcert root — anchors the traefik edge cert only
 #       traefik.{crt,key}   # traefik host-facing edge cert (mkcert-signed)
 #       certd.{crt,key}     # certd HTTPS API server cert (certd-issued)
-#       certd-signing.key   # certd CA signing key, PKCS#8 PEM (X.509 + SSH)
-#       certd-signing.key.pub   # OpenSSH-format CA pubkey (TrustedUserCAKeys)
-#       certd-x509-ca.crt   # certd X.509 issuer — the ONE internal-mTLS CA;
-#                           #   every cert below is signed by it (gen.sh, offline)
-#       nats.{crt,key}      # NATS TLS server cert (certd-issued)
+#       certd-signing.key   # SSH CA signing key, PKCS#8 PEM (SSH certs only)
+#       certd-signing.key.pub   # OpenSSH-format SSH CA pubkey (TrustedUserCAKeys)
+#       root.key            # two-tier ROOT key — signs the intermediate +
+#                           #   bootstrap leaves offline; certd serve never loads it
+#       certd-x509-ca.crt   # self-signed ROOT (pathlen:1) — the ONE anchor every
+#                           #   consumer pins (filename kept from the single-tier issuer)
+#       seal.key            # 32-byte AES key sealing the intermediate (DEV ONLY)
+#       certd-x509-int.crt  # intermediate issuer cert — CERTD_CA_X509_CERT_FILE
+#       certd-x509-int.key.sealed   # intermediate key, AES-sealed; unsealed at boot
+#       nats.{crt,key}      # NATS TLS server cert (root-signed bootstrap leaf)
 #       postgres.{crt,key}  # postgres TLS server cert (certd-issued)
 #       certd-nats.{crt,key}    # certd's NATS publisher client cert (certd-issued)
 #       certd-db.{crt,key}  # certd's Postgres client cert, CN=certd (certd-issued)
@@ -305,15 +310,30 @@ services:
       # consulted. cert-agentd's bootstrap AND renewed certs both carry that
       # SAN (see gen.sh), so it authenticates as the same principal throughout.
       # principals.json seeds the DB on first boot, same as roles.json.
+      # The anchor (certd-x509-ca.crt) is now the two-tier ROOT — see gen.sh.
+      # Consumers (this, NATS, Postgres, cert-agentd, traefik) all still pin this
+      # one file; it just holds the root instead of the old single-tier issuer.
       CERTD_API_CLIENT_CA: /shared/certs/certd-x509-ca.crt
-      CERTD_CA_KEY_FILE: /shared/certs/certd-signing.key
-      # Persistent X.509 issuer cert (self-signed over the signing key).
-      # Without it certd self-generates an EPHEMERAL issuer at boot, so
-      # certd-issued leaves stop chain-validating across a certd restart.
-      # This is the trust anchor workloads verify certd-issued peers against —
-      # and now certd's OWN listener cert chains here too (issue-server'd, no
-      # longer mkcert). ca.crt (mkcert root) only anchors the traefik edge cert.
-      CERTD_CA_X509_CERT_FILE: /shared/certs/certd-x509-ca.crt
+      # SSH CA signing key ONLY now (two-tier splits the signers): SSH user/host
+      # certs sign with this; X.509 leaves sign with the unsealed intermediate
+      # below. certd serve therefore never holds the root key (root.key, which
+      # gen.sh used offline to sign the intermediate + bootstrap leaves).
+      # CERTD_CA_KEY is one scheme-tagged ref: file:<path> for a PKCS#8 PEM, or a
+      # bare KMS key ref (ARN / alias) for a KMS-backed signer.
+      CERTD_CA_KEY: file:/shared/certs/certd-signing.key
+      # ── Two-tier X.509 issuance (default in this rig; docs/two-tier-ca.md) ──
+      # CERTD_CA_X509_CERT_FILE is the INTERMEDIATE cert certd signs leaves under
+      # (no longer the anchor). Its key is sealed (certd-x509-int.key.sealed) and
+      # unsealed into memory at boot via CERTD_CA_SEAL_KEY — here a local AES key
+      # file (file: scheme, DEV ONLY: certd logs a loud warning; prod uses KMS).
+      # CERTD_CA_ROOT_CERT_FILE is the root certd chain-verifies the intermediate
+      # against at boot (fail-closed). It's also the anchor served at
+      # /api/v1/x509/trust-bundle — CERTD_CA_TRUST_BUNDLE defaults to the root when
+      # set, so consumers pull the root (not the intermediate); no explicit pin needed.
+      CERTD_CA_X509_CERT_FILE: /shared/certs/certd-x509-int.crt
+      CERTD_CA_SEALED_KEY_FILE: /shared/certs/certd-x509-int.key.sealed
+      CERTD_CA_SEAL_KEY: file:/shared/certs/seal.key
+      CERTD_CA_ROOT_CERT_FILE: /shared/certs/certd-x509-ca.crt
       # NATS over mTLS (the server requires --tlsverify). certd connects at
       # BOOT to publish audit + ship logs. Its publisher cert (certd-nats.crt)
       # is certd-issued (self-issued offline by gen.sh, before any runtime

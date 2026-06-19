@@ -1,7 +1,7 @@
 // AWS KMS binding for the CA signing key. KMS is the primary deployment
-// target, so this is compiled in by DEFAULT: setting CERTD_CA_KMS_KEY
-// (or --kms-key) to a KMS key id / ARN makes both `certd serve` and
-// `certd ca` sign through KMS, with the private key never leaving the
+// target, so this is compiled in by DEFAULT: setting CERTD_CA_KEY
+// (or --key) to a KMS key id / ARN (i.e. a non-file: ref) makes both
+// `certd serve` and `certd ca` sign through KMS, with the key never leaving the
 // HSM. The cost is ~+4.4 MiB of binary (the AWS SDK + credential chain).
 //
 // This is the ONLY file that imports the AWS SDK, by design: to make KMS

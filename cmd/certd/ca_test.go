@@ -90,7 +90,7 @@ func TestWriteBundle_ConcatenatesInOrder(t *testing.T) {
 }
 
 func TestResolveCASigner_RequiresSource(t *testing.T) {
-	if _, err := resolveCASigner(context.Background(), "", ""); err == nil {
+	if _, err := resolveCASigner(context.Background(), ""); err == nil {
 		t.Fatal("resolveCASigner with no key source should error")
 	}
 }
@@ -101,7 +101,7 @@ func TestResolveCASigner_KMSWithoutBinding(t *testing.T) {
 	if kmsClientFactory != nil {
 		t.Skip("a KMS binding is registered in this build")
 	}
-	_, err := resolveCASigner(context.Background(), "", "arn:aws:kms:...:key/abc")
+	_, err := resolveCASigner(context.Background(), "arn:aws:kms:...:key/abc")
 	if err == nil || !strings.Contains(err.Error(), "no KMS binding") {
 		t.Fatalf("err = %v, want 'no KMS binding compiled in'", err)
 	}

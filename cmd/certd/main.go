@@ -55,17 +55,16 @@
 //	               leaving it to the DSN's sslmode. The leaf is re-read per handshake and the CA
 //	               pool on mtime, so a rotation lands on the next pool dial without a restart.
 //
-//	CERTD_CA_KEY_FILE        PKCS#8-encoded Ed25519 private key PEM path — the CA signing key
-//	                         used for BOTH SSH user/host certs and X.509/SPIFFE workload certs
-//	                         (one key: wrapped for SSH, used directly for X.509). When unset
-//	                         (and CERTD_CA_KMS_KEY also unset), certd generates an ephemeral key
-//	                         at startup — dev only; certs are invalidated on every restart.
-//	CERTD_CA_KMS_KEY         KMS key reference (ARN / GCP resource name / Vault key path) for a
-//	                         CA key that never leaves the HSM. Takes precedence over
-//	                         CERTD_CA_KEY_FILE. The AWS KMS binding (cmd/certd/kms_aws.go) is
-//	                         compiled in by default, so this works on the stock binary; other
-//	                         backends register via RegisterKMSClientFactory (see
-//	                         internal/server/signer/kms). The same var drives `certd ca`.
+//	CERTD_CA_KEY             The CA signing key, as one scheme-tagged reference:
+//	                         "file:<path>" loads a PKCS#8 Ed25519 PEM; anything else is a KMS key
+//	                         ref (ARN / GCP resource name / Vault key path) for a key that never
+//	                         leaves the HSM. In single-tier this signs BOTH SSH and X.509; in
+//	                         two-tier it signs SSH only (X.509 uses the sealed intermediate). The
+//	                         AWS KMS binding (cmd/certd/aws_kms.go) is compiled in by default, so a
+//	                         KMS ref works on the stock binary; other backends register via
+//	                         RegisterKMSClientFactory (see internal/server/signer/kms). The same
+//	                         var drives `certd ca`. Unset ⇒ certd generates an ephemeral key at
+//	                         startup — dev only; certs are invalidated on every restart.
 //	CERTD_CA_X509_CERT_FILE  X.509-only issuer cert for the workload/SPIFFE certs signed by that
 //	                         key. SSH needs no issuer cert — clients trust the key's public half
 //	                         via TrustedUserCAKeys. When unset, certd self-signs one at startup
@@ -76,19 +75,22 @@
 //	                         old issuer + logged) — a signing-KEY rotation still needs a restart.
 //	CERTD_CA_TRUST_BUNDLE    PEM served as-is at GET /api/v1/x509/trust-bundle so workloads can
 //	                         pull the current trust anchor (old⊕new during a rotation overlap).
-//	                         Defaults to CERTD_CA_X509_CERT_FILE; read per request; unauthenticated
-//	                         (CA certs are public). Empty ⇒ the endpoint returns 503.
+//	                         Defaults to CERTD_CA_ROOT_CERT_FILE (the two-tier anchor) when set,
+//	                         else CERTD_CA_X509_CERT_FILE (the single-tier issuer = anchor); read
+//	                         per request; unauthenticated (CA certs are public). Empty ⇒ 503.
 //	CERTD_CA_X509_CERT_CN    Subject CN for the self-signed startup CA cert. Default
 //	                         "tokyo3-ca".
 //
-//	CERTD_CA_SEALED_KEY_FILE Base64 KMS-ciphertext of the X.509 intermediate's PKCS#8 private key
+//	CERTD_CA_SEALED_KEY_FILE Base64 seal-ciphertext of the X.509 intermediate's PKCS#8 private key
 //	                         (produced by `certd ca issue-intermediate`). When set (with
-//	                         CERTD_CA_SEAL_KMS_KEY), certd unseals it into memory at boot and signs
+//	                         CERTD_CA_SEAL_KEY), certd unseals it into memory at boot and signs
 //	                         X.509 leaves with the intermediate — so the asymmetric ROOT key stays
-//	                         offline. SSH keeps signing with CERTD_CA_KEY_FILE/KMS. Unset ⇒
+//	                         offline. SSH keeps signing with CERTD_CA_KEY. Unset ⇒
 //	                         single-tier: X.509 signs with the same key as SSH.
-//	CERTD_CA_SEAL_KMS_KEY    Symmetric KMS key reference that wraps the sealed intermediate key
-//	                         (Decrypt at boot). Required iff CERTD_CA_SEALED_KEY_FILE is set.
+//	CERTD_CA_SEAL_KEY        Seal key that wraps the sealed intermediate key (Decrypt at boot).
+//	                         A bare KMS key ref (alias / uuid / arn) uses KMS; "file:<path>" uses a
+//	                         local AES-256 key (DEV ONLY — logs a loud warning). Required iff
+//	                         CERTD_CA_SEALED_KEY_FILE is set.
 //	CERTD_CA_ROOT_CERT_FILE  Root cert PEM (the trust anchor consumers pin). When set, certd
 //	                         verifies at boot that CERTD_CA_X509_CERT_FILE (the intermediate)
 //	                         chains to it and is in-validity, failing closed otherwise, and warns
@@ -406,20 +408,24 @@ func runServe(ctx context.Context) error {
 		X509Signer:       x509Signer,
 		X509IssuerCert:   x509IssuerCert,
 		X509IssuerReload: x509IssuerReload,
-		TrustBundlePath:  envutil.Or("CERTD_CA_TRUST_BUNDLE", os.Getenv("CERTD_CA_X509_CERT_FILE")),
-		SSHCAKeysPath:    os.Getenv("CERTD_SSH_CA_KEYS_FILE"),
-		Policy:           policyEngine,
-		OIDCVerifier:     oidcVerifier,
-		MTLSStore:        mtlsStore,
-		Audit:            auditSink,
-		AuditSource:      auditSrc,
-		Portal:           portalSrv,
-		KRL:              krlStore,
-		ActiveCertStore:  activeCerts,
-		RateLimitRPS:     rlRPS,
-		RateLimitBurst:   rlBurst,
-		TrustedProxies:   trustedProxies,
-		Version:          Version,
+		// Anchor served at /api/v1/x509/trust-bundle: explicit override, else the
+		// anchor consumers pin — the ROOT in two-tier (CERTD_CA_ROOT_CERT_FILE),
+		// the issuer in single-tier (CERTD_CA_X509_CERT_FILE). Defaulting to the
+		// intermediate would make pull-based consumers anchor it instead of the root.
+		TrustBundlePath: envutil.First("CERTD_CA_TRUST_BUNDLE", "CERTD_CA_ROOT_CERT_FILE", "CERTD_CA_X509_CERT_FILE"),
+		SSHCAKeysPath:   os.Getenv("CERTD_SSH_CA_KEYS_FILE"),
+		Policy:          policyEngine,
+		OIDCVerifier:    oidcVerifier,
+		MTLSStore:       mtlsStore,
+		Audit:           auditSink,
+		AuditSource:     auditSrc,
+		Portal:          portalSrv,
+		KRL:             krlStore,
+		ActiveCertStore: activeCerts,
+		RateLimitRPS:    rlRPS,
+		RateLimitBurst:  rlBurst,
+		TrustedProxies:  trustedProxies,
+		Version:         Version,
 	})
 	if err != nil {
 		return fmt.Errorf("api server: %w", err)
@@ -654,34 +660,33 @@ func versionCmd() *cobra.Command {
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 // loadCASigner returns the CA signing primitive via the shared signer
-// seam (resolveCASigner): CERTD_CA_KMS_KEY selects a KMS-backed key
-// (needs a KMS-bound build), CERTD_CA_KEY_FILE a PKCS#8 Ed25519 PEM
-// file. When neither is set, certd generates an ephemeral keypair and
-// warns that issued certs won't survive a restart.
+// seam (resolveCASigner): CERTD_CA_KEY is one scheme-tagged ref — "file:<path>"
+// for a PKCS#8 Ed25519 PEM, or a KMS key ref (ARN / resource name) for a
+// KMS-backed key (needs a KMS-bound build). When unset, certd generates an
+// ephemeral keypair and warns that issued certs won't survive a restart.
 func loadCASigner(ctx context.Context, log *slog.Logger) (signer.Signer, error) {
-	keyPath := os.Getenv("CERTD_CA_KEY_FILE")
-	kmsKey := os.Getenv("CERTD_CA_KMS_KEY")
-	if keyPath == "" && kmsKey == "" {
-		log.Warn("CERTD_CA_KEY_FILE / CERTD_CA_KMS_KEY unset — generating ephemeral CA key (not for production)")
+	keyRef := os.Getenv("CERTD_CA_KEY")
+	if keyRef == "" {
+		log.Warn("CERTD_CA_KEY unset — generating ephemeral CA key (not for production)")
 		return signer.NewEphemeralEd25519()
 	}
-	return resolveCASigner(ctx, keyPath, kmsKey)
+	return resolveCASigner(ctx, keyRef)
 }
 
 // loadX509Signer returns the signer certd uses for X.509 leaf issuance. When a
 // sealed intermediate key is configured (CERTD_CA_SEALED_KEY_FILE +
-// CERTD_CA_SEAL_KMS_KEY), it is unsealed into memory and returned — so the
+// CERTD_CA_SEAL_KEY), it is unsealed into memory and returned — so the
 // asymmetric root key never touches the online issuance path and certd signs
 // leaves with the intermediate. Otherwise X.509 falls back to caSigner
 // (single-tier: one key signs both SSH and X.509).
 func loadX509Signer(ctx context.Context, log *slog.Logger, caSigner signer.Signer) (signer.Signer, error) {
 	sealedPath := os.Getenv("CERTD_CA_SEALED_KEY_FILE")
-	sealKey := os.Getenv("CERTD_CA_SEAL_KMS_KEY")
+	sealKey := os.Getenv("CERTD_CA_SEAL_KEY")
 	if sealedPath == "" && sealKey == "" {
 		return caSigner, nil // single-tier
 	}
 	if sealedPath == "" || sealKey == "" {
-		return nil, errors.New("two-tier X.509 needs both CERTD_CA_SEALED_KEY_FILE and CERTD_CA_SEAL_KMS_KEY (one is set, the other is not)")
+		return nil, errors.New("two-tier X.509 needs both CERTD_CA_SEALED_KEY_FILE and CERTD_CA_SEAL_KEY (one is set, the other is not)")
 	}
 	raw, err := os.ReadFile(sealedPath)
 	if err != nil {

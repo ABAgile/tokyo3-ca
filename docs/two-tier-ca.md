@@ -1,6 +1,6 @@
 # Design: two-tier X.509 CA (offline root + sealed intermediate) and SSH CA rotation
 
-- **Status:** proposed (design only — no code yet)
+- **Status:** implemented — and the default in the docker rig (local `file:` seal; production uses a KMS seal key)
 - **Date:** 2026-06-07
 - **Scope:** `certd` X.509 issuance hierarchy + `cert-agentd` trust distribution; SSH CA key distribution.
 - **Related:** [OPERATIONS.md](../OPERATIONS.md) §2–4, [THREAT_MODEL.md](../THREAT_MODEL.md),
@@ -128,11 +128,11 @@ The **anti-theft / active-cert guard** is already chain-agnostic (keys on the SP
 | Env (certd) | Meaning |
 |---|---|
 | `CERTD_CA_SEALED_KEY_FILE` | Ciphertext of the intermediate's PKCS#8 key (KMS-`Encrypt`ed). |
-| `CERTD_CA_SEAL_KMS_KEY` | **Symmetric** KMS key ref used to `Decrypt` the sealed key at boot. |
+| `CERTD_CA_SEAL_KEY` | Seal key used to `Decrypt` the sealed key at boot. A bare ref (alias / uuid / arn) ⇒ **symmetric KMS**; `file:<path>` ⇒ a local AES-256 key (**dev only** — logs a loud warning, key sits beside the ciphertext). |
 | `CERTD_CA_X509_CERT_FILE` | (re-purposed) the **intermediate** cert — what certd signs leaves under. |
 | `CERTD_CA_ROOT_CERT_FILE` | the **root** cert — the trust anchor; chain-verified against the intermediate at boot. |
 | `CERTD_CA_TRUST_BUNDLE` | default → `CERTD_CA_ROOT_CERT_FILE` (served at `/api/v1/x509/trust-bundle`). |
-| `CERTD_CA_KMS_KEY` / `CERTD_CA_KEY_FILE` | unchanged — the **stable SSH** signer (no longer the X.509 issuer). |
+| `CERTD_CA_KEY` | unchanged — the **stable SSH** signer (no longer the X.509 issuer). `file:<path>` or a KMS key ref. |
 | `CERTD_SSH_CA_KEYS_FILE` | operator-maintained `TrustedUserCAKeys`-format set (multi-key during overlap); served at `/api/v1/ssh/ca-keys`. Falls back to the live SSH CA key when unset. |
 
 | Env (cert-agentd) | Meaning |
@@ -179,8 +179,8 @@ first. **B** is the backbone; **C+D** deliver two-tier; **E** ships it.
     `NotAfter ≤ rootCert.NotAfter` (enforced).
   - Update `x509engine_test.go:226` pathlen assertions (root vs intermediate now differ).
 - `cmd/certd/ca_intermediate.go` (new) — `certd ca issue-intermediate`: resolve the **root**
-  signer (`--root-kms-key`/`--root-key`), generate the intermediate keypair,
-  `SignIntermediateCA`, then **seal** the key (`Encrypt` via `--seal-kms-key`). Outputs:
+  signer (`--root-key`), generate the intermediate keypair,
+  `SignIntermediateCA`, then **seal** the key (`Encrypt` via `--seal-key`). Outputs:
   `--out-cert` (intermediate) + `--out-sealed-key` (ciphertext). Run on a restricted/air-gapped
   host where root `Sign` is enabled.
 
@@ -190,7 +190,7 @@ first. **B** is the backbone; **C+D** deliver two-tier; **E** ships it.
   `RegisterKMSClientFactory`. The key is tiny → direct KMS `Encrypt`/`Decrypt`, no envelope
   (Decision 2).
 - `cmd/certd/signer_source.go`: sealed-intermediate mode — when `CERTD_CA_SEALED_KEY_FILE` set,
-  read ciphertext → `Decrypt` via `CERTD_CA_SEAL_KMS_KEY` → load PKCS#8 → in-memory
+  read ciphertext → `Decrypt` via `CERTD_CA_SEAL_KEY` → load PKCS#8 → in-memory
   `signer.Signer` (the **X.509 signer**).
 - **Split the signer:** `api.Config` gains `X509Signer signer.Signer`; `sign_x509.go` uses
   `s.x509Signer`; SSH paths keep `CASigner`. `main.go`: `X509Signer` = sealed signer, falling
@@ -231,7 +231,7 @@ Near-verbatim clone of the X.509 trust-bundle endpoint + agent puller.
 
 ### Intermediate ceremony (≈ quarterly)
 1. On a restricted/air-gapped host where root `Sign` is enabled:
-   `certd ca issue-intermediate --root-kms-key … --root-cert root.crt --seal-kms-key … --cn "tokyo3-ca intermediate" --ttl 2160h --out-cert int.crt --out-sealed-key int.key.sealed`.
+   `certd ca issue-intermediate --root-key … --root-cert root.crt --seal-key … --cn "tokyo3-ca intermediate" --ttl 2160h --out-cert int.crt --out-sealed-key int.key.sealed`.
 2. Distribute `int.crt` → `CERTD_CA_X509_CERT_FILE`, `int.key.sealed` →
    `CERTD_CA_SEALED_KEY_FILE`. **Restart certd** (signing key fixed at boot).
 3. Old leaves (≤24 h) drain — they carry the *old* intermediate (still root-signed, in-validity),
