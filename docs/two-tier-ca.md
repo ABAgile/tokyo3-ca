@@ -206,7 +206,8 @@ first. **B** is the backbone; **C+D** deliver two-tier; **E** ships it.
   recovery); update §2–3 to three artifacts (root cert = anchor, intermediate cert = issuer,
   sealed intermediate key = secret).
 - `README.md`: replace the "ONE CA" framing with root-anchor + intermediate-issuer;
-  `shared/certs/gen.sh` mints root + intermediate + sealed key; the mesh anchors
+  `shared/certs/gen.sh` delegates CA-owned material to `certd ca init-env`, which
+  mints/reuses root + intermediate + sealed key and bootstrap leaves; the mesh anchors
   (`CERTD_API_CLIENT_CA`, `POSTGRES_SSL_CA`, NATS `--tlscacert`, `CERT_AGENTD_CA`) → **root**.
 - `THREAT_MODEL.md`: CA-key rows — root offline (online only at ceremony), intermediate
   sealed-at-rest + in-memory at runtime, blast radius bounded by intermediate lifetime.

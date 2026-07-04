@@ -28,25 +28,26 @@
 #
 #   ./shared/
 #     certs/
-#       gen.sh              # mkcert + openssl + ssh-keygen, host-side
-#       ca.crt              # mkcert root — anchors the traefik edge cert only
+#       gen.sh              # mkcert edge cert + certd ca init-env wrapper
+#       bootstrap.yaml      # manifest for internal root/intermediate/leaves
+#       traefik-ca.crt      # mkcert root — anchors the traefik edge cert only
 #       traefik.{crt,key}   # traefik host-facing edge cert (mkcert-signed)
 #       certd.{crt,key}     # certd HTTPS API server cert (certd-issued)
 #       certd-signing.key   # SSH CA signing key, PKCS#8 PEM (SSH certs only)
 #       certd-signing.key.pub   # OpenSSH-format SSH CA pubkey (TrustedUserCAKeys)
-#       root.key            # two-tier ROOT key — signs the intermediate +
-#                           #   bootstrap leaves offline; certd serve never loads it
+#       root.key            # two-tier ROOT key — signs the intermediate only;
+#                           #   certd serve never loads it
 #       certd-x509-ca.crt   # self-signed ROOT (pathlen:1) — the ONE anchor every
 #                           #   consumer pins (filename kept from the single-tier issuer)
 #       seal.key            # 32-byte AES key sealing the intermediate (DEV ONLY)
 #       certd-x509-int.crt  # intermediate issuer cert — CERTD_CA_X509_CERT_FILE
 #       certd-x509-int.key.sealed   # intermediate key, AES-sealed; unsealed at boot
-#       nats.{crt,key}      # NATS TLS server cert (root-signed bootstrap leaf)
-#       postgres.{crt,key}  # postgres TLS server cert (certd-issued)
-#       certd-nats.{crt,key}    # certd's NATS publisher client cert (certd-issued)
-#       certd-db.{crt,key}  # certd's Postgres client cert, CN=certd (certd-issued)
-#       natsbox.{crt,key}   # natsbox NATS client cert (certd-issued)
-#       cert-agentd.{crt,key}   # cert-agentd bootstrap workload cert (certd-issued)
+#       nats.{crt,key}      # NATS TLS server cert (leaf+intermediate)
+#       postgres.{crt,key}  # postgres TLS server cert (leaf+intermediate)
+#       certd-nats.{crt,key}    # certd's NATS publisher client cert (leaf+intermediate)
+#       certd-db.{crt,key}  # certd's Postgres client cert, CN=certd (leaf+intermediate)
+#       natsbox.{crt,key}   # natsbox NATS client cert (leaf+intermediate)
+#       cert-agentd.{crt,key}   # cert-agentd bootstrap workload cert (leaf+intermediate)
 #     policy/               # sample certd policy (mounted into certd at /shared/policy)
 #       roles.json          # role table — CERTD_ROLES_FILE
 #       principals.json     # mTLS principal map — sample (CERTD_MTLS_PRINCIPALS_FILE)
@@ -414,11 +415,11 @@ services:
         # rewrites svid_bundle.pem.
         cp /shared/certs/cert-agentd.crt   /state/svid.pem
         cp /shared/certs/cert-agentd.key   /state/svid.key
-        # The mTLS trust anchor — NOT mkcert's ca.crt. This is what the agent
+        # The mTLS trust anchor — NOT mkcert's traefik-ca.crt. This is what the agent
         # and the sibling workloads it provisions (/certs/authd-*) verify
         # certd-issued peers (NATS, Postgres) against — and now certd's own API
         # listener too (the agent reads certd-x509-ca.crt from /shared for that
-        # hop, see CERT_AGENTD_WORKLOAD_CA). mkcert's ca.crt no longer appears on
+        # hop, see CERT_AGENTD_WORKLOAD_CA). mkcert's traefik-ca.crt no longer appears on
         # any agent path; it anchors only the traefik host-facing edge.
         cp /shared/certs/certd-x509-ca.crt /state/svid_bundle.pem
         chmod 644 /state/svid.pem /state/svid_bundle.pem
@@ -454,7 +455,7 @@ services:
       # WORKLOAD_CA verifies certd's HTTPS *API* server cert. The agent reaches
       # certd DIRECTLY (certd:8443, not through traefik), and certd's listener
       # cert is now certd-issued — so the agent verifies it against the internal
-      # mesh CA, the same anchor it uses for every other hop. mkcert (ca.crt) is
+      # mesh CA, the same anchor it uses for every other hop. mkcert (traefik-ca.crt) is
       # gone from this path entirely; it now lives only at the traefik edge.
       CERT_AGENTD_WORKLOAD_CA: /shared/certs/certd-x509-ca.crt
       CERT_AGENTD_SPIFFE_URI: spiffe://tokyo3/authd/agent

@@ -55,6 +55,15 @@ make build         # → bin/certd + bin/cert-agentd + bin/auth-ssh-creds
 make check         # gofmt + test + staticcheck + gopls + govulncheck
 ```
 
+Bootstrap a full static cert environment from a manifest:
+
+```sh
+certd ca init-env shared/certs/bootstrap.yaml --out-dir shared/certs --force
+```
+
+The command reuses existing root/intermediate/SSH CA key material and regenerates
+server/workload leaves; `shared/certs/gen.sh` wraps it for the docker-compose rig.
+
 Benchmarks for the per-request hot paths (policy evaluation,
 revocation lookup, signer round-trip):
 
@@ -84,7 +93,7 @@ Local builds via `make docker-build` (server), `make docker-build-agent`,
 loop for end-to-end testing without external infrastructure:
 
 ```sh
-make gen-certs                      # one-time: mkcert + openssl + ssh-keygen → ./shared/certs/
+make gen-certs                      # one-time: mkcert + certd ca init-env → ./shared/certs/
 make docker-up                      # _sync-shared + compose up (auto-runs gen-certs if needed)
 docker compose logs -f cert-agentd  # observe renewal cycle (~70 s with TTL=120 s)
 curl https://localhost:8443/healthz # mkcert root in OS trust store — no --cacert needed
@@ -103,25 +112,26 @@ slots into the same shape):
 ```
 shared/
   certs/
-    gen.sh                # mkcert + openssl + ssh-keygen + certd ca issue-{intermediate,server,workload}
-    ca.crt                # mkcert root — anchors the traefik edge cert only
+    gen.sh                # mkcert edge cert + certd ca init-env wrapper
+    bootstrap.yaml        # manifest for root/intermediate/server/workload bootstrap
+    traefik-ca.crt                # mkcert root — anchors the traefik edge cert only
     traefik.{crt,key}     # traefik host-facing edge cert (mkcert-signed)
-    certd.{crt,key}       # certd HTTPS API server cert (root-signed bootstrap leaf)
+    certd.{crt,key}       # certd HTTPS API server cert (leaf+intermediate)
     certd-signing.key     # SSH CA signing key, PKCS#8 PEM (SSH certs only)
     certd-signing.key.pub # OpenSSH-format SSH CA pubkey (TrustedUserCAKeys)
-    root.key              # two-tier ROOT key — signs the intermediate + bootstrap
-                          #   leaves offline; certd serve never loads it
+    root.key              # two-tier ROOT key — signs the intermediate only;
+                          #   certd serve never loads it
     certd-x509-ca.crt     # self-signed ROOT (pathlen:1) → CERTD_CA_ROOT_CERT_FILE;
                           #   the ONE anchor every consumer pins
     seal.key              # 32-byte AES key sealing the intermediate (DEV ONLY)
     certd-x509-int.crt    # intermediate issuer → CERTD_CA_X509_CERT_FILE
     certd-x509-int.key.sealed  # intermediate key, AES-sealed; unsealed at boot
-    nats.{crt,key}        # NATS TLS server cert (root-signed bootstrap leaf)
-    postgres.{crt,key}    # postgres TLS server cert (certd-issued)
-    certd-nats.{crt,key}  # certd's NATS publisher client cert (certd-issued)
-    certd-db.{crt,key}    # certd's Postgres client cert, CN=certd (certd-issued)
-    natsbox.{crt,key}     # natsbox NATS client cert (certd-issued)
-    cert-agentd.{crt,key} # cert-agentd bootstrap workload identity (certd-issued)
+    nats.{crt,key}        # NATS TLS server cert (leaf+intermediate)
+    postgres.{crt,key}    # postgres TLS server cert (leaf+intermediate)
+    certd-nats.{crt,key}  # certd's NATS publisher client cert (leaf+intermediate)
+    certd-db.{crt,key}    # certd's Postgres client cert, CN=certd (leaf+intermediate)
+    natsbox.{crt,key}     # natsbox NATS client cert (leaf+intermediate)
+    cert-agentd.{crt,key} # cert-agentd bootstrap workload identity (leaf+intermediate)
   policy/                 # sample certd policy
     roles.json            # role table → CERTD_ROLES_FILE (seeds the DB)
     principals.json       # mTLS principal map (sample; prod mTLS path)
@@ -147,7 +157,7 @@ cert. It's seeded as the SPIFFE **X.509-SVID layout** — `svid.pem` /
 `svid.key` (from `cert-agentd.{crt,key}`) plus `svid_bundle.pem` (the
 mTLS CA, from `certd-x509-ca.crt`) — the generic workload-credential
 naming, so `/certs` reads as a standard SVID dir for the agent and the
-sibling workloads it provisions. mkcert's `ca.crt` appears on no agent
+sibling workloads it provisions. mkcert's `traefik-ca.crt` appears on no agent
 path at all: the agent reaches certd **directly** (`certd:8443`, not via
 traefik), and certd's listener cert is now certd-issued — so the agent
 verifies even that hop against the internal CA
@@ -186,16 +196,16 @@ for both server and client certs. There is no per-channel CA and no bundle.
 The rig runs certd's **two-tier hierarchy by default** (see the callout
 below), so that one anchor is now the **root**:
 
-- `certd-x509-ca.crt` — the self-signed **root** (pathlen:1), the ONE anchor consumers pin: NATS's `--tlscacert`, Postgres's `ssl_ca_file`, `CERTD_API_CLIENT_CA`, cert-agentd's bundle, and traefik's backend CA all point here. certd signs X.509 leaves with a sealed **intermediate** (`certd-x509-int.crt` = `CERTD_CA_X509_CERT_FILE`) that chains to this root, and presents leaves as leaf+intermediate; the nats/postgres *server* certs chain here too, so it works in both directions. `gen.sh` mints the root + intermediate offline, then issues the static bootstrap mesh certs (server/workload) directly under the root — the runtime certs certd issues (cert-agentd renewals, authd workloads) are intermediate-signed. Both validate to this same root, which is the only file any consumer references (the filename is unchanged from the old single-tier issuer, so nothing downstream moved).
-- `ca.crt` — mkcert root. Anchors the **traefik host-facing edge cert** (`traefik.crt`) only. traefik publishes `:8443` to the host and terminates TLS with that mkcert cert (whose SANs cover `certd.localhost` — the portal vhost the router Host-matches — plus `localhost`/`127.0.0.1`, so both `curl https://localhost:8443` and the browser portal trust it with no `--cacert`), then re-encrypts to certd over the internal CA. mkcert no longer touches certd's own listener cert — that's certd-issued now and chains to `certd-x509-ca.crt` like every other mesh cert, so cert-agentd (which reaches certd directly, bypassing traefik) verifies it with the same single anchor. The mkcert root is *not* used for any internal link and stays out of cert-agentd's `/certs` volume. **Why edge-terminate only here:** certd's sign API is mTLS; terminating it at traefik would strip the caller's client cert and break SAN→principal auth, so machine traffic never transits the edge.
+- `certd-x509-ca.crt` — the self-signed **root** (pathlen:1), the ONE anchor consumers pin: NATS's `--tlscacert`, Postgres's `ssl_ca_file`, `CERTD_API_CLIENT_CA`, cert-agentd's bundle, and traefik's backend CA all point here. certd signs X.509 leaves with a sealed **intermediate** (`certd-x509-int.crt` = `CERTD_CA_X509_CERT_FILE`) that chains to this root, and presents leaves as leaf+intermediate; the nats/postgres *server* certs chain here too, so it works in both directions. `gen.sh` now delegates CA-owned material to `certd ca init-env shared/certs/bootstrap.yaml`: it mints/reuses the root + intermediate offline, uses the intermediate for static bootstrap server/workload leaves, then seals that intermediate for runtime issuance. Both bootstrap and runtime leaves validate to this same root, which is the only file any consumer references (the filename is unchanged from the old single-tier issuer, so nothing downstream moved).
+- `traefik-ca.crt` — mkcert root. Anchors the **traefik host-facing edge cert** (`traefik.crt`) only. traefik publishes `:8443` to the host and terminates TLS with that mkcert cert (whose SANs cover `certd.localhost` — the portal vhost the router Host-matches — plus `localhost`/`127.0.0.1`, so both `curl https://localhost:8443` and the browser portal trust it with no `--cacert`), then re-encrypts to certd over the internal CA. mkcert no longer touches certd's own listener cert — that's certd-issued now and chains to `certd-x509-ca.crt` like every other mesh cert, so cert-agentd (which reaches certd directly, bypassing traefik) verifies it with the same single anchor. The mkcert root is *not* used for any internal link and stays out of cert-agentd's `/certs` volume. **Why edge-terminate only here:** certd's sign API is mTLS; terminating it at traefik would strip the caller's client cert and break SAN→principal auth, so machine traffic never transits the edge.
 - `certd-signing.key.pub` — OpenSSH-format **SSH CA** pubkey (`TrustedUserCAKeys`). SSH world only; never goes in a TLS trust bundle.
 
 > **Two-tier CA (rig default).** certd runs a two-tier X.509 hierarchy — an
-> offline root (`root.key`, used only by `gen.sh`) signs a short-lived
+> offline root (`root.key`, used only by `gen.sh` / `certd ca init-env`) signs a short-lived
 > **intermediate** whose key is sealed; certd unseals it into memory at boot and
 > signs leaves with it, so the root key never sits on the online issuance path.
 > Consumers pin the **root** (`CERTD_CA_ROOT_CERT_FILE` = `certd-x509-ca.crt`)
-> and each runtime leaf carries the intermediate in its chain. Wired via
+> and each X.509 leaf carries the intermediate in its chain. Wired via
 > `CERTD_CA_SEALED_KEY_FILE` + `CERTD_CA_SEAL_KEY` + `CERTD_CA_ROOT_CERT_FILE`.
 > **The seal is the one dev shortcut:** `CERTD_CA_SEAL_KEY=file:/shared/certs/seal.key`
 > uses a local AES-256 key (certd logs a loud warning) instead of KMS — the key
@@ -318,7 +328,7 @@ cert are certd-issued, so `--tlscacert`, each client's server-verify CA,
 and the workload identities all resolve to `certd-x509-ca.crt`.
 
 - certd's publisher cert (`certd-nats.crt`) and `natsbox`'s cert are
-  self-issued offline by `gen.sh` (they connect at boot, before any
+  issued offline by `certd ca init-env` (they connect at boot, before any
   runtime issuance exists), so they already chain to the CA.
 - `cert-agentd` reuses its own workload cert as its NATS identity
   (`CERT_AGENTD_NATS_CERT` defaults to it). It's certd-issued from the

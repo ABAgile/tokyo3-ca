@@ -266,10 +266,13 @@ longer only with hardware key custody). The unsealed key lives in plaintext
 process memory at runtime (no `mlock` — see [THREAT_MODEL.md](THREAT_MODEL.md)
 §S2 #2/#5); local-hardware custody (TPM/enclave) is the stronger option.
 
-**The dev rig runs two-tier by default.** `gen.sh` mints the root + sealed
-intermediate and `docker-compose.yml` wires `CERTD_CA_SEAL_KEY=file:/shared/certs/seal.key`
-— a local AES-256 seal (certd logs a loud warning), so the rig exercises two-tier
-end to end without KMS. Production sets `CERTD_CA_SEAL_KEY` to a KMS key ref.
+**The dev rig runs two-tier by default.** `gen.sh` is now a thin wrapper around
+`certd ca init-env shared/certs/bootstrap.yaml`: it mints/reuses the
+root + sealed intermediate, issues static bootstrap server/workload leaves with
+that intermediate, and `docker-compose.yml` wires
+`CERTD_CA_SEAL_KEY=file:/shared/certs/seal.key` — a local AES-256 seal (certd
+logs a loud warning), so the rig exercises two-tier end to end without KMS.
+Production sets `CERTD_CA_SEAL_KEY` to a KMS key ref.
 
 ## 4. Common scenarios
 

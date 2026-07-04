@@ -5,7 +5,7 @@
 ##   make test               Run all tests
 ##   make check              Full pre-commit sequence (gofmt + test + vet + staticcheck + gopls + govulncheck + deadcode)
 ##   make tidy               Run go mod tidy
-##   make gen-certs          Generate dev TLS material in ./certs/ via mkcert (host-side, pre-flight for docker compose)
+##   make gen-certs          Generate dev TLS material via mkcert + certd ca init-env
 ##   make docker-build       Build the server Docker image (linux/arm64, default)
 ##   make docker-build-agent Build the agent image (cert-agentd — for host-level renewal)
 ##   make docker-build-cli   Build the CLI image (auth-ssh-creds — for CI runners + dev containers)
@@ -189,12 +189,12 @@ docker-push: docker-build
 
 # ── Dev rig (docker compose) ──────────────────────────────────────────────────
 
-## gen-certs: Generate dev TLS material in ./shared/certs/ via mkcert (host-side).
-## Pre-flight for `make docker-up`: mints the dev CA root (via
-## mkcert), the certd HTTPS cert, cert-agentd's bootstrap cert, and
-## certd's SSH user CA (certd-signing.key/.pub). Idempotent — re-runs
-## regenerate leaf X.509 certs but preserve the SSH signing key
-## (rotating it would invalidate every cert ever signed).
+## gen-certs: Generate dev TLS material via mkcert + certd ca init-env.
+## Pre-flight for `make docker-up`: mkcert mints only the host-facing
+## Traefik edge cert; certd ca init-env consumes shared/certs/bootstrap.yaml
+## to mint/reuse the internal root, sealed intermediate, SSH CA, and static
+## server/workload leaves. Idempotent — re-runs regenerate leaf X.509 certs
+## but preserve CA key material unless those files are deleted.
 gen-certs:
 	@bash shared/certs/gen.sh
 
@@ -205,7 +205,7 @@ gen-certs:
 ## the rig keeps cert-agentd's renewable state on a separate
 ## agent_state volume — _sync-shared never touches that.
 _sync-shared:
-	@if [ ! -f shared/certs/ca.crt ]; then $(MAKE) gen-certs; fi
+	@if [ ! -f shared/certs/traefik-ca.crt ]; then $(MAKE) gen-certs; fi
 	@docker volume create $(SHARED_VOLUME) >/dev/null
 	@tar -cf - -C shared . | docker run --rm -i -v $(SHARED_VOLUME):/shared alpine:3.21 sh -c "tar -xf - -C /shared"
 	@echo "  synced ./shared/ → docker volume $(SHARED_VOLUME)"
