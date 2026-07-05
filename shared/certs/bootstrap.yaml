@@ -24,10 +24,10 @@ servers:
     dns: [certd, localhost]
     ips: [127.0.0.1]
   - name: nats
-    dns: [nats, localhost]
+    dns: [nats, tokyo3-nats, localhost]
     ips: [127.0.0.1]
   - name: postgres
-    dns: [postgres, localhost]
+    dns: [postgres, tokyo3-postgres, localhost]
     ips: [127.0.0.1]
 
 workloads:

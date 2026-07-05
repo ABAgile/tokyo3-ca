@@ -58,4 +58,4 @@ ok
 echo ""
 echo "dev TLS material written to ./shared/certs/"
 echo "CA: $CAROOT/rootCA.pem (mkcert root, trusted via mkcert -install)"
-echo "next: make docker-up # _sync-shared tar-pipes ./shared/ + brings up rig"
+echo "next: make docker-up # syncs CA-local shared/ + downstream certs/ and brings up the mesh rig"

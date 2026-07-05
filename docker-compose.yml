@@ -1,108 +1,207 @@
-# docker-compose.yml — local-test rig for certd ↔ cert-agentd
+# docker-compose.yml — shared tokyo3 mesh root owned by tokyo3-ca
 #
-# Stands up the renewal loop end-to-end:
+# Default CA dev/integration stack. It starts the certd-rooted shared
+# backplane that sibling repos consume over stable Docker DNS aliases:
 #
-#     NATS  ◄═══════ audit publish ═════  certd  ──── sign-workload ◄──── cert-agentd
-#       ▲   (all NATS links mTLS)
-#       │  inspect / replay
-#       └── natsbox (persistent CLI; `docker compose exec natsbox nats stream view ca_audit`)
+#   tokyo3-postgres:5432   mTLS-only Postgres
+#   tokyo3-nats:4222       mTLS NATS/JetStream
+#   certd:8443             certd signing API on tokyo3_idp
 #
-# Useful for exercising the certd HTTP/mTLS surface, the audit
-# publishing path, and the cert-agentd renewal cycle without any
-# external infrastructure. Every inter-service link is mTLS by default:
-# certd's HTTPS API, the NATS client port (--tlsverify), and Postgres
-# (cert auth). See "One internal CA, plus two edge anchors" in README.md for
-# which anchor verifies what.
-#
-# ── Layout ────────────────────────────────────────────────────────────────────
-#
-# Dev material lives under ./shared/ (mirrors the tokyo3-auth layout
-# so future additions — postgres init scripts, traefik configs, etc. —
-# slot into the same tree). On `make docker-up`, the directory is
-# tar-piped into the shared_data named volume, which every read-only
-# consumer mounts at /shared. cert-agentd has its own writeable
-# agent_state volume seeded from shared_data by the cert-agentd-init
-# service — separation is necessary because cert-agentd overwrites
-# its own cert+key on renewal, and we don't want re-running
-# _sync-shared to clobber the renewed cert.
-#
-#   ./shared/
-#     certs/
-#       gen.sh              # mkcert edge cert + certd ca init-env wrapper
-#       bootstrap.yaml      # manifest for internal root/intermediate/leaves
-#       traefik-ca.crt      # mkcert root — anchors the traefik edge cert only
-#       traefik.{crt,key}   # traefik host-facing edge cert (mkcert-signed)
-#       certd.{crt,key}     # certd HTTPS API server cert (certd-issued)
-#       certd-signing.key   # SSH CA signing key, PKCS#8 PEM (SSH certs only)
-#       certd-signing.key.pub   # OpenSSH-format SSH CA pubkey (TrustedUserCAKeys)
-#       root.key            # two-tier ROOT key — signs the intermediate only;
-#                           #   certd serve never loads it
-#       certd-x509-ca.crt   # self-signed ROOT (pathlen:1) — the ONE anchor every
-#                           #   consumer pins (filename kept from the single-tier issuer)
-#       seal.key            # 32-byte AES key sealing the intermediate (DEV ONLY)
-#       certd-x509-int.crt  # intermediate issuer cert — CERTD_CA_X509_CERT_FILE
-#       certd-x509-int.key.sealed   # intermediate key, AES-sealed; unsealed at boot
-#       nats.{crt,key}      # NATS TLS server cert (leaf+intermediate)
-#       postgres.{crt,key}  # postgres TLS server cert (leaf+intermediate)
-#       certd-nats.{crt,key}    # certd's NATS publisher client cert (leaf+intermediate)
-#       certd-db.{crt,key}  # certd's Postgres client cert, CN=certd (leaf+intermediate)
-#       natsbox.{crt,key}   # natsbox NATS client cert (leaf+intermediate)
-#       cert-agentd.{crt,key}   # cert-agentd bootstrap workload cert (leaf+intermediate)
-#     policy/               # sample certd policy (mounted into certd at /shared/policy)
-#       roles.json          # role table — CERTD_ROLES_FILE
-#       principals.json     # mTLS principal map — sample (CERTD_MTLS_PRINCIPALS_FILE)
-#     agent/                # sample cert-agentd config (mounted at /shared/agent)
-#       workloads.json      # extra workload client certs — CERT_AGENTD_WORKLOADS_FILE
-#     postgres/             # postgres mTLS rig (mounted at /shared/postgres)
-#       pg-entrypoint.sh    # stages server-key perms + enables ssl/HBA
-#       pg_hba_cert.conf    # mTLS-only HBA: hostssl cert, reject plain
-#       db-init.sh          # creates the auth_app role (cert CN → role)
-#     traefik/              # host-facing HTTPS edge (mounted at /shared/traefik)
-#       dynamic.yml         # file-provider: edge TLS termination + re-encrypt to certd
-#
-# ── Pre-flight + quick start ──────────────────────────────────────────────────
-#
-#     make gen-certs       # one-time: mkcert + ssh-keygen → ./shared/certs/
-#     make docker-up       # _sync-shared + docker compose up --build
-#
-#     # auto-run is also fine — docker-up runs gen-certs and _sync-shared
-#     # if they haven't yet:
-#     make docker-up
-#
-# ── Inspect ───────────────────────────────────────────────────────────────────
-#
-#     docker compose logs -f cert-agentd       # renewals every ~70 s (TTL=120 s × 0.6)
-#     docker compose logs -f certd             # sign-workload + audit-publish events
-#     curl https://localhost:8443/healthz      # mkcert root in OS trust → no --cacert
-#     docker compose exec natsbox nats stream view ca_audit
-#                                              # tail the audit stream interactively
-#     docker compose exec natsbox nats stream view app_log
-#                                              # tail certd + cert-agentd operational logs
-#
-# ── Tear down ─────────────────────────────────────────────────────────────────
-#
-#     make docker-down                # preserve volumes
-#     make clean-all                  # nukes ./bin, ./shared/certs/*.{crt,key,pub},
-#                                     # AND the named volumes (full reset)
+# Use `make docker-up` so external networks, CA-local shared_data, and the
+# downstream cert-only tokyo3_shared_data volume are created/populated first.
 
 services:
 
-  # ── traefik: host-facing HTTPS edge (mkcert termination) ─────────────────────
-  # The single mkcert hop, relocated to the edge. traefik publishes :8443 to the
-  # host, terminates TLS with the mkcert-signed edge cert (traefik.crt) — so
-  # `curl https://localhost:8443/healthz` and the browser portal trust it with
-  # no --cacert — then RE-ENCRYPTS to certd over the internal mesh CA, verifying
-  # certd's listener cert against certd-x509-ca.crt (see shared/traefik/
-  # dynamic.yml). mkcert no longer touches certd's own cert; the internal CA now
-  # covers every hop behind this edge.
-  #
-  # Only the human/browser surface (portal, healthz, OIDC) is edge-terminated.
-  # certd's sign API is mTLS — terminating it here would strip the caller's
-  # client cert and break SAN→principal auth — so cert-agentd talks to certd
-  # DIRECTLY (certd:8443) and never transits traefik.
-  #
-  # No Docker socket: routing/TLS/backend-CA all come from the watched file
-  # provider (dynamic.yml); static config is the CLI flags below.
+  # ── shared Postgres backplane ───────────────────────────────────────────────
+  postgres:
+    image: postgres:17-alpine
+    entrypoint: ["sh", "/shared/postgres/pg-entrypoint.sh"]
+    environment:
+      PG_INIT_SCRIPT: /shared/postgres/db-init.sh
+      POSTGRES_USER: postgres
+      POSTGRES_DB: postgres
+      POSTGRES_HOST_AUTH_METHOD: trust
+      POSTGRES_SSL_CERT: /shared/certs/postgres.crt
+      POSTGRES_SSL_KEY: /shared/certs/postgres.key
+      POSTGRES_SSL_CA: /shared/certs/certd-x509-ca.crt
+    volumes:
+      - shared_data:/shared:ro
+      - mesh_db_data:/var/lib/postgresql/data
+    networks:
+      tokyo3_backplane:
+        aliases:
+          - tokyo3-postgres
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+  # ── shared NATS/JetStream backplane ─────────────────────────────────────────
+  nats:
+    image: nats:2-alpine
+    command:
+      - "-js"
+      - "-sd"
+      - "/data"
+      - "-m"
+      - "8222"
+      - "--tls"
+      - "--tlscert=/shared/certs/nats.crt"
+      - "--tlskey=/shared/certs/nats.key"
+      - "--tlscacert=/shared/certs/certd-x509-ca.crt"
+      - "--tlsverify"
+    volumes:
+      - shared_data:/shared:ro
+      - mesh_nats_data:/data
+    networks:
+      tokyo3_backplane:
+        aliases:
+          - tokyo3-nats
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8222/healthz"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+      start_period: 3s
+    restart: unless-stopped
+
+  # ── shared NATS CLI/provisioner ─────────────────────────────────────────────
+  natsbox:
+    image: natsio/nats-box:${NATSBOX_VERSION:-0.19.5}
+    depends_on:
+      nats:
+        condition: service_healthy
+    environment:
+      NATS_URL: tls://tokyo3-nats:4222
+    volumes:
+      - shared_data:/shared:ro
+    networks:
+      - tokyo3_backplane
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        nats context save default \
+          --server tls://tokyo3-nats:4222 \
+          --tlscert /shared/certs/natsbox.crt \
+          --tlskey /shared/certs/natsbox.key \
+          --tlsca /shared/certs/certd-x509-ca.crt \
+          --select > /dev/null
+
+        nats stream info ca_audit > /dev/null 2>&1 || \
+          nats stream add ca_audit \
+            --subjects 'ca.audit.events' \
+            --retention limits \
+            --storage file \
+            --max-age 9600h \
+            --deny-delete \
+            --deny-purge \
+            --defaults
+
+        nats stream info auth_audit > /dev/null 2>&1 || \
+          nats stream add auth_audit \
+            --subjects 'auth.audit.events' \
+            --retention limits \
+            --storage file \
+            --max-age 9600h \
+            --deny-delete \
+            --deny-purge \
+            --defaults
+
+        nats stream info app_log > /dev/null 2>&1 || \
+          nats stream add app_log \
+            --subjects 'app_log.>' \
+            --retention limits \
+            --storage file \
+            --max-age 168h \
+            --max-bytes 268435456 \
+            --discard old \
+            --defaults
+
+        exec tail -f /dev/null
+    healthcheck:
+      test: ["CMD-SHELL", "nats stream info ca_audit > /dev/null 2>&1 && nats stream info auth_audit > /dev/null 2>&1 && nats stream info app_log > /dev/null 2>&1"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+      start_period: 3s
+    restart: unless-stopped
+
+  # ── certd: CA service on the shared mesh ────────────────────────────────────
+  certd:
+    build:
+      context: .
+      target: server
+      args:
+        VERSION: ${VERSION:-dev-docker}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+      natsbox:
+        condition: service_healthy
+    volumes:
+      - shared_data:/shared:ro
+    networks:
+      tokyo3_backplane: {}
+      tokyo3_idp:
+        aliases:
+          - certd
+          - certd.localhost
+    environment:
+      CERTD_ADDR: ":8443"
+      CERTD_API_CERT: /shared/certs/certd.crt
+      CERTD_API_KEY: /shared/certs/certd.key
+      CERTD_API_CLIENT_CA: /shared/certs/certd-x509-ca.crt
+
+      CERTD_CA_KEY: file:/shared/certs/certd-signing.key
+      CERTD_CA_X509_CERT_FILE: /shared/certs/certd-x509-int.crt
+      CERTD_CA_SEALED_KEY_FILE: /shared/certs/certd-x509-int.key.sealed
+      CERTD_CA_SEAL_KEY: file:/shared/certs/seal.key
+      CERTD_CA_ROOT_CERT_FILE: /shared/certs/certd-x509-ca.crt
+
+      CERTD_DATABASE_URL: "postgres://certd@tokyo3-postgres:5432/certd?sslmode=verify-full&sslcert=/shared/certs/certd-db.crt&sslkey=/shared/certs/certd-db.key&sslrootcert=/shared/certs/certd-x509-ca.crt"
+      CERTD_NATS_URL: tls://tokyo3-nats:4222
+      CERTD_NATS_CERT: /shared/certs/certd-nats.crt
+      CERTD_NATS_KEY: /shared/certs/certd-nats.key
+      CERTD_NATS_CA: /shared/certs/certd-x509-ca.crt
+
+      CERTD_ROLES_FILE: /shared/policy/roles.json
+      CERTD_MTLS_PRINCIPALS_FILE: /shared/policy/principals.json
+
+      # Basic auth keeps the portal usable before auth OIDC is layered on.
+      CERTD_PORTAL_USERNAME: ${CERTD_PORTAL_USERNAME:-admin}
+      CERTD_PORTAL_PASSWORD: ${CERTD_PORTAL_PASSWORD:-certd-dev}
+      CERTD_PORTAL_REALM: certd portal
+
+      # Optional auth-backed portal OIDC. Set all five values to enable.
+      CERTD_PORTAL_OIDC_ISSUER: ${CERTD_PORTAL_OIDC_ISSUER:-}
+      CERTD_PORTAL_OIDC_CLIENT_ID: ${CERTD_PORTAL_OIDC_CLIENT_ID:-}
+      CERTD_PORTAL_OIDC_CLIENT_SECRET: ${CERTD_PORTAL_OIDC_CLIENT_SECRET:-}
+      CERTD_PORTAL_OIDC_REDIRECT_URL: ${CERTD_PORTAL_OIDC_REDIRECT_URL:-}
+      CERTD_PORTAL_SESSION_KEY: ${CERTD_PORTAL_SESSION_KEY:-}
+      CERTD_PORTAL_ADMIN_GROUP: ${CERTD_PORTAL_ADMIN_GROUP:-ca-portal-admin}
+
+      # Optional bearer-token verifier for API callers.
+      CERTD_OIDC_ISSUER: ${CERTD_OIDC_ISSUER:-}
+      CERTD_OIDC_AUDIENCE: ${CERTD_OIDC_AUDIENCE:-}
+
+      # Lets certd trust auth.localhost when portal OIDC points at auth's
+      # mkcert-backed HTTPS issuer.
+      SSL_CERT_FILE: ${CERTD_SSL_CERT_FILE:-/shared/certs/traefik-ca.crt}
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- --no-check-certificate https://localhost:8443/healthz >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    restart: unless-stopped
+
+  # ── traefik: certd host-facing HTTPS edge ───────────────────────────────────
   traefik:
     image: traefik:${TRAEFIK_VERSION:-v3.3}
     depends_on:
@@ -118,8 +217,10 @@ services:
       - "--log.level=INFO"
     volumes:
       - shared_data:/shared:ro
+    networks:
+      tokyo3_idp: {}
     ports:
-      - "8443:8443"
+      - "${CERTD_TRAEFIK_HTTPS_PORT:-8443}:8443"
     healthcheck:
       test: ["CMD", "wget", "-q", "--spider", "http://localhost:8082/ping"]
       interval: 5s
@@ -128,270 +229,7 @@ services:
       start_period: 5s
     restart: unless-stopped
 
-  # ── postgres: certd's mTLS-only store ───────────────────────────────────────
-  # certd's persistent backend (role table, mTLS principals, KRL, active-cert
-  # guard). mTLS is enabled BY DEFAULT — there is no plaintext path:
-  # pg_hba_cert.conf rejects every non-TLS connection and requires each TLS
-  # client to present a certificate whose CN matches the connecting role.
-  #
-  # One CA, both directions: POSTGRES_SSL_CA verifies CLIENT certs and the
-  # server cert (postgres.crt) is itself certd-issued, so connecting clients
-  # verify the SERVER against the same certd-x509-ca.crt — no mkcert here.
-  # Roles ← CN: certd ← certd-db.crt (certd itself, the owner/superuser);
-  # auth_app ← authd-db-app.crt and auth_admin ← authd-db-admin.crt are the
-  # extra login roles db-init.sh creates for the certs cert-agentd provisions
-  # from shared/agent/workloads.json.
-  #
-  # Not published to the host (compose-network only) to avoid clashing with a
-  # host Postgres; reach it via `docker compose exec postgres ...`.
-  postgres:
-    image: postgres:17-alpine
-    # Root entrypoint stages the server key's perms + turns on ssl/HBA before
-    # docker-entrypoint.sh drops privileges. mTLS by default.
-    entrypoint: ["sh", "/shared/postgres/pg-entrypoint.sh"]
-    environment:
-      PG_INIT_SCRIPT: /shared/postgres/db-init.sh
-      # certd is the superuser/owner certd connects as (certd-db.crt CN=certd);
-      # it owns the "certd" database and runs its own migrations.
-      POSTGRES_USER: certd
-      POSTGRES_DB: certd
-      # No passwords anywhere: every role authenticates by client-cert CN over
-      # TLS (pg_hba_cert.conf). HOST_AUTH_METHOD=trust lets initdb create the
-      # passwordless superuser without POSTGRES_PASSWORD; it only shapes the
-      # image's generated pg_hba, which pg-entrypoint.sh replaces at runtime
-      # with the cert-only HBA — so TCP access stays cert-authenticated.
-      POSTGRES_HOST_AUTH_METHOD: trust
-      # mTLS material — all certd-issued: clients are verified against the CA,
-      # and the server cert chains to it too (clients verify the server here).
-      POSTGRES_SSL_CERT: /shared/certs/postgres.crt
-      POSTGRES_SSL_KEY: /shared/certs/postgres.key
-      POSTGRES_SSL_CA: /shared/certs/certd-x509-ca.crt
-    volumes:
-      - shared_data:/shared:ro
-      - db_data:/var/lib/postgresql/data
-    healthcheck:
-      # Local socket (trust) — proves the server is up; says nothing about TLS.
-      test: ["CMD-SHELL", "pg_isready -U certd -d certd"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
-      start_period: 10s
-    restart: unless-stopped
-
-  nats:
-    image: nats:2-alpine
-    # mTLS BY DEFAULT on the client port (4222): --tlsverify forces every
-    # publisher/consumer to present a client cert. Both the server cert AND
-    # the client-CA are certd-issued, so the ONE anchor certd-x509-ca.crt
-    # covers everything — no bundle. cert-agentd, certd, and natsbox all
-    # present certd-issued certs and verify this server against the same CA.
-    # The monitoring port (8222) stays plaintext HTTP for the healthcheck.
-    command:
-      - "-js"
-      - "-sd"
-      - "/data"
-      - "-m"
-      - "8222"
-      - "--tls"
-      - "--tlscert=/shared/certs/nats.crt"
-      - "--tlskey=/shared/certs/nats.key"
-      - "--tlscacert=/shared/certs/certd-x509-ca.crt"
-      - "--tlsverify"
-    volumes:
-      - nats_data:/data
-      - shared_data:/shared:ro
-    healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8222/healthz"]
-      interval: 2s
-      timeout: 2s
-      retries: 15
-      start_period: 3s
-    restart: unless-stopped
-
-  # ── natsbox: stream provisioner + interactive shell ─────────────────────────
-  # Creates two streams on boot, then stays running so the user can:
-  #
-  #     docker compose exec natsbox nats stream view ca_audit
-  #     docker compose exec natsbox nats stream view app_log
-  #     docker compose exec natsbox nats stream info ca_audit
-  #     docker compose exec natsbox sh    # full nats CLI shell
-  #
-  # ca_audit  — compliance audit events (ca.audit.events); immutable,
-  #             long retention (deny-delete/deny-purge).
-  # app_log   — operational log shipping from certd + cert-agentd via
-  #             tokyo3-base/applog (subjects app_log.certd,
-  #             app_log.cert-agentd.<instance>, captured by app_log.>).
-  #             applog uses core nats Publish (fire-and-forget), so
-  #             without this stream the lines are silently dropped.
-  #             Bounded + deletable — ops logs aren't compliance records.
-  natsbox:
-    image: natsio/nats-box:${NATSBOX_VERSION:-0.19.5}
-    depends_on:
-      nats:
-        condition: service_healthy
-    environment:
-      NATS_URL: tls://nats:4222
-    volumes:
-      - shared_data:/shared:ro
-    entrypoint: ["/bin/sh", "-c"]
-    command:
-      - |
-        set -e
-        # Save (and select) a TLS context so every nats call below — and the
-        # healthcheck + interactive `docker compose exec natsbox` — speaks
-        # mTLS. natsbox's client cert and the CA it verifies the NATS server
-        # against are both certd-issued: one workload CA (certd-x509-ca.crt)
-        # for both directions, same anchor the server uses for --tlsverify.
-        nats context save default \
-          --server tls://nats:4222 \
-          --tlscert /shared/certs/natsbox.crt \
-          --tlskey /shared/certs/natsbox.key \
-          --tlsca /shared/certs/certd-x509-ca.crt \
-          --select > /dev/null
-        nats stream info ca_audit > /dev/null 2>&1 || \
-          nats stream add ca_audit \
-            --subjects 'ca.audit.events' \
-            --retention limits \
-            --storage file \
-            --max-age 9600h \
-            --deny-delete \
-            --deny-purge \
-            --defaults
-        nats stream info app_log > /dev/null 2>&1 || \
-          nats stream add app_log \
-            --subjects 'app_log.>' \
-            --retention limits \
-            --storage file \
-            --max-age 168h \
-            --max-bytes 268435456 \
-            --discard old \
-            --defaults
-        exec tail -f /dev/null
-    healthcheck:
-      test: ["CMD-SHELL", "nats stream info ca_audit > /dev/null 2>&1 && nats stream info app_log > /dev/null 2>&1"]
-      interval: 2s
-      timeout: 2s
-      retries: 20
-      start_period: 3s
-    restart: unless-stopped
-
-  # ── certd: the CA service ────────────────────────────────────────────────────
-  # mTLS on every link, inbound and outbound. Outbound: certd connects to
-  # Postgres (its store) and NATS (audit + logs) at boot with certd-issued
-  # client certs. Inbound: the sign API verifies caller certs against the
-  # workload CA (CERTD_API_CLIENT_CA) and authenticates them by SAN→groups via
-  # the mTLS principal registry (CERTD_MTLS_PRINCIPALS_FILE) — body-groups are
-  # no longer consulted once that's set. OIDC stays off (no human callers in
-  # the rig); production layers it on alongside the mTLS principal path.
-  certd:
-    build:
-      context: .
-      target: server
-      args:
-        VERSION: ${VERSION:-dev-docker}
-    depends_on:
-      nats:
-        condition: service_healthy
-      natsbox:
-        condition: service_healthy
-      postgres:
-        condition: service_healthy
-    volumes:
-      - shared_data:/shared:ro
-    environment:
-      CERTD_ADDR: ":8443"
-      CERTD_API_CERT: /shared/certs/certd.crt
-      CERTD_API_KEY: /shared/certs/certd.key
-      # Inbound API mTLS (the production-shaped path). CERTD_API_CLIENT_CA
-      # turns on TLS-layer client-cert verification against the workload CA
-      # (VerifyClientCertIfGiven — /healthz still works cert-less). With
-      # CERTD_MTLS_PRINCIPALS_FILE set, the sign endpoints authenticate the
-      # caller by its verified cert SAN → groups (principals.json maps
-      # spiffe://tokyo3/authd/agent → ["authd"]) and body-groups are no longer
-      # consulted. cert-agentd's bootstrap AND renewed certs both carry that
-      # SAN (see gen.sh), so it authenticates as the same principal throughout.
-      # principals.json seeds the DB on first boot, same as roles.json.
-      # The anchor (certd-x509-ca.crt) is now the two-tier ROOT — see gen.sh.
-      # Consumers (this, NATS, Postgres, cert-agentd, traefik) all still pin this
-      # one file; it just holds the root instead of the old single-tier issuer.
-      CERTD_API_CLIENT_CA: /shared/certs/certd-x509-ca.crt
-      # SSH CA signing key ONLY now (two-tier splits the signers): SSH user/host
-      # certs sign with this; X.509 leaves sign with the unsealed intermediate
-      # below. certd serve therefore never holds the root key (root.key, which
-      # gen.sh used offline to sign the intermediate + bootstrap leaves).
-      # CERTD_CA_KEY is one scheme-tagged ref: file:<path> for a PKCS#8 PEM, or a
-      # bare KMS key ref (ARN / alias) for a KMS-backed signer.
-      CERTD_CA_KEY: file:/shared/certs/certd-signing.key
-      # ── Two-tier X.509 issuance (default in this rig; docs/two-tier-ca.md) ──
-      # CERTD_CA_X509_CERT_FILE is the INTERMEDIATE cert certd signs leaves under
-      # (no longer the anchor). Its key is sealed (certd-x509-int.key.sealed) and
-      # unsealed into memory at boot via CERTD_CA_SEAL_KEY — here a local AES key
-      # file (file: scheme, DEV ONLY: certd logs a loud warning; prod uses KMS).
-      # CERTD_CA_ROOT_CERT_FILE is the root certd chain-verifies the intermediate
-      # against at boot (fail-closed). It's also the anchor served at
-      # /api/v1/x509/trust-bundle — CERTD_CA_TRUST_BUNDLE defaults to the root when
-      # set, so consumers pull the root (not the intermediate); no explicit pin needed.
-      CERTD_CA_X509_CERT_FILE: /shared/certs/certd-x509-int.crt
-      CERTD_CA_SEALED_KEY_FILE: /shared/certs/certd-x509-int.key.sealed
-      CERTD_CA_SEAL_KEY: file:/shared/certs/seal.key
-      CERTD_CA_ROOT_CERT_FILE: /shared/certs/certd-x509-ca.crt
-      # NATS over mTLS (the server requires --tlsverify). certd connects at
-      # BOOT to publish audit + ship logs. Its publisher cert (certd-nats.crt)
-      # is certd-issued (self-issued offline by gen.sh, before any runtime
-      # issuance exists), and it verifies the NATS server cert against the same
-      # workload CA — certd-x509-ca.crt for both directions.
-      CERTD_NATS_URL: tls://nats:4222
-      CERTD_NATS_CERT: /shared/certs/certd-nats.crt
-      CERTD_NATS_KEY: /shared/certs/certd-nats.key
-      CERTD_NATS_CA: /shared/certs/certd-x509-ca.crt
-      # Persistent store (role table, mTLS principals, KRL, active-cert guard)
-      # on Postgres over mTLS. No password in the DSN — Postgres authenticates
-      # certd by its client-cert CN (certd-db.crt, CN=certd → the "certd" role).
-      # sslrootcert verifies the Postgres server cert (also certd-issued), and
-      # CERTD_ROLES_FILE below now SEEDS this DB once rather than feeding an
-      # in-memory table. Turning the store on also activates the X.509
-      # renewal/anti-theft guard (per-identity serial continuity).
-      CERTD_DATABASE_URL: "postgres://certd@postgres:5432/certd?sslmode=verify-full&sslcert=/shared/certs/certd-db.crt&sslkey=/shared/certs/certd-db.key&sslrootcert=/shared/certs/certd-x509-ca.crt"
-      # Enforce the sample role table: the "authd" group may obtain
-      # spiffe://tokyo3/authd/* certs. Seeds the DB on first boot.
-      CERTD_ROLES_FILE: /shared/policy/roles.json
-      CERTD_MTLS_PRINCIPALS_FILE: /shared/policy/principals.json
-      # Admin portal (server-rendered roles/hosts/audit/revocations UI at
-      # /portal/). Reached through the traefik edge at https://certd.localhost:8443/portal/.
-      # OIDC needs a real IdP, so the rig uses the HTTP Basic gate instead:
-      # setting USERNAME + PASSWORD both arms it (either one empty ⇒ unguarded).
-      # Dev creds only — override via the host env before `make docker-up`.
-      CERTD_PORTAL_USERNAME: ${CERTD_PORTAL_USERNAME:-admin}
-      CERTD_PORTAL_PASSWORD: ${CERTD_PORTAL_PASSWORD:-certd-dev}
-      CERTD_PORTAL_REALM: certd portal
-      # Debug only (local dev rig): exposes net/http/pprof + a 30s
-      # goroutine/OS-thread stats line in the logs, to chase the
-      # pids.current growth. Never set this in a deployed certd.
-      # CERTD_DEBUG_ADDR: ":6060"
-    # No host port: traefik owns the host-facing :8443 edge now and proxies to
-    # this listener over the compose network (certd:8443). cert-agentd also
-    # reaches it directly at certd:8443. Containers resolve `certd` regardless
-    # of any published port, so nothing here needs to be exposed to the host.
-    # ports:
-    #   - "6060:6060"    # pprof (debug only)
-    healthcheck:
-      # /healthz returns 200 with ca_pubkey_hash + audit_active flag.
-      # busybox wget (Alpine 3.21) supports --no-check-certificate
-      # since 1.36+.
-      test: ["CMD-SHELL", "wget -qO- --no-check-certificate https://127.0.0.1:8443/healthz > /dev/null"]
-      interval: 5s
-      timeout: 3s
-      retries: 6
-      start_period: 5s
-    restart: unless-stopped
-
-  # ── cert-agentd-init: seed the writeable cert-agentd state on first boot ────
-  # cert-agentd overwrites its own cert+key on renewal — incompatible
-  # with shared_data's read-only mount. Solution: copy the bootstrap
-  # material from /shared into a writeable agent_state volume on first
-  # boot, then have cert-agentd point at agent_state. On subsequent
-  # boots, the sentinel check skips the copy so the renewed cert
-  # survives. `make clean-all` wipes agent_state for a fresh demo.
+  # ── demo cert-agentd: exercises certd renewal against the mesh ──────────────
   cert-agentd-init:
     image: alpine:3.21
     depends_on:
@@ -408,30 +246,14 @@ services:
           echo "cert-agentd-init: /state already populated, skipping"
           exit 0
         fi
-        # Seed the SPIFFE X.509-SVID layout (svid.pem / svid.key / svid_bundle.pem)
-        # — the generic workload-credential naming, decoupled from the agent's
-        # own name, so any consumer can read /certs as a standard SVID dir. The
-        # renewer rewrites svid.{pem,key} in place; the trust-bundle refresher
-        # rewrites svid_bundle.pem.
-        cp /shared/certs/cert-agentd.crt   /state/svid.pem
-        cp /shared/certs/cert-agentd.key   /state/svid.key
-        # The mTLS trust anchor — NOT mkcert's traefik-ca.crt. This is what the agent
-        # and the sibling workloads it provisions (/certs/authd-*) verify
-        # certd-issued peers (NATS, Postgres) against — and now certd's own API
-        # listener too (the agent reads certd-x509-ca.crt from /shared for that
-        # hop, see CERT_AGENTD_WORKLOAD_CA). mkcert's traefik-ca.crt no longer appears on
-        # any agent path; it anchors only the traefik host-facing edge.
+        cp /shared/certs/cert-agentd.crt /state/svid.pem
+        cp /shared/certs/cert-agentd.key /state/svid.key
         cp /shared/certs/certd-x509-ca.crt /state/svid_bundle.pem
         chmod 644 /state/svid.pem /state/svid_bundle.pem
         chmod 600 /state/svid.key
         echo "cert-agentd-init: seeded bootstrap material into agent_state"
     restart: "no"
 
-  # ── cert-agentd: the per-workload credential agent ───────────────────────────
-  # Mounts agent_state at /certs (writeable) — cert-agentd reads its
-  # bootstrap cert from here on first boot, then renews in place every
-  # ~72 s (60% of TTL_SECONDS=120). The renewal cycle is observable
-  # via `docker compose logs -f cert-agentd`.
   cert-agentd:
     build:
       context: .
@@ -443,54 +265,25 @@ services:
         condition: service_completed_successfully
     volumes:
       - agent_state:/certs:rw
-      # Read-only access to ./shared for the workloads spec file.
       - shared_data:/shared:ro
+    networks:
+      tokyo3_backplane: {}
+      tokyo3_idp: {}
     environment:
       CERT_AGENTD_CERTD_URL: https://certd:8443
-      # SPIFFE X.509-SVID layout (svid.pem / svid.key / svid_bundle.pem) — the
-      # generic workload-credential naming, seeded by cert-agentd-init and
-      # rewritten in place on renewal.
       CERT_AGENTD_WORKLOAD_CERT: /certs/svid.pem
       CERT_AGENTD_WORKLOAD_KEY: /certs/svid.key
-      # WORKLOAD_CA verifies certd's HTTPS *API* server cert. The agent reaches
-      # certd DIRECTLY (certd:8443, not through traefik), and certd's listener
-      # cert is now certd-issued — so the agent verifies it against the internal
-      # mesh CA, the same anchor it uses for every other hop. mkcert (traefik-ca.crt) is
-      # gone from this path entirely; it now lives only at the traefik edge.
       CERT_AGENTD_WORKLOAD_CA: /shared/certs/certd-x509-ca.crt
       CERT_AGENTD_SPIFFE_URI: spiffe://tokyo3/authd/agent
       CERT_AGENTD_TTL_SECONDS: "120"
-      # Body-groups sent on every sign request. INERT now that certd verifies
-      # callers via the mTLS principal registry (CERT_AGENTD's cert SAN
-      # spiffe://tokyo3/authd/agent → ["authd"]); kept as the graceful fallback
-      # if CERTD_MTLS_PRINCIPALS_FILE is ever unset. The agent presents its
-      # workload cert (CERT_AGENTD_WORKLOAD_CERT) as the client cert on every
-      # certd call, which is what the inbound mTLS layer verifies.
       CERT_AGENTD_GROUPS: authd
-      # Provision authd's mTLS client certs (db-app, db-admin, nats,
-      # scim — all Ed25519) into /certs alongside the agent's own
-      # identity. The spiffe://tokyo3/authd/* role pattern covers both.
       CERT_AGENTD_WORKLOADS_FILE: /shared/agent/workloads.json
-      # NATS over mTLS. The agent reuses its own SVID (/certs/svid.{pem,key})
-      # as its NATS client identity — both the bootstrap cert and every renewed
-      # cert are certd-issued, so a single anchor works. NATS_CA is the mTLS
-      # trust bundle seeded into the agent's own volume by cert-agentd-init
-      # (/certs/svid_bundle.pem) — the same anchor the sibling workloads it
-      # provisions use to verify their certd-issued peers.
-      CERT_AGENTD_NATS_URL: tls://nats:4222
-      CERT_AGENTD_NATS_CA: /certs/svid_bundle.pem
-      # Pull-based trust-bundle refresh: periodically GET certd's
-      # /api/v1/x509/trust-bundle and rewrite the local anchor, so a certd CA
-      # rotation propagates without an out-of-band push. Points at the same
-      # file the agent + provisioned siblings verify peers against. In this
-      # rig the anchor is stable, so it's a no-op steady state (the fetch
-      # matches and skips the write) — it exercises the path end to end.
       CERT_AGENTD_TRUST_BUNDLE_PATH: /certs/svid_bundle.pem
+      CERT_AGENTD_NATS_URL: tls://tokyo3-nats:4222
+      CERT_AGENTD_NATS_CERT: /certs/svid.pem
+      CERT_AGENTD_NATS_KEY: /certs/svid.key
+      CERT_AGENTD_NATS_CA: /certs/svid_bundle.pem
     healthcheck:
-      # No HTTP surface — probe via filesystem mtime instead.
-      # Renewals fire every ~72 s; if the cert hasn't been touched in
-      # 150 s, the agent has stalled. start_period gives the first
-      # renewal time to land before any failure is reported.
       test: ["CMD-SHELL", "test $(( $(date +%s) - $(stat -c %Y /certs/svid.pem) )) -lt 150"]
       interval: 30s
       timeout: 3s
@@ -499,27 +292,17 @@ services:
     restart: unless-stopped
 
 volumes:
-  # ── shared_data (external — Makefile-owned) ──────────────────────────────────
-  # Owned by the Makefile, NOT compose: `make _sync-shared` creates this
-  # volume and tar-pipes ./shared/ into it BEFORE `docker compose up`
-  # runs. Declared external so compose mounts that already-populated
-  # volume instead of creating its own empty one — a compose-created
-  # volume left certd reading an empty /shared ("certd-signing.key not
-  # found"). External volumes skip the <project>_ prefix, so `name:`
-  # pins the compose-namespaced name explicitly; ${COMPOSE_PROJECT_NAME}
-  # (exported by the Makefile, defaulting to "ca") keeps it in lockstep
-  # with _sync-shared's SHARED_VOLUME. `make clean-all` removes it.
   shared_data:
     external: true
     name: ${COMPOSE_PROJECT_NAME:-ca}_shared_data
-  # ── agent_state ──────────────────────────────────────────────────────────────
-  # cert-agentd's renewable cert+key. Compose-managed (created + seeded
-  # by cert-agentd-init on first boot); preserved across `docker compose
-  # down`. `make clean-all` wipes it for a fresh bootstrap.
   agent_state:
-  nats_data:
-  # ── db_data ──────────────────────────────────────────────────────────────────
-  # postgres data directory. Compose-managed; preserved across `docker compose
-  # down`. `make clean-all` (docker compose down -v) wipes it for a fresh initdb,
-  # which re-runs db-init.sh.
-  db_data:
+  mesh_db_data:
+  mesh_nats_data:
+
+networks:
+  tokyo3_backplane:
+    external: true
+    name: ${TOKYO3_BACKPLANE_NETWORK:-tokyo3_backplane}
+  tokyo3_idp:
+    external: true
+    name: ${TOKYO3_IDP_NETWORK:-tokyo3_idp}

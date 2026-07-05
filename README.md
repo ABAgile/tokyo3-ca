@@ -87,22 +87,47 @@ Three images are published to GHCR on each tagged release
 Local builds via `make docker-build` (server), `make docker-build-agent`,
 `make docker-build-cli`.
 
-### Local dev rig (docker-compose)
+### Local dev / integration rig (docker-compose)
 
-`docker-compose.yml` stands up a self-contained certd ↔ cert-agentd
-loop for end-to-end testing without external infrastructure:
+`docker-compose.yml` is the default shared tokyo3 mesh root. It starts certd
+plus the mTLS backplane sibling repos consume:
+
+- `tokyo3-postgres:5432` — mTLS-only Postgres with `certd` and `authdb`
+  databases plus cert-auth roles `certd`, `auth_admin`, and `auth_app`.
+- `tokyo3-nats:4222` — mTLS NATS/JetStream with `ca_audit`, `auth_audit`, and
+  `app_log` streams.
+- `certd:8443` on `tokyo3_idp` — direct mTLS signing API for cert-agentd and
+  related repos.
+
+Use the Make target so the external Docker networks, CA-local shared_data
+volume, and downstream cert-only volume are prepared before compose starts:
 
 ```sh
-make gen-certs                      # one-time: mkcert + certd ca init-env → ./shared/certs/
-make docker-up                      # _sync-shared + compose up (auto-runs gen-certs if needed)
-docker compose logs -f cert-agentd  # observe renewal cycle (~70 s with TTL=120 s)
-curl https://localhost:8443/healthz # mkcert root in OS trust store — no --cacert needed
+make docker-up                       # shared mesh: backplane + certd + demo agent
+curl https://localhost:8443/healthz  # mkcert root in OS trust store — no --cacert needed
+docker compose logs -f cert-agentd   # observe renewal cycle (~70 s with TTL=120 s)
 docker compose exec natsbox \
-    nats stream view ca_audit       # tail the audit event stream
+    nats stream view ca_audit        # tail the audit event stream
 docker compose exec natsbox \
-    nats stream view app_log        # tail certd + cert-agentd operational logs
-make docker-down                    # stop (preserves volumes)
-make clean-all                      # full reset (wipes shared/certs/* + named volumes)
+    nats stream view app_log         # tail certd + cert-agentd operational logs
+make docker-down                     # stop (preserves volumes)
+make clean-all                       # full reset (wipes shared/certs/* + named volumes)
+```
+
+Sibling repos such as `auth` should join `tokyo3_backplane` for
+`tokyo3-postgres` / `tokyo3-nats`, and `tokyo3_idp` for `certd` and OIDC
+interactions. They should mount the external `tokyo3_shared_data` volume
+read-only; it contains only `/certs`, not CA policy, traefik config, or
+Postgres scripts. An auth stack can publish `auth.localhost` on `tokyo3_idp`
+so certd portal OIDC can use `https://auth.localhost` as issuer.
+
+Override shared mesh names when needed:
+
+```sh
+TOKYO3_SHARED_VOLUME=my_shared \
+TOKYO3_BACKPLANE_NETWORK=my_backplane \
+TOKYO3_IDP_NETWORK=my_idp \
+make docker-up
 ```
 
 **Layout.** Dev material lives under `./shared/` (mirrors the
@@ -140,20 +165,24 @@ shared/
   postgres/               # postgres mTLS rig (mounted at /shared/postgres)
     pg-entrypoint.sh      # stages server-key perms + enables ssl/HBA
     pg_hba_cert.conf      # mTLS-only HBA: hostssl cert, reject plain
-    db-init.sh            # creates the auth_app/auth_admin login roles (CN → role)
+    db-init.sh            # shared mesh certd/authdb databases + cert-auth roles
   traefik/                # host-facing HTTPS edge (mounted at /shared/traefik)
     dynamic.yml           # file-provider: edge TLS termination + re-encrypt to certd
 ```
 
-**Volume model.** `make docker-up` tar-pipes `./shared/` into a
-docker-namespaced `ca_shared_data` named volume (compose's
-auto-namespacing keeps it from colliding with sibling repos' own
-`shared_data`). Every consumer mounts it read-only at `/shared`.
-cert-agentd is the exception — it renews its own cert in place, so
-the rig copies the bootstrap material onto a separate writeable
-`agent_state` volume via the `cert-agentd-init` service on first
-boot. That way, re-running `_sync-shared` never clobbers a renewed
-cert. It's seeded as the SPIFFE **X.509-SVID layout** — `svid.pem` /
+**Volume model.** `make docker-up` writes two volumes:
+
+- `ca_shared_data` — CA-local full copy of `./shared/`, mounted by this compose
+  stack at `/shared` for certd, traefik, Postgres scripts, and local policy.
+- `tokyo3_shared_data` — downstream-facing copy containing only `/certs`, so
+  sibling repos can mount cert material read-only without seeing CA-local
+  policy or config. This limits directory exposure; `shared/certs/` still
+  contains dev bootstrap private keys, so treat this as local-dev material.
+
+cert-agentd is the exception — it renews its own cert in place, so the rig
+copies bootstrap material from `ca_shared_data` onto a separate writeable
+`agent_state` volume via the `cert-agentd-init` service on first boot. That
+way, re-running `_sync-shared` never clobbers a renewed cert. It's seeded as the SPIFFE **X.509-SVID layout** — `svid.pem` /
 `svid.key` (from `cert-agentd.{crt,key}`) plus `svid_bundle.pem` (the
 mTLS CA, from `certd-x509-ca.crt`) — the generic workload-credential
 naming, so `/certs` reads as a standard SVID dir for the agent and the
@@ -346,18 +375,19 @@ docker compose exec natsbox nats --server nats://nats:4222 stream ls
 #   → nats: error: ... tls: first record does not look like a TLS handshake
 ```
 
-**Streams.** `natsbox` provisions two JetStream streams on boot:
+**Streams.** `natsbox` provisions three JetStream streams on boot:
 `ca_audit` (compliance audit events, `ca.audit.events`; immutable,
-long retention) and `app_log` (operational log shipping from certd +
-cert-agentd via `tokyo3-base/applog`, capturing `app_log.>`; bounded
-and deletable). `applog` publishes with core NATS, so without the
-`app_log` stream those lines are silently dropped.
+long retention), `auth_audit` (`auth.audit.events`, for the auth repo
+when it joins the mesh), and `app_log` (operational log shipping from
+certd + cert-agentd via `tokyo3-base/applog`, capturing `app_log.>`;
+bounded and deletable). `applog` publishes with core NATS, so without
+`app_log` those lines are silently dropped.
 
 **Healthchecks.** certd (HTTPS `/healthz`) and cert-agentd
 (filesystem mtime of the cert file, recent renewal proof). `traefik`
 (the host-facing HTTPS edge) is healthy once its `/ping` entrypoint
 answers, and waits on certd being healthy first. `natsbox` is healthy
-once both streams exist, and stays running so you can `docker compose
+once all streams exist, and stays running so you can `docker compose
 exec natsbox sh` for the full `nats` CLI.
 
 **Debugging (pprof).** Set `CERTD_DEBUG_ADDR` to expose
