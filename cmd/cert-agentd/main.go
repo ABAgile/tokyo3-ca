@@ -43,7 +43,7 @@
 //
 // Optional additional workload client certs:
 //
-//	CERT_AGENTD_WORKLOADS_FILE  JSON array of extra X.509 client certs the agent renews for
+//	CERT_AGENTD_WORKLOADS_FILE  YAML/JSON array of extra X.509 client certs the agent renews for
 //	                            sibling processes (mTLS to db, nats, …): each {name, spiffe_uri,
 //	                            subject_cn, key_type (ecdsa-p256|ed25519), ttl_seconds,
 //	                            cert_path, key_path, rotate_key}. rotate_key (default false)
@@ -117,7 +117,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -132,6 +131,7 @@ import (
 	"github.com/abagile/tokyo3-base/tls/reloader"
 	"github.com/abagile/tokyo3-base/version"
 	"github.com/spf13/cobra"
+	"gopkg.in/yaml.v3"
 
 	"github.com/abagile/tokyo3-ca/internal/agent/output"
 	"github.com/abagile/tokyo3-ca/internal/agent/renew"
@@ -348,28 +348,28 @@ func runAgent(ctx context.Context) error {
 	return nil
 }
 
-// workloadSpec is one entry in the CERT_AGENTD_WORKLOADS_FILE JSON
+// workloadSpec is one entry in the CERT_AGENTD_WORKLOADS_FILE YAML/JSON
 // array: an additional X.509 client cert the agent renews for a sibling
 // process to present (mTLS to db, nats, …). Distinct from the agent's
 // own bootstrap identity, which authenticates these requests to certd.
 type workloadSpec struct {
-	Name       string `json:"name"`
-	SPIFFEURI  string `json:"spiffe_uri"`
-	SubjectCN  string `json:"subject_cn"`
-	KeyType    string `json:"key_type"` // ecdsa-p256 | ed25519; empty ⇒ ecdsa-p256
-	TTLSeconds int64  `json:"ttl_seconds"`
-	CertPath   string `json:"cert_path"`
-	KeyPath    string `json:"key_path"`
+	Name       string `json:"name" yaml:"name"`
+	SPIFFEURI  string `json:"spiffe_uri" yaml:"spiffe_uri"`
+	SubjectCN  string `json:"subject_cn" yaml:"subject_cn"`
+	KeyType    string `json:"key_type" yaml:"key_type"` // ecdsa-p256 | ed25519; empty ⇒ ecdsa-p256
+	TTLSeconds int64  `json:"ttl_seconds" yaml:"ttl_seconds"`
+	CertPath   string `json:"cert_path" yaml:"cert_path"`
+	KeyPath    string `json:"key_path" yaml:"key_path"`
 	// RotateKey regenerates the private key on every renewal (a fresh
 	// key+cert each cycle). Default false keeps the key stable — leave it
 	// off for file-reading servers (e.g. Postgres) that can't safely
 	// reload a rotating cert/key pair; enable only where the consumer
 	// tolerates it.
-	RotateKey bool `json:"rotate_key"`
+	RotateKey bool `json:"rotate_key" yaml:"rotate_key"`
 }
 
-// buildWorkloadRenewers reads CERT_AGENTD_WORKLOADS_FILE (a JSON array
-// of workloadSpec) and returns one renewer per spec, all sharing the
+// buildWorkloadRenewers reads CERT_AGENTD_WORKLOADS_FILE (a YAML/JSON
+// array of workloadSpec) and returns one renewer per spec, all sharing the
 // certd client. Returns nil when the env var is unset. certd's role
 // table must permit the agent's identity to obtain each spec's
 // spiffe_uri.
@@ -383,7 +383,7 @@ func buildWorkloadRenewers(signer renew.Signer, groups []string, log *slog.Logge
 		return nil, fmt.Errorf("read %s: %w", specFile, err)
 	}
 	var specs []workloadSpec
-	if err := json.Unmarshal(data, &specs); err != nil {
+	if err := yaml.Unmarshal(data, &specs); err != nil {
 		return nil, fmt.Errorf("decode %s: %w", specFile, err)
 	}
 	renewers := make([]*renew.Renewer, 0, len(specs))

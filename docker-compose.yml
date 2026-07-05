@@ -277,7 +277,7 @@ services:
       CERT_AGENTD_SPIFFE_URI: spiffe://tokyo3/authd/agent
       CERT_AGENTD_TTL_SECONDS: "120"
       CERT_AGENTD_GROUPS: authd
-      CERT_AGENTD_WORKLOADS_FILE: /shared/agent/workloads.json
+      CERT_AGENTD_WORKLOADS_FILE: /shared/agent/workloads.yaml
       CERT_AGENTD_TRUST_BUNDLE_PATH: /certs/svid_bundle.pem
       CERT_AGENTD_NATS_URL: tls://tokyo3-nats:4222
       CERT_AGENTD_NATS_CERT: /certs/svid.pem

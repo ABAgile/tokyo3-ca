@@ -161,7 +161,7 @@ shared/
     roles.json            # role table → CERTD_ROLES_FILE (seeds the DB)
     principals.json       # mTLS principal map (sample; prod mTLS path)
   agent/
-    workloads.json        # extra cert-agentd workload certs → CERT_AGENTD_WORKLOADS_FILE
+    workloads.yaml        # extra cert-agentd workload certs → CERT_AGENTD_WORKLOADS_FILE
   postgres/               # postgres mTLS rig (mounted at /shared/postgres)
     pg-entrypoint.sh      # stages server-key perms + enables ssl/HBA
     pg_hba_cert.conf      # mTLS-only HBA: hostssl cert, reject plain
@@ -206,7 +206,7 @@ renewed certs carry that SAN, so it authenticates as the same principal
 on the first request and every renewal — `CERT_AGENTD_GROUPS` is now an
 inert fallback (body-groups aren't consulted once principals are wired).
 It provisions authd's four mTLS client certs from
-`shared/agent/workloads.json` (`CERT_AGENTD_WORKLOADS_FILE`), all
+`shared/agent/workloads.yaml` (`CERT_AGENTD_WORKLOADS_FILE`), all
 Ed25519, into `/certs`: `db-app` (CN `auth_app`) and `db-admin` (CN
 `auth_admin`) for Postgres cert-auth, plus `nats` and `scim`. Keys are
 stable by default (cert-only rotation); set a workload's `rotate_key`
