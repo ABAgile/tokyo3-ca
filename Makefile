@@ -32,7 +32,7 @@ TOKYO3_SHARED_VOLUME     ?= tokyo3_shared_data
 TOKYO3_BACKPLANE_NETWORK ?= tokyo3_backplane
 TOKYO3_IDP_NETWORK       ?= tokyo3_idp
 export COMPOSE_PROJECT_NAME TOKYO3_SHARED_VOLUME TOKYO3_BACKPLANE_NETWORK TOKYO3_IDP_NETWORK
-SHARED_VOLUME := $(COMPOSE_PROJECT_NAME)_shared_data
+SHARED_VOLUME            := $(COMPOSE_PROJECT_NAME)_shared_data
 
 # ── Phony targets ─────────────────────────────────────────────────────────────
 
@@ -42,10 +42,6 @@ SHARED_VOLUME := $(COMPOSE_PROJECT_NAME)_shared_data
         docker-build docker-build-amd64 docker-build-agent docker-build-cli docker-push \
         docker-up docker-down \
         install install-cli clean clean-all help
-
-# ── shared_data volumes ───────────────────────────────────────────────────────
-# CA services use the project-local shared_data volume for full ./shared/.
-# Sibling repos get the stable tokyo3_shared_data volume containing only certs/.
 
 all: build
 
@@ -156,7 +152,7 @@ docker-push: docker-build
 
 ## gen-certs: Generate dev TLS material via mkcert + certd ca init-env
 # Pre-flight for `make docker-up`: mkcert mints only the host-facing Traefik
-# edge cert; certd ca init-env consumes shared/certs/bootstrap.yaml to
+# edge cert; certd ca init-env consumes shared/certs/bootstrap.yml to
 # mint/reuse the internal root, sealed intermediate, SSH CA, and static
 # server/workload leaves. Idempotent — re-runs regenerate leaf X.509 certs but
 # preserve CA key material unless those files are deleted.
@@ -170,12 +166,13 @@ _sync-shared:
 	@tar -cf - -C shared . | docker run --rm -i -v $(SHARED_VOLUME):/shared alpine:3.21 sh -c "tar -xf - -C /shared"
 	@echo "  synced ./shared/ → docker volume $(SHARED_VOLUME)"
 
-# _sync-tokyo3-certs: Export only certs/ into the downstream shared volume.
+# _sync-tokyo3-certs: Export bootstrap certs while preserving runtime dirs.
+# Preserve /agent and /workloads, which cert-agentd manages at runtime.
 _sync-tokyo3-certs:
 	@docker volume create $(TOKYO3_SHARED_VOLUME) >/dev/null
-	@docker run --rm -v $(TOKYO3_SHARED_VOLUME):/tokyo3 alpine:3.21 sh -c "rm -rf /tokyo3/* /tokyo3/.[!.]* /tokyo3/..?* 2>/dev/null || true"
+	@docker run --rm -v $(TOKYO3_SHARED_VOLUME):/tokyo3 alpine:3.21 sh -c "find /tokyo3 -mindepth 1 -maxdepth 1 ! -name agent ! -name workloads -exec rm -rf {} + && mkdir -p /tokyo3/agent /tokyo3/workloads"
 	@tar -cf - -C shared certs | docker run --rm -i -v $(TOKYO3_SHARED_VOLUME):/tokyo3 alpine:3.21 sh -c "tar -xf - -C /tokyo3"
-	@echo "  synced ./shared/certs/ → docker volume $(TOKYO3_SHARED_VOLUME)/certs"
+	@echo "  synced ./shared/certs/ → docker volume $(TOKYO3_SHARED_VOLUME)/certs; preserved /agent and /workloads"
 
 # mesh-networks: Create shared external Docker networks for tokyo3 integrations.
 mesh-networks:
@@ -185,7 +182,7 @@ mesh-networks:
 
 ## docker-up: Sync shared CA material and bring up the shared tokyo3 mesh rig.
 docker-up: _sync-shared _sync-tokyo3-certs mesh-networks
-	docker compose up -d --build --wait
+	docker compose up -d --build --wait --remove-orphans
 
 ## docker-down: Stop the shared tokyo3 mesh rig (preserves volumes).
 docker-down:

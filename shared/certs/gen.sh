@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Generate dev TLS material for docker-compose rig.
 #
-# CA-owned material is produced by `certd ca init-env` from bootstrap.yaml:
+# CA-owned material is produced by `certd ca init-env` from bootstrap.yml:
 # root + sealed intermediate, certd/NATS/Postgres server certs, certd client
 # certs, cert-agentd bootstrap SVID, and SSH CA key. This script stays as local
 # dev glue: install mkcert, mint the host-facing Traefik edge cert, build certd,
@@ -12,7 +12,7 @@ set -euo pipefail
 DIR="$(cd "$(dirname "$0")" && pwd)"
 OUT="$DIR"
 REPO_ROOT="$(cd "$DIR/../.." && pwd)"
-MANIFEST="$DIR/bootstrap.yaml"
+MANIFEST="$DIR/bootstrap.yml"
 
 mkdir -p "$OUT"
 
@@ -40,7 +40,7 @@ ok
 # re-encrypts to certd over the internal certd-issued mesh CA.
 step "traefik (server cert)"
 mkcert -cert-file "$OUT/traefik.crt" -key-file "$OUT/traefik.key" \
-  certd.localhost localhost 127.0.0.1 >/dev/null 2>&1
+  certd.localhost traefik.localhost localhost 127.0.0.1 >/dev/null 2>&1
 ok
 
 TMP="$(mktemp -d)"

@@ -106,8 +106,10 @@ in both directions:
 
 The agent reaches certd **directly** at `certd:8443` (never through traefik) so
 its client cert isn't stripped — the sign API's SAN→principal auth depends on it.
-The agent's anchor file (`svid_bundle.pem`, = the root) is seeded by
-`cert-agentd-init` and kept fresh by polling `GET /api/v1/x509/trust-bundle`.
+The agent self-seeds its own SVID and trust bundle into `/tokyo3/agent` on
+first boot; its anchor file (`/tokyo3/agent/trust-bundle.pem`, = the root)
+stays fresh by
+polling `GET /api/v1/x509/trust-bundle`.
 
 ---
 

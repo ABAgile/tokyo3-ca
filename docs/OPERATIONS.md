@@ -267,7 +267,7 @@ process memory at runtime (no `mlock` — see [THREAT_MODEL.md](THREAT_MODEL.md)
 §S2 #2/#5); local-hardware custody (TPM/enclave) is the stronger option.
 
 **The dev rig runs two-tier by default.** `gen.sh` is now a thin wrapper around
-`certd ca init-env shared/certs/bootstrap.yaml`: it mints/reuses the
+`certd ca init-env shared/certs/bootstrap.yml`: it mints/reuses the
 root + sealed intermediate, issues static bootstrap server/workload leaves with
 that intermediate, and `docker-compose.yml` wires
 `CERTD_CA_SEAL_KEY=file:/shared/certs/seal.key` — a local AES-256 seal (certd
@@ -399,7 +399,7 @@ issued through certd's sign endpoint, the first certd renewal does
 certd ca issue-workload \
   --spiffe-uri spiffe://td/host/db-1 \   # the identity it will renew under
   --ca-cert issuer.crt --key arn:… \     # (or --key file:ca.key) — signs through KMS
-  --out-cert svid.pem --out-key svid.key --bundle-out svid_bundle.pem
+  --out-cert svid.pem --out-key svid.key --bundle-out trust-bundle.pem
 ```
 
 `certd ca issue-workload` (SPIFFE SVID; its sibling `certd ca issue-server`
@@ -479,10 +479,10 @@ keeps retrying (each 403 is a sign failure → retry on
   ```sh
   certd ca issue-workload --spiffe-uri spiffe://<trust-domain>/<path> \
     --ca-cert issuer.crt --key …  \
-    --out-cert svid.pem --out-key svid.key --bundle-out svid_bundle.pem
+    --out-cert svid.pem --out-key svid.key --bundle-out trust-bundle.pem
   ```
-  drop `svid.{pem,key}` onto the host (the agent's writable `/certs` /
-  `agent_state`) and restart cert-agentd.
+  drop `svid.{pem,key}` onto the host's writable `/tokyo3/agent` directory
+  and restart cert-agentd.
 - **Confirmed theft** → treat the key as compromised: re-bootstrap with a
   **fresh keypair** (the command above generates one — do *not* keep the
   old `svid.key`), restart, and remediate the source host. Keep workload

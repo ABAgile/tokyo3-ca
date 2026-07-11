@@ -58,7 +58,7 @@ make check         # gofmt + test + staticcheck + gopls + govulncheck
 Bootstrap a full static cert environment from a manifest:
 
 ```sh
-certd ca init-env shared/certs/bootstrap.yaml --out-dir shared/certs --force
+certd ca init-env shared/certs/bootstrap.yml --out-dir shared/certs --force
 ```
 
 The command reuses existing root/intermediate/SSH CA key material and regenerates
@@ -100,12 +100,11 @@ plus the mTLS backplane sibling repos consume:
   related repos.
 
 Use the Make target so the external Docker networks, CA-local shared_data
-volume, and downstream cert-only volume are prepared before compose starts:
+volume, and downstream cert/workload volume are prepared before compose starts:
 
 ```sh
-make docker-up                       # shared mesh: backplane + certd + demo agent
+make docker-up                       # shared mesh: backplane + certd + central cert-agentd
 curl https://localhost:8443/healthz  # mkcert root in OS trust store — no --cacert needed
-docker compose logs -f cert-agentd   # observe renewal cycle (~70 s with TTL=120 s)
 docker compose exec natsbox \
     nats stream view ca_audit        # tail the audit event stream
 docker compose exec natsbox \
@@ -116,10 +115,14 @@ make clean-all                       # full reset (wipes shared/certs/* + named 
 
 Sibling repos such as `auth` should join `tokyo3_backplane` for
 `tokyo3-postgres` / `tokyo3-nats`, and `tokyo3_idp` for `certd` and OIDC
-interactions. They should mount the external `tokyo3_shared_data` volume
-read-only; it contains only `/certs`, not CA policy, traefik config, or
-Postgres scripts. An auth stack can publish `auth.localhost` on `tokyo3_idp`
-so certd portal OIDC can use `https://auth.localhost` as issuer.
+interactions. For local development, CA's central cert-agentd writes auth
+workload certs into `tokyo3_shared_data:/workloads` and seeds its own SVID into
+`tokyo3_shared_data:/agent`; downstream stacks mount that volume read-only
+and do not need their own cert-agentd sidecar. The shared volume contains
+`/certs` bootstrap material plus `/agent` and `/workloads` runtime certs,
+not CA policy, traefik config, or Postgres scripts. An auth stack can
+publish `auth.localhost` on `tokyo3_idp` so certd portal OIDC can use
+`https://auth.localhost` as issuer.
 
 Override shared mesh names when needed:
 
@@ -138,7 +141,7 @@ slots into the same shape):
 shared/
   certs/
     gen.sh                # mkcert edge cert + certd ca init-env wrapper
-    bootstrap.yaml        # manifest for root/intermediate/server/workload bootstrap
+    bootstrap.yml         # manifest for root/intermediate/server/workload bootstrap
     traefik-ca.crt                # mkcert root — anchors the traefik edge cert only
     traefik.{crt,key}     # traefik host-facing edge cert (mkcert-signed)
     certd.{crt,key}       # certd HTTPS API server cert (leaf+intermediate)
@@ -153,6 +156,7 @@ shared/
     certd-x509-int.key.sealed  # intermediate key, AES-sealed; unsealed at boot
     nats.{crt,key}        # NATS TLS server cert (leaf+intermediate)
     postgres.{crt,key}    # postgres TLS server cert (leaf+intermediate)
+    authd.{crt,key}       # authd TLS server cert (leaf+intermediate)
     certd-nats.{crt,key}  # certd's NATS publisher client cert (leaf+intermediate)
     certd-db.{crt,key}    # certd's Postgres client cert, CN=certd (leaf+intermediate)
     natsbox.{crt,key}     # natsbox NATS client cert (leaf+intermediate)
@@ -161,7 +165,7 @@ shared/
     roles.json            # role table → CERTD_ROLES_FILE (seeds the DB)
     principals.json       # mTLS principal map (sample; prod mTLS path)
   agent/
-    workloads.yaml        # extra cert-agentd workload certs → CERT_AGENTD_WORKLOADS_FILE
+    workloads.yml         # extra cert-agentd workload certs → CERT_AGENTD_WORKLOADS_FILE
   postgres/               # postgres mTLS rig (mounted at /shared/postgres)
     pg-entrypoint.sh      # stages server-key perms + enables ssl/HBA
     pg_hba_cert.conf      # mTLS-only HBA: hostssl cert, reject plain
@@ -169,29 +173,26 @@ shared/
   traefik/                # host-facing HTTPS edge (mounted at /shared/traefik)
     dynamic.yml           # file-provider: edge TLS termination + re-encrypt to certd
 ```
-
 **Volume model.** `make docker-up` writes two volumes:
 
-- `ca_shared_data` — CA-local full copy of `./shared/`, mounted by this compose
+- `ca_shared_data` — CA-local full copy `./shared/`, mounted by the compose
   stack at `/shared` for certd, traefik, Postgres scripts, and local policy.
-- `tokyo3_shared_data` — downstream-facing copy containing only `/certs`, so
-  sibling repos can mount cert material read-only without seeing CA-local
-  policy or config. This limits directory exposure; `shared/certs/` still
-  contains dev bootstrap private keys, so treat this as local-dev material.
+- `tokyo3_shared_data` — downstream-facing volume containing `/certs`
+  bootstrap material plus `/agent` and `/workloads` runtime certs generated by
+  CA's central cert-agentd. Sibling repos mount it read-only without seeing
+  CA-local policy or config. `shared/certs/` still contains dev bootstrap
+  private keys, so treat it as local-dev material.
 
-cert-agentd is the exception — it renews its own cert in place, so the rig
-copies bootstrap material from `ca_shared_data` onto a separate writeable
-`agent_state` volume via the `cert-agentd-init` service on first boot. That
-way, re-running `_sync-shared` never clobbers a renewed cert. It's seeded as the SPIFFE **X.509-SVID layout** — `svid.pem` /
-`svid.key` (from `cert-agentd.{crt,key}`) plus `svid_bundle.pem` (the
-mTLS CA, from `certd-x509-ca.crt`) — the generic workload-credential
-naming, so `/certs` reads as a standard SVID dir for the agent and the
-sibling workloads it provisions. mkcert's `traefik-ca.crt` appears on no agent
-path at all: the agent reaches certd **directly** (`certd:8443`, not via
-traefik), and certd's listener cert is now certd-issued — so the agent
-verifies even that hop against the internal CA
-(`CERT_AGENTD_WORKLOAD_CA=/shared/certs/certd-x509-ca.crt`). The one
-mkcert hop left is the traefik host-facing edge.
+cert-agentd self-seeds `/tokyo3/agent` on first boot from
+`shared/certs/cert-agentd.{crt,key}` and keeps renewing there in place, while
+writing auth workload certs to `/tokyo3/workloads`; re-running `_sync-shared`
+never clobbers them. The runtime paths are the generic workload-credential
+layout, so the agent and its sibling workloads keep separate writable homes.
+mkcert's `traefik-ca.crt` appears on no agent path at all: the agent reaches
+certd **directly** (`certd:8443`, not via traefik), and certd's listener cert
+is certd-issued — so the agent verifies even that hop against the internal CA
+(`CERT_AGENTD_WORKLOAD_CA=/tokyo3/agent/trust-bundle.pem`). The one mkcert
+hop left is the traefik host-facing edge.
 
 **Policy & workloads (sample).** The rig enforces the
 `shared/policy/roles.json` role table (`CERTD_ROLES_FILE`, which now
@@ -206,7 +207,7 @@ renewed certs carry that SAN, so it authenticates as the same principal
 on the first request and every renewal — `CERT_AGENTD_GROUPS` is now an
 inert fallback (body-groups aren't consulted once principals are wired).
 It provisions authd's four mTLS client certs from
-`shared/agent/workloads.yaml` (`CERT_AGENTD_WORKLOADS_FILE`), all
+`shared/agent/workloads.yml` (`CERT_AGENTD_WORKLOADS_FILE`), all
 Ed25519, into `/certs`: `db-app` (CN `auth_app`) and `db-admin` (CN
 `auth_admin`) for Postgres cert-auth, plus `nats` and `scim`. Keys are
 stable by default (cert-only rotation); set a workload's `rotate_key`
@@ -225,7 +226,7 @@ for both server and client certs. There is no per-channel CA and no bundle.
 The rig runs certd's **two-tier hierarchy by default** (see the callout
 below), so that one anchor is now the **root**:
 
-- `certd-x509-ca.crt` — the self-signed **root** (pathlen:1), the ONE anchor consumers pin: NATS's `--tlscacert`, Postgres's `ssl_ca_file`, `CERTD_API_CLIENT_CA`, cert-agentd's bundle, and traefik's backend CA all point here. certd signs X.509 leaves with a sealed **intermediate** (`certd-x509-int.crt` = `CERTD_CA_X509_CERT_FILE`) that chains to this root, and presents leaves as leaf+intermediate; the nats/postgres *server* certs chain here too, so it works in both directions. `gen.sh` now delegates CA-owned material to `certd ca init-env shared/certs/bootstrap.yaml`: it mints/reuses the root + intermediate offline, uses the intermediate for static bootstrap server/workload leaves, then seals that intermediate for runtime issuance. Both bootstrap and runtime leaves validate to this same root, which is the only file any consumer references (the filename is unchanged from the old single-tier issuer, so nothing downstream moved).
+- `certd-x509-ca.crt` — the self-signed **root** (pathlen:1), the ONE anchor consumers pin: NATS's `--tlscacert`, Postgres's `ssl_ca_file`, `CERTD_API_CLIENT_CA`, cert-agentd's bundle, and traefik's backend CA all point here. certd signs X.509 leaves with a sealed **intermediate** (`certd-x509-int.crt` = `CERTD_CA_X509_CERT_FILE`) that chains to this root, and presents leaves as leaf+intermediate; the nats/postgres *server* certs chain here too, so it works in both directions. `gen.sh` now delegates CA-owned material to `certd ca init-env shared/certs/bootstrap.yml`: it mints/reuses the root + intermediate offline, uses the intermediate for static bootstrap server/workload leaves, then seals that intermediate for runtime issuance. Both bootstrap and runtime leaves validate to this same root, which is the only file any consumer references (the filename is unchanged from the old single-tier issuer, so nothing downstream moved).
 - `traefik-ca.crt` — mkcert root. Anchors the **traefik host-facing edge cert** (`traefik.crt`) only. traefik publishes `:8443` to the host and terminates TLS with that mkcert cert (whose SANs cover `certd.localhost` — the portal vhost the router Host-matches — plus `localhost`/`127.0.0.1`, so both `curl https://localhost:8443` and the browser portal trust it with no `--cacert`), then re-encrypts to certd over the internal CA. mkcert no longer touches certd's own listener cert — that's certd-issued now and chains to `certd-x509-ca.crt` like every other mesh cert, so cert-agentd (which reaches certd directly, bypassing traefik) verifies it with the same single anchor. The mkcert root is *not* used for any internal link and stays out of cert-agentd's `/certs` volume. **Why edge-terminate only here:** certd's sign API is mTLS; terminating it at traefik would strip the caller's client cert and break SAN→principal auth, so machine traffic never transits the edge.
 - `certd-signing.key.pub` — OpenSSH-format **SSH CA** pubkey (`TrustedUserCAKeys`). SSH world only; never goes in a TLS trust bundle.
 
@@ -244,16 +245,16 @@ below), so that one anchor is now the **root**:
 > (`GET /api/v1/ssh/ca-keys`, `CERTD_SSH_CA_KEYS_FILE`). See
 > [docs/two-tier-ca.md](docs/two-tier-ca.md) and docs/OPERATIONS.md §3.
 
-Watch it work:
+Watch central workload issuance work:
 
 ```sh
 docker compose logs -f cert-agentd      # db-app + db-admin + nats + scim + self renewing
-docker compose exec cert-agentd ls -l /certs   # authd-*.crt/key
-docker compose exec natsbox nats stream view ca_audit  # x509.workload.cert.signed events
+docker compose exec cert-agentd ls -l /tokyo3/workloads   # authd-*.crt/key
+docker compose exec natsbox nats stream view ca_audit     # x509.workload.cert.signed events
 # Prove a provisioned leaf chains to the issuer cert (end-to-end trust):
 docker compose exec cert-agentd sh -c \
-  'openssl verify -CAfile /shared/certs/certd-x509-ca.crt /certs/authd-db-app.crt'
-#   → /certs/authd-db-app.crt: OK
+  'openssl verify -CAfile /tokyo3/certs/certd-x509-ca.crt /tokyo3/workloads/authd-db-app.crt'
+#   → /tokyo3/workloads/authd-db-app.crt: OK
 ```
 
 **Inbound API mTLS (by default).** certd's sign endpoints authenticate

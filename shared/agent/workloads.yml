@@ -3,27 +3,27 @@
   subject_cn: auth_app
   key_type: ed25519
   ttl_seconds: 600
-  cert_path: /certs/authd-db-app.crt
-  key_path: /certs/authd-db-app.key
+  cert_path: /tokyo3/workloads/authd-db-app.crt
+  key_path: /tokyo3/workloads/authd-db-app.key
 
 - name: authd-db-admin
   spiffe_uri: spiffe://tokyo3/authd/db-admin
   subject_cn: auth_admin
   key_type: ed25519
   ttl_seconds: 600
-  cert_path: /certs/authd-db-admin.crt
-  key_path: /certs/authd-db-admin.key
+  cert_path: /tokyo3/workloads/authd-db-admin.crt
+  key_path: /tokyo3/workloads/authd-db-admin.key
 
 - name: authd-nats
   spiffe_uri: spiffe://tokyo3/authd/nats
   key_type: ed25519
   ttl_seconds: 600
-  cert_path: /certs/authd-nats.crt
-  key_path: /certs/authd-nats.key
+  cert_path: /tokyo3/workloads/authd-nats.crt
+  key_path: /tokyo3/workloads/authd-nats.key
 
 - name: authd-scim
   spiffe_uri: spiffe://tokyo3/authd/scim
   key_type: ed25519
   ttl_seconds: 600
-  cert_path: /certs/authd-scim.crt
-  key_path: /certs/authd-scim.key
+  cert_path: /tokyo3/workloads/authd-scim.crt
+  key_path: /tokyo3/workloads/authd-scim.key

@@ -8,7 +8,8 @@
 #   certd:8443             certd signing API on tokyo3_idp
 #
 # Use `make docker-up` so external networks, CA-local shared_data, and the
-# downstream cert-only tokyo3_shared_data volume are created/populated first.
+# downstream tokyo3_shared_data volume (/certs, /agent, /workloads) are
+# created/populated first.
 
 services:
 
@@ -229,31 +230,7 @@ services:
       start_period: 5s
     restart: unless-stopped
 
-  # ── demo cert-agentd: exercises certd renewal against the mesh ──────────────
-  cert-agentd-init:
-    image: alpine:3.21
-    depends_on:
-      certd:
-        condition: service_healthy
-    volumes:
-      - shared_data:/shared:ro
-      - agent_state:/state
-    entrypoint: ["/bin/sh", "-c"]
-    command:
-      - |
-        set -e
-        if [ -f /state/svid.pem ]; then
-          echo "cert-agentd-init: /state already populated, skipping"
-          exit 0
-        fi
-        cp /shared/certs/cert-agentd.crt /state/svid.pem
-        cp /shared/certs/cert-agentd.key /state/svid.key
-        cp /shared/certs/certd-x509-ca.crt /state/svid_bundle.pem
-        chmod 644 /state/svid.pem /state/svid_bundle.pem
-        chmod 600 /state/svid.key
-        echo "cert-agentd-init: seeded bootstrap material into agent_state"
-    restart: "no"
-
+  # ── central dev cert-agentd: self-seeds /tokyo3/agent and writes workloads ──
   cert-agentd:
     build:
       context: .
@@ -261,30 +238,47 @@ services:
       args:
         VERSION: ${VERSION:-dev-docker}
     depends_on:
-      cert-agentd-init:
-        condition: service_completed_successfully
+      certd:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        mkdir -p /tokyo3/agent /tokyo3/workloads
+        if [ ! -s /tokyo3/agent/svid.pem ] || [ ! -s /tokyo3/agent/svid.key ]; then
+          cp /shared/certs/cert-agentd.crt /tokyo3/agent/svid.pem
+          cp /shared/certs/cert-agentd.key /tokyo3/agent/svid.key
+          chmod 644 /tokyo3/agent/svid.pem
+          chmod 600 /tokyo3/agent/svid.key
+          echo "cert-agentd: seeded bootstrap SVID into /tokyo3/agent"
+        fi
+        if [ ! -s /tokyo3/agent/trust-bundle.pem ]; then
+          cp /shared/certs/certd-x509-ca.crt /tokyo3/agent/trust-bundle.pem
+          chmod 644 /tokyo3/agent/trust-bundle.pem
+          echo "cert-agentd: seeded bootstrap trust bundle into /tokyo3/agent"
+        fi
+        exec cert-agentd run
     volumes:
-      - agent_state:/certs:rw
       - shared_data:/shared:ro
+      - tokyo3_shared_data:/tokyo3:rw
     networks:
       tokyo3_backplane: {}
       tokyo3_idp: {}
     environment:
       CERT_AGENTD_CERTD_URL: https://certd:8443
-      CERT_AGENTD_WORKLOAD_CERT: /certs/svid.pem
-      CERT_AGENTD_WORKLOAD_KEY: /certs/svid.key
-      CERT_AGENTD_WORKLOAD_CA: /shared/certs/certd-x509-ca.crt
+      CERT_AGENTD_WORKLOAD_CERT: /tokyo3/agent/svid.pem
+      CERT_AGENTD_WORKLOAD_KEY: /tokyo3/agent/svid.key
+      CERT_AGENTD_WORKLOAD_CA: /tokyo3/agent/trust-bundle.pem
       CERT_AGENTD_SPIFFE_URI: spiffe://tokyo3/authd/agent
       CERT_AGENTD_TTL_SECONDS: "120"
       CERT_AGENTD_GROUPS: authd
-      CERT_AGENTD_WORKLOADS_FILE: /shared/agent/workloads.yaml
-      CERT_AGENTD_TRUST_BUNDLE_PATH: /certs/svid_bundle.pem
+      CERT_AGENTD_WORKLOADS_FILE: /shared/agent/workloads.yml
+      CERT_AGENTD_TRUST_BUNDLE_PATH: /tokyo3/agent/trust-bundle.pem
       CERT_AGENTD_NATS_URL: tls://tokyo3-nats:4222
-      CERT_AGENTD_NATS_CERT: /certs/svid.pem
-      CERT_AGENTD_NATS_KEY: /certs/svid.key
-      CERT_AGENTD_NATS_CA: /certs/svid_bundle.pem
+      CERT_AGENTD_NATS_CERT: /tokyo3/agent/svid.pem
+      CERT_AGENTD_NATS_KEY: /tokyo3/agent/svid.key
+      CERT_AGENTD_NATS_CA: /tokyo3/agent/trust-bundle.pem
     healthcheck:
-      test: ["CMD-SHELL", "test $(( $(date +%s) - $(stat -c %Y /certs/svid.pem) )) -lt 150"]
+      test: ["CMD-SHELL", "test $(( $(date +%s) - $(stat -c %Y /tokyo3/agent/svid.pem) )) -lt 150"]
       interval: 30s
       timeout: 3s
       retries: 3
@@ -295,7 +289,9 @@ volumes:
   shared_data:
     external: true
     name: ${COMPOSE_PROJECT_NAME:-ca}_shared_data
-  agent_state:
+  tokyo3_shared_data:
+    external: true
+    name: ${TOKYO3_SHARED_VOLUME:-tokyo3_shared_data}
   mesh_db_data:
   mesh_nats_data:
 
