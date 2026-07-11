@@ -10,7 +10,7 @@
 
 - name: vaultd-db-app
   spiffe_uri: spiffe://tokyo3/vaultd/db-app
-  subject_cn: vault_app
+  subject_cn: vaultd_app
   key_type: ed25519
   rotate_key: true
   ttl_seconds: 600
@@ -19,7 +19,7 @@
 
 - name: vaultd-db-admin
   spiffe_uri: spiffe://tokyo3/vaultd/db-admin
-  subject_cn: vault_admin
+  subject_cn: vaultd_admin
   key_type: ed25519
   rotate_key: true
   ttl_seconds: 600

@@ -92,8 +92,9 @@ Local builds via `make docker-build` (server), `make docker-build-agent`,
 `docker-compose.yml` is the default shared tokyo3 mesh root. It starts certd
 plus the mTLS backplane sibling repos consume:
 
-- `tokyo3-postgres:5432` — mTLS-only Postgres with `certd` and `authdb`
-  databases plus cert-auth roles `certd`, `auth_admin`, and `auth_app`.
+- `tokyo3-postgres:5432` — mTLS-only Postgres with `certd`, `authd`, and
+  `vaultd` databases plus cert-auth roles named `<service>_admin` and
+  `<service>_app`.
 - `tokyo3-nats:4222` — mTLS NATS/JetStream with `ca_audit`, `auth_audit`, and
   `app_log` streams.
 - `certd:8443` on `tokyo3_idp` — direct mTLS signing API for cert-agentd and
@@ -165,7 +166,8 @@ shared/
     postgres.{crt,key}    # postgres TLS server cert (leaf+intermediate)
     authd.{crt,key}       # authd TLS server cert (leaf+intermediate)
     certd-nats.{crt,key}  # certd's NATS publisher client cert (leaf+intermediate)
-    certd-db.{crt,key}    # certd's Postgres client cert, CN=certd (leaf+intermediate)
+    certd-db-admin.{crt,key}  # certd's Postgres admin cert, CN=certd_admin
+    certd-db-app.{crt,key}    # certd's Postgres app cert, CN=certd_app
     natsbox.{crt,key}     # natsbox NATS client cert (leaf+intermediate)
     cert-agentd-authd.{crt,key}   # authd cert-agentd bootstrap identity
     cert-agentd-vaultd.{crt,key}  # vaultd cert-agentd bootstrap identity
@@ -178,7 +180,7 @@ shared/
   postgres/               # postgres mTLS rig (mounted at /shared/postgres)
     pg-entrypoint.sh      # stages server-key perms + enables ssl/HBA
     pg_hba_cert.conf      # mTLS-only HBA: hostssl cert, reject plain
-    db-init.sh            # shared mesh certd/authdb databases + cert-auth roles
+    db-init.sh            # shared mesh certd/authd/vaultd databases + cert-auth roles
   traefik/                # host-facing HTTPS edge (mounted at /shared/traefik)
     dynamic.yml           # file-provider: edge TLS termination + re-encrypt to certd
 ```
@@ -222,7 +224,7 @@ agent provisions authd's workload certs from
 `shared/agent/authd-workloads.yml`, while the vaultd agent provisions Vault's
 from `shared/agent/vaultd-workloads.yml`; both manifests use Ed25519. Authd's
 manifest writes `authd` (DNS SANs `authd` and `auth.localhost`) for TLS server
-auth, `db-app` (CN `auth_app`) and `db-admin` (CN `auth_admin`) for Postgres
+auth, `db-app` (CN `authd_app`) and `db-admin` (CN `authd_admin`) for Postgres
 cert-auth, plus `nats` and `scim`. All sample workloads set
 `rotate_key: true`, so cert-agentd writes a fresh key and certificate pair
 atomically on every renewal. Consumers must reload both files; authd's TLS
@@ -316,11 +318,12 @@ renewal/anti-theft guard all live here. There is **no plaintext path**:
 `shared/postgres/pg_hba_cert.conf` rejects every non-TLS connection
 (`host ... reject`) and requires each TLS client to present a
 certificate whose CN matches the connecting role (`hostssl all all all
-cert`). Roles map to client certs by CN — `certd` ← `certd-db.crt`
-(certd itself, the owner/superuser), and `auth_app` ← `authd-db-app.crt`
-/ `auth_admin` ← `authd-db-admin.crt` (the certs cert-agentd provisions,
-demonstrating workload login). The service is **not** published to the
-host — reach it via `docker compose exec postgres ...`.
+cert`). Roles map to client certs by CN — `certd_admin` ←
+`certd-db-admin.crt` (certd itself, used for its store migrations/runtime in
+this rig), `authd_app` ← `authd-db-app.crt` / `authd_admin` ←
+`authd-db-admin.crt`, and `vaultd_app` / `vaultd_admin` follow the same
+pattern. The service is **not** published to the host — reach it via
+`docker compose exec postgres ...`.
 
 Both directions use the one internal CA: postgres verifies connecting
 **clients** against `certd-x509-ca.crt` (`POSTGRES_SSL_CA`), and its
@@ -332,7 +335,7 @@ postgres demands, then starts it with `ssl=on` and the cert HBA.
 certd can present its client cert two ways. Embedding `sslcert`/`sslkey`
 in `CERTD_DATABASE_URL` works but pins the cert at boot (pgx reads the
 files once when it parses the DSN), so a cert-agentd rotation of
-`certd-db.crt` isn't picked up until restart. Setting
+`certd-db-admin.crt` isn't picked up until restart. Setting
 `CERTD_DB_CERT`/`CERTD_DB_KEY`/`CERTD_DB_CA` instead routes the
 connection through `tls/reloader`: the leaf is re-read per handshake and
 the CA pool on mtime, so a rotated cert lands on the next pool dial
@@ -359,13 +362,13 @@ identity*.
 ```sh
 # A TLS connection without a client cert is refused — mTLS is mandatory:
 docker compose exec postgres \
-  psql 'host=postgres dbname=certd user=certd sslmode=require'
+  psql 'host=postgres dbname=certd user=certd_admin sslmode=require'
 #   → FATAL: connection requires a valid client certificate
 
-# certd's own client leaf authenticates as the certd role by CN:
+# certd's own client leaf authenticates as the certd_admin role by CN:
 docker compose exec postgres \
-  openssl x509 -in /shared/certs/certd-db.crt -noout -subject
-#   → subject=CN = certd
+  openssl x509 -in /shared/certs/certd-db-admin.crt -noout -subject
+#   → subject=CN = certd_admin
 ```
 
 **NATS (mTLS by default).** The NATS client port runs `--tlsverify`,

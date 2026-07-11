@@ -175,7 +175,7 @@ services:
       CERTD_CA_SEAL_KEY: file:/shared/certs/seal.key
       CERTD_CA_ROOT_CERT_FILE: /shared/certs/certd-x509-ca.crt
 
-      CERTD_DATABASE_URL: "postgres://certd@tokyo3-postgres:5432/certd?sslmode=verify-full&sslcert=/shared/certs/certd-db.crt&sslkey=/shared/certs/certd-db.key&sslrootcert=/shared/certs/certd-x509-ca.crt"
+      CERTD_DATABASE_URL: "postgres://certd_admin@tokyo3-postgres:5432/certd?sslmode=verify-full&sslcert=/shared/certs/certd-db-admin.crt&sslkey=/shared/certs/certd-db-admin.key&sslrootcert=/shared/certs/certd-x509-ca.crt"
       CERTD_NATS_URL: tls://tokyo3-nats:4222
       CERTD_NATS_CERT: /shared/certs/certd-nats.crt
       CERTD_NATS_KEY: /shared/certs/certd-nats.key

@@ -11,21 +11,45 @@ psql -v ON_ERROR_STOP=1 \
      --dbname   "$POSTGRES_DB" \
      --no-psqlrc <<'SQL'
 
-CREATE ROLE certd LOGIN;
-CREATE ROLE auth_admin LOGIN;
-CREATE ROLE auth_app LOGIN;
+CREATE ROLE certd_admin LOGIN;
+CREATE ROLE certd_app LOGIN;
+CREATE ROLE authd_admin LOGIN;
+CREATE ROLE authd_app LOGIN;
+CREATE ROLE vaultd_admin LOGIN;
+CREATE ROLE vaultd_app LOGIN;
 
-CREATE DATABASE certd OWNER certd;
-CREATE DATABASE authdb OWNER auth_admin;
+CREATE DATABASE certd OWNER certd_admin;
+CREATE DATABASE authd OWNER authd_admin;
+CREATE DATABASE vaultd OWNER vaultd_admin;
 
-\connect authdb
+\connect certd
 
-GRANT CONNECT ON DATABASE authdb TO auth_app;
-GRANT USAGE ON SCHEMA public TO auth_app;
+GRANT CONNECT ON DATABASE certd TO certd_app;
+GRANT USAGE ON SCHEMA public TO certd_app;
 
-ALTER DEFAULT PRIVILEGES FOR ROLE auth_admin IN SCHEMA public
-    GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO auth_app;
-ALTER DEFAULT PRIVILEGES FOR ROLE auth_admin IN SCHEMA public
-    GRANT USAGE, SELECT ON SEQUENCES TO auth_app;
+ALTER DEFAULT PRIVILEGES FOR ROLE certd_admin IN SCHEMA public
+    GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO certd_app;
+ALTER DEFAULT PRIVILEGES FOR ROLE certd_admin IN SCHEMA public
+    GRANT USAGE, SELECT ON SEQUENCES TO certd_app;
+
+\connect authd
+
+GRANT CONNECT ON DATABASE authd TO authd_app;
+GRANT USAGE ON SCHEMA public TO authd_app;
+
+ALTER DEFAULT PRIVILEGES FOR ROLE authd_admin IN SCHEMA public
+    GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO authd_app;
+ALTER DEFAULT PRIVILEGES FOR ROLE authd_admin IN SCHEMA public
+    GRANT USAGE, SELECT ON SEQUENCES TO authd_app;
+
+\connect vaultd
+
+GRANT CONNECT ON DATABASE vaultd TO vaultd_app;
+GRANT USAGE ON SCHEMA public TO vaultd_app;
+
+ALTER DEFAULT PRIVILEGES FOR ROLE vaultd_admin IN SCHEMA public
+    GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO vaultd_app;
+ALTER DEFAULT PRIVILEGES FOR ROLE vaultd_admin IN SCHEMA public
+    GRANT USAGE, SELECT ON SEQUENCES TO vaultd_app;
 
 SQL

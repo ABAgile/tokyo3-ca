@@ -10,7 +10,7 @@
 
 - name: authd-db-app
   spiffe_uri: spiffe://tokyo3/authd/db-app
-  subject_cn: auth_app
+  subject_cn: authd_app
   key_type: ed25519
   rotate_key: true
   ttl_seconds: 600
@@ -19,7 +19,7 @@
 
 - name: authd-db-admin
   spiffe_uri: spiffe://tokyo3/authd/db-admin
-  subject_cn: auth_admin
+  subject_cn: authd_admin
   key_type: ed25519
   rotate_key: true
   ttl_seconds: 600

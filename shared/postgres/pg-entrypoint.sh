@@ -6,11 +6,11 @@
 # strict ownership + permissions postgres insists on before it will start.
 #
 # Env (set on the db container in docker-compose.yml):
-#   PG_INIT_SCRIPT     initdb script to install (creates the app role)
+#   PG_INIT_SCRIPT     initdb script to install (creates service DBs/roles)
 #   POSTGRES_SSL_CERT  server certificate PEM (mkcert-signed; CN=postgres)
 #   POSTGRES_SSL_KEY   server private key PEM
 #   POSTGRES_SSL_CA    client-cert trust anchor — certd's X.509 issuer cert,
-#                      so certd-issued authd-db-* leaves authenticate by CN
+#                      so certd-issued *-db-* leaves authenticate by CN
 set -eu
 
 if [ -n "${PG_INIT_SCRIPT:-}" ]; then
