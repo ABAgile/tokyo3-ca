@@ -27,7 +27,7 @@ GOFLAGS :=
 IMAGE_NAME ?= abagile/tokyo3-ca
 IMAGE_TAG  ?= $(VERSION)
 
-COMPOSE_PROJECT_NAME     ?= ca
+COMPOSE_PROJECT_NAME     ?= tokyo3_ca
 TOKYO3_SHARED_VOLUME     ?= tokyo3_shared_data
 TOKYO3_BACKPLANE_NETWORK ?= tokyo3_backplane
 TOKYO3_IDP_NETWORK       ?= tokyo3_idp

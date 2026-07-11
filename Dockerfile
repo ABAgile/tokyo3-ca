@@ -62,7 +62,7 @@ FROM alpine:3.21 AS agent
 # busybox-wget healthchecks leave behind) and forwards signals so the
 # binary still shuts down cleanly. Without it a non-reaping Go PID 1
 # accumulates <defunct> processes — cgroup pids.current climbs forever.
-RUN apk add --no-cache ca-certificates tini
+RUN apk add --no-cache ca-certificates tini tzdata
 
 COPY --from=builder /out/cert-agentd /usr/local/bin/cert-agentd
 
@@ -88,7 +88,7 @@ FROM alpine:3.21 AS server
 # busybox-wget HTTPS healthcheck orphans every probe) and forwards
 # signals so certd shuts down cleanly. Without it a non-reaping Go PID 1
 # accumulates <defunct> processes — cgroup pids.current climbs forever.
-RUN apk add --no-cache ca-certificates tini
+RUN apk add --no-cache ca-certificates tini tzdata
 
 COPY --from=builder /out/certd /usr/local/bin/certd
 

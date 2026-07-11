@@ -11,6 +11,11 @@
 # downstream tokyo3_shared_data volume (/certs, /agent, /workloads) are
 # created/populated first.
 
+name: ${COMPOSE_PROJECT_NAME:-tokyo3_ca}
+
+x-default-environment: &default-environment
+  TZ: ${TZ:-Asia/Taipei}
+
 services:
 
   # ── shared Postgres backplane ───────────────────────────────────────────────
@@ -18,6 +23,7 @@ services:
     image: postgres:17-alpine
     entrypoint: ["sh", "/shared/postgres/pg-entrypoint.sh"]
     environment:
+      <<: *default-environment
       PG_INIT_SCRIPT: /shared/postgres/db-init.sh
       POSTGRES_USER: postgres
       POSTGRES_DB: postgres
@@ -54,6 +60,8 @@ services:
       - "--tlskey=/shared/certs/nats.key"
       - "--tlscacert=/shared/certs/certd-x509-ca.crt"
       - "--tlsverify"
+    environment:
+      <<: *default-environment
     volumes:
       - shared_data:/shared:ro
       - mesh_nats_data:/data
@@ -76,6 +84,7 @@ services:
       nats:
         condition: service_healthy
     environment:
+      <<: *default-environment
       NATS_URL: tls://tokyo3-nats:4222
     volumes:
       - shared_data:/shared:ro
@@ -154,6 +163,7 @@ services:
           - certd
           - certd.localhost
     environment:
+      <<: *default-environment
       CERTD_ADDR: ":8443"
       CERTD_API_CERT: /shared/certs/certd.crt
       CERTD_API_KEY: /shared/certs/certd.key
@@ -216,6 +226,8 @@ services:
       - "--providers.file.filename=/shared/traefik/dynamic.yml"
       - "--providers.file.watch=true"
       - "--log.level=INFO"
+    environment:
+      <<: *default-environment
     volumes:
       - shared_data:/shared:ro
     networks:
@@ -269,6 +281,7 @@ services:
       tokyo3_backplane: {}
       tokyo3_idp: {}
     environment:
+      <<: *default-environment
       CERT_AGENTD_CERTD_URL: https://certd:8443
       CERT_AGENTD_WORKLOAD_CERT: /tokyo3/agent/authd/svid.pem
       CERT_AGENTD_WORKLOAD_KEY: /tokyo3/agent/authd/svid.key
@@ -326,6 +339,7 @@ services:
       tokyo3_backplane: {}
       tokyo3_idp: {}
     environment:
+      <<: *default-environment
       CERT_AGENTD_CERTD_URL: https://certd:8443
       CERT_AGENTD_WORKLOAD_CERT: /tokyo3/agent/vaultd/svid.pem
       CERT_AGENTD_WORKLOAD_KEY: /tokyo3/agent/vaultd/svid.key

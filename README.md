@@ -128,11 +128,17 @@ publish `auth.localhost` on `tokyo3_idp` so certd portal OIDC can use
 Override shared mesh names when needed:
 
 ```sh
+COMPOSE_PROJECT_NAME=my_ca \
 TOKYO3_SHARED_VOLUME=my_shared \
 TOKYO3_BACKPLANE_NETWORK=my_backplane \
 TOKYO3_IDP_NETWORK=my_idp \
 make docker-up
 ```
+
+The compose stack sets `TZ=${TZ:-Asia/Taipei}` for all services by default;
+export `TZ` before `make docker-up` to use another timezone. The certd and
+cert-agentd images include `tzdata` so named zones such as `Asia/Taipei` are
+resolved by the Go runtime.
 
 **Layout.** Dev material lives under `./shared/` (mirrors the
 tokyo3-auth tree, so adding consumers like the Postgres rig below
