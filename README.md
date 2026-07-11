@@ -184,10 +184,12 @@ shared/
   private keys, so treat it as local-dev material.
 
 cert-agentd self-seeds `/tokyo3/agent` on first boot from
-`shared/certs/cert-agentd.{crt,key}` and keeps renewing there in place, while
-writing auth workload certs to `/tokyo3/workloads`; re-running `_sync-shared`
-never clobbers them. The runtime paths are the generic workload-credential
-layout, so the agent and its sibling workloads keep separate writable homes.
+`shared/certs/cert-agentd.{crt,key}`, the CA trust bundle, and
+`shared/agent/workloads.yml`. It keeps its identity, trust bundle, and workload
+manifest there while writing issued certs to `/tokyo3/workloads`; re-running
+`_sync-shared` never clobbers the runtime directories. The runtime paths are
+the generic workload-credential layout, so the agent and its sibling workloads
+keep separate writable homes.
 mkcert's `traefik-ca.crt` appears on no agent path at all: the agent reaches
 certd **directly** (`certd:8443`, not via traefik), and certd's listener cert
 is certd-issued — so the agent verifies even that hop against the internal CA
@@ -210,11 +212,11 @@ It provisions authd's workload certs from
 `shared/agent/workloads.yml` (`CERT_AGENTD_WORKLOADS_FILE`), all Ed25519,
 into `/tokyo3/workloads`: `authd` (DNS SANs `authd` and `auth.localhost`) for
 TLS server auth, `db-app` (CN `auth_app`) and `db-admin` (CN `auth_admin`)
-for Postgres cert-auth, plus `nats` and `scim`. Keys are
-stable by default (cert-only rotation); set a workload's `rotate_key`
-(or `CERT_AGENTD_ROTATE_KEY` for the agent's own cert) to regenerate the
-key each renewal — leave it off for the Postgres certs, which can't
-safely reload a rotating pair. Both `roles.json` and `principals.json`
+for Postgres cert-auth, plus `nats` and `scim`. All sample workloads set
+`rotate_key: true`, so cert-agentd writes a fresh key and certificate pair
+atomically on every renewal. Consumers must reload both files; authd's TLS
+loaders do so for new connections, while Postgres/NATS deployments need their
+normal certificate reload mechanism. Both `roles.json` and `principals.json`
 *seed* the Postgres store on first boot. OIDC stays off (no human
 callers in the rig); production layers it on alongside the mTLS path.
 

@@ -256,6 +256,11 @@ services:
           chmod 644 /tokyo3/agent/trust-bundle.pem
           echo "cert-agentd: seeded bootstrap trust bundle into /tokyo3/agent"
         fi
+        if [ ! -s /tokyo3/agent/workloads.yml ]; then
+          cp /shared/agent/workloads.yml /tokyo3/agent/workloads.yml
+          chmod 644 /tokyo3/agent/workloads.yml
+          echo "cert-agentd: seeded workload manifest into /tokyo3/agent"
+        fi
         exec cert-agentd run
     volumes:
       - shared_data:/shared:ro
@@ -270,13 +275,11 @@ services:
       CERT_AGENTD_WORKLOAD_CA: /tokyo3/agent/trust-bundle.pem
       CERT_AGENTD_SPIFFE_URI: spiffe://tokyo3/authd/agent
       CERT_AGENTD_TTL_SECONDS: "120"
+      CERT_AGENTD_ROTATE_KEY: "true"
       CERT_AGENTD_GROUPS: authd
-      CERT_AGENTD_WORKLOADS_FILE: /shared/agent/workloads.yml
+      CERT_AGENTD_WORKLOADS_FILE: /tokyo3/agent/workloads.yml
       CERT_AGENTD_TRUST_BUNDLE_PATH: /tokyo3/agent/trust-bundle.pem
       CERT_AGENTD_NATS_URL: tls://tokyo3-nats:4222
-      CERT_AGENTD_NATS_CERT: /tokyo3/agent/svid.pem
-      CERT_AGENTD_NATS_KEY: /tokyo3/agent/svid.key
-      CERT_AGENTD_NATS_CA: /tokyo3/agent/trust-bundle.pem
     healthcheck:
       test: ["CMD-SHELL", "test $(( $(date +%s) - $(stat -c %Y /tokyo3/agent/svid.pem) )) -lt 150"]
       interval: 30s

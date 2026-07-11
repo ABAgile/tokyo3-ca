@@ -3,6 +3,7 @@
   subject_cn: authd
   dns_names: [authd, auth.localhost]
   key_type: ed25519
+  rotate_key: true
   ttl_seconds: 600
   cert_path: /tokyo3/workloads/authd.crt
   key_path: /tokyo3/workloads/authd.key
@@ -11,6 +12,7 @@
   spiffe_uri: spiffe://tokyo3/authd/db-app
   subject_cn: auth_app
   key_type: ed25519
+  rotate_key: true
   ttl_seconds: 600
   cert_path: /tokyo3/workloads/authd-db-app.crt
   key_path: /tokyo3/workloads/authd-db-app.key
@@ -19,6 +21,7 @@
   spiffe_uri: spiffe://tokyo3/authd/db-admin
   subject_cn: auth_admin
   key_type: ed25519
+  rotate_key: true
   ttl_seconds: 600
   cert_path: /tokyo3/workloads/authd-db-admin.crt
   key_path: /tokyo3/workloads/authd-db-admin.key
@@ -26,6 +29,7 @@
 - name: authd-nats
   spiffe_uri: spiffe://tokyo3/authd/nats
   key_type: ed25519
+  rotate_key: true
   ttl_seconds: 600
   cert_path: /tokyo3/workloads/authd-nats.crt
   key_path: /tokyo3/workloads/authd-nats.key
@@ -33,6 +37,7 @@
 - name: authd-scim
   spiffe_uri: spiffe://tokyo3/authd/scim
   key_type: ed25519
+  rotate_key: true
   ttl_seconds: 600
   cert_path: /tokyo3/workloads/authd-scim.crt
   key_path: /tokyo3/workloads/authd-scim.key
