@@ -3,7 +3,7 @@
 #
 # CA-owned material is produced by `certd ca init-env` from bootstrap.yml:
 # root + sealed intermediate, certd/NATS/Postgres server certs, certd client
-# certs, cert-agentd bootstrap SVID, and SSH CA key. This script stays as local
+# certs, cert-agentd bootstrap SVIDs, and SSH CA key. This script stays as local
 # dev glue: install mkcert, mint the host-facing Traefik edge cert, build certd,
 # and invoke the manifest-driven bootstrap wrapper.
 

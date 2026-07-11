@@ -1,0 +1,35 @@
+- name: vaultd
+  spiffe_uri: spiffe://tokyo3/vaultd/server
+  subject_cn: vaultd
+  dns_names: [vaultd, vault.localhost]
+  key_type: ed25519
+  rotate_key: true
+  ttl_seconds: 600
+  cert_path: /tokyo3/workloads/vaultd.crt
+  key_path: /tokyo3/workloads/vaultd.key
+
+- name: vaultd-db-app
+  spiffe_uri: spiffe://tokyo3/vaultd/db-app
+  subject_cn: vault_app
+  key_type: ed25519
+  rotate_key: true
+  ttl_seconds: 600
+  cert_path: /tokyo3/workloads/vaultd-db-app.crt
+  key_path: /tokyo3/workloads/vaultd-db-app.key
+
+- name: vaultd-db-admin
+  spiffe_uri: spiffe://tokyo3/vaultd/db-admin
+  subject_cn: vault_admin
+  key_type: ed25519
+  rotate_key: true
+  ttl_seconds: 600
+  cert_path: /tokyo3/workloads/vaultd-db-admin.crt
+  key_path: /tokyo3/workloads/vaultd-db-admin.key
+
+- name: vaultd-nats
+  spiffe_uri: spiffe://tokyo3/vaultd/nats
+  key_type: ed25519
+  rotate_key: true
+  ttl_seconds: 600
+  cert_path: /tokyo3/workloads/vaultd-nats.crt
+  key_path: /tokyo3/workloads/vaultd-nats.key

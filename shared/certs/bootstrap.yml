@@ -38,5 +38,7 @@ workloads:
   - name: certd-db
     spiffe_uri: spiffe://tokyo3/certd/db
     cn: certd
-  - name: cert-agentd
+  - name: cert-agentd-authd
     spiffe_uri: spiffe://tokyo3/authd/agent
+  - name: cert-agentd-vaultd
+    spiffe_uri: spiffe://tokyo3/vaultd/agent

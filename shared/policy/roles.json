@@ -4,5 +4,11 @@
     "group_claim": "authd",
     "spiffe_patterns": ["spiffe://tokyo3/authd/*"],
     "max_x509_cert_ttl_seconds": 86400
+  },
+  {
+    "name": "vaultd-workloads",
+    "group_claim": "vaultd",
+    "spiffe_patterns": ["spiffe://tokyo3/vaultd/*"],
+    "max_x509_cert_ttl_seconds": 86400
   }
 ]

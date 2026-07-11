@@ -3,5 +3,10 @@
     "name": "authd-agent",
     "san": "spiffe://tokyo3/authd/agent",
     "groups": ["authd"]
+  },
+  {
+    "name": "vaultd-agent",
+    "san": "spiffe://tokyo3/vaultd/agent",
+    "groups": ["vaultd"]
   }
 ]
