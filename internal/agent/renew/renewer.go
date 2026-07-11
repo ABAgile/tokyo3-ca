@@ -65,6 +65,10 @@ type Config struct {
 	// identity; populating it makes tooling output friendlier.
 	SubjectCommonName string
 
+	// DNSNames are optional DNS SANs for workload certificates used as
+	// TLS server identities.
+	DNSNames []string
+
 	// KeyType selects the locally-generated private key's algorithm:
 	// "ecdsa-p256" or "ed25519". Empty ⇒ ecdsa-p256.
 	KeyType KeyType
@@ -216,6 +220,7 @@ func (r *Renewer) SignOnce(ctx context.Context) (validAfter, validBefore time.Ti
 		PublicKey:         string(pubPEM),
 		SPIFFEURI:         r.cfg.SPIFFEURI,
 		SubjectCommonName: r.cfg.SubjectCommonName,
+		DNSNames:          r.cfg.DNSNames,
 		Groups:            r.cfg.Groups,
 		// Serial of the cert we're rotating from, read from disk so it
 		// survives restarts without extra state. Empty on first issuance

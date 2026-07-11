@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"math/big"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -50,6 +51,7 @@ func TestSignWorkloadCert_RoundTrip(t *testing.T) {
 		PublicKey:         subject,
 		SPIFFEURI:         "spiffe://corp/svc/billing",
 		SubjectCommonName: "billing-svc",
+		DNSNames:          []string{"billing", "billing.example"},
 		ValidAfter:        now,
 		ValidBefore:       now.Add(24 * time.Hour),
 		Serial:            big.NewInt(42),
@@ -70,6 +72,9 @@ func TestSignWorkloadCert_RoundTrip(t *testing.T) {
 	if len(cert.URIs) != 1 || cert.URIs[0].String() != "spiffe://corp/svc/billing" {
 		t.Errorf("URIs = %v, want [spiffe://corp/svc/billing]", cert.URIs)
 	}
+	if !slices.Equal(cert.DNSNames, []string{"billing", "billing.example"}) {
+		t.Errorf("DNSNames = %v, want [billing billing.example]", cert.DNSNames)
+	}
 	if cert.KeyUsage&x509.KeyUsageDigitalSignature == 0 {
 		t.Error("KeyUsage missing DigitalSignature")
 	}
@@ -84,6 +89,12 @@ func TestSignWorkloadCert_RoundTrip(t *testing.T) {
 	}
 	if _, err := cert.Verify(opts); err != nil {
 		t.Errorf("workload cert failed to verify against CA: %v", err)
+	}
+	serverOpts := opts
+	serverOpts.DNSName = "billing.example"
+	serverOpts.KeyUsages = []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}
+	if _, err := cert.Verify(serverOpts); err != nil {
+		t.Errorf("workload server identity failed DNS verification: %v", err)
 	}
 }
 

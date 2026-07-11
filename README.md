@@ -206,10 +206,11 @@ SAN `spiffe://tokyo3/authd/agent` → `["authd"]`. Both its bootstrap and
 renewed certs carry that SAN, so it authenticates as the same principal
 on the first request and every renewal — `CERT_AGENTD_GROUPS` is now an
 inert fallback (body-groups aren't consulted once principals are wired).
-It provisions authd's four mTLS client certs from
-`shared/agent/workloads.yml` (`CERT_AGENTD_WORKLOADS_FILE`), all
-Ed25519, into `/certs`: `db-app` (CN `auth_app`) and `db-admin` (CN
-`auth_admin`) for Postgres cert-auth, plus `nats` and `scim`. Keys are
+It provisions authd's workload certs from
+`shared/agent/workloads.yml` (`CERT_AGENTD_WORKLOADS_FILE`), all Ed25519,
+into `/tokyo3/workloads`: `authd` (DNS SANs `authd` and `auth.localhost`) for
+TLS server auth, `db-app` (CN `auth_app`) and `db-admin` (CN `auth_admin`)
+for Postgres cert-auth, plus `nats` and `scim`. Keys are
 stable by default (cert-only rotation); set a workload's `rotate_key`
 (or `CERT_AGENTD_ROTATE_KEY` for the agent's own cert) to regenerate the
 key each renewal — leave it off for the Postgres certs, which can't
@@ -248,7 +249,7 @@ below), so that one anchor is now the **root**:
 Watch central workload issuance work:
 
 ```sh
-docker compose logs -f cert-agentd      # db-app + db-admin + nats + scim + self renewing
+docker compose logs -f cert-agentd      # api + db-app + db-admin + nats + scim
 docker compose exec cert-agentd ls -l /tokyo3/workloads   # authd-*.crt/key
 docker compose exec natsbox nats stream view ca_audit     # x509.workload.cert.signed events
 # Prove a provisioned leaf chains to the issuer cert (end-to-end trust):

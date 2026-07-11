@@ -32,6 +32,9 @@ type signX509Request struct {
 	// SubjectCommonName is an optional CN. Modern verifiers ignore
 	// CN as identity; this is for human-friendly tooling only.
 	SubjectCommonName string `json:"subject_common_name,omitempty"`
+	// DNSNames are optional DNS SANs for workload certificates used as
+	// TLS server identities.
+	DNSNames []string `json:"dns_names,omitempty"`
 	// Groups carry the caller's authenticated group membership when
 	// the API is in body-groups fallback mode. Ignored when OIDC or
 	// mTLS is configured.
@@ -227,6 +230,7 @@ func (s *Server) handleSignX509WorkloadCert(w http.ResponseWriter, r *http.Reque
 		PublicKey:         pub,
 		SPIFFEURI:         spiffeURI,
 		SubjectCommonName: req.SubjectCommonName,
+		DNSNames:          req.DNSNames,
 		ValidAfter:        now,
 		ValidBefore:       now.Add(ttl),
 		Serial:            serial,

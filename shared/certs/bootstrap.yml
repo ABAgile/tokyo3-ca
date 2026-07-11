@@ -29,9 +29,6 @@ servers:
   - name: postgres
     dns: [postgres, tokyo3-postgres, localhost]
     ips: [127.0.0.1]
-  - name: authd
-    dns: [authd, auth.localhost]
-    ips: [127.0.0.1]
 
 workloads:
   - name: certd-nats

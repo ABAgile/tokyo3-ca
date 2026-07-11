@@ -349,17 +349,20 @@ func runAgent(ctx context.Context) error {
 }
 
 // workloadSpec is one entry in the CERT_AGENTD_WORKLOADS_FILE YAML/JSON
-// array: an additional X.509 client cert the agent renews for a sibling
-// process to present (mTLS to db, nats, …). Distinct from the agent's
+// array: an additional X.509 cert the agent renews for a sibling process
+// to present (mTLS to db, nats, or TLS server identity). DNSNames are
+// optional and add DNS SANs for server-facing workload certificates.
+// Distinct from the agent's
 // own bootstrap identity, which authenticates these requests to certd.
 type workloadSpec struct {
-	Name       string `json:"name" yaml:"name"`
-	SPIFFEURI  string `json:"spiffe_uri" yaml:"spiffe_uri"`
-	SubjectCN  string `json:"subject_cn" yaml:"subject_cn"`
-	KeyType    string `json:"key_type" yaml:"key_type"` // ecdsa-p256 | ed25519; empty ⇒ ecdsa-p256
-	TTLSeconds int64  `json:"ttl_seconds" yaml:"ttl_seconds"`
-	CertPath   string `json:"cert_path" yaml:"cert_path"`
-	KeyPath    string `json:"key_path" yaml:"key_path"`
+	Name       string   `json:"name" yaml:"name"`
+	SPIFFEURI  string   `json:"spiffe_uri" yaml:"spiffe_uri"`
+	SubjectCN  string   `json:"subject_cn" yaml:"subject_cn"`
+	DNSNames   []string `json:"dns_names" yaml:"dns_names"`
+	KeyType    string   `json:"key_type" yaml:"key_type"` // ecdsa-p256 | ed25519; empty ⇒ ecdsa-p256
+	TTLSeconds int64    `json:"ttl_seconds" yaml:"ttl_seconds"`
+	CertPath   string   `json:"cert_path" yaml:"cert_path"`
+	KeyPath    string   `json:"key_path" yaml:"key_path"`
 	// RotateKey regenerates the private key on every renewal (a fresh
 	// key+cert each cycle). Default false keeps the key stable — leave it
 	// off for file-reading servers (e.g. Postgres) that can't safely
@@ -395,6 +398,7 @@ func buildWorkloadRenewers(signer renew.Signer, groups []string, log *slog.Logge
 			Signer:            signer,
 			SPIFFEURI:         s.SPIFFEURI,
 			SubjectCommonName: s.SubjectCN,
+			DNSNames:          s.DNSNames,
 			KeyType:           renew.KeyType(s.KeyType),
 			RotateKey:         s.RotateKey,
 			Groups:            groups,

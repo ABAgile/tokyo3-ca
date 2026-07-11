@@ -1,3 +1,12 @@
+- name: authd
+  spiffe_uri: spiffe://tokyo3/authd/server
+  subject_cn: authd
+  dns_names: [authd, auth.localhost]
+  key_type: ed25519
+  ttl_seconds: 600
+  cert_path: /tokyo3/workloads/authd.crt
+  key_path: /tokyo3/workloads/authd.key
+
 - name: authd-db-app
   spiffe_uri: spiffe://tokyo3/authd/db-app
   subject_cn: auth_app

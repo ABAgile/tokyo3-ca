@@ -50,6 +50,8 @@ type WorkloadCertParams struct {
 	// RFC 6125. We populate it for human-friendly tooling that still
 	// shows CN.
 	SubjectCommonName string
+	// DNSNames are optional DNS SANs for TLS server identities.
+	DNSNames []string
 	// ValidAfter is the earliest moment the cert is valid (inclusive).
 	ValidAfter time.Time
 	// ValidBefore is the moment the cert expires (exclusive). Must be
@@ -94,6 +96,7 @@ func SignWorkloadCert(rnd io.Reader, caSigner signer.Signer, caCert *x509.Certif
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth},
 		BasicConstraintsValid: true,
 		IsCA:                  false,
+		DNSNames:              p.DNSNames,
 		URIs:                  []*url.URL{uri},
 	}
 

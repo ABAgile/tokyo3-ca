@@ -60,6 +60,9 @@ type SignWorkloadRequest struct {
 	// SubjectCommonName is an optional CN. Modern verifiers ignore
 	// CN as identity; this is for human-friendly tooling only.
 	SubjectCommonName string `json:"subject_common_name,omitempty"`
+	// DNSNames are optional DNS SANs for workload certificates that are
+	// also used as TLS server identities.
+	DNSNames []string `json:"dns_names,omitempty"`
 	// Groups carry the caller's authenticated group membership for
 	// policy enforcement when certd is in body-groups fallback mode.
 	// Production uses OIDC or mTLS attribution and ignores this.
