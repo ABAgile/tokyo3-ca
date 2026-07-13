@@ -92,7 +92,7 @@ RUN apk add --no-cache ca-certificates tini tzdata
 
 COPY --from=builder /out/certd /usr/local/bin/certd
 
-EXPOSE 443
+EXPOSE 8443
 
 ENTRYPOINT ["/sbin/tini", "--", "/usr/local/bin/certd"]
 CMD ["serve"]

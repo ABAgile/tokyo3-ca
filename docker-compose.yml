@@ -214,11 +214,12 @@ services:
 
   # ── traefik: certd host-facing HTTPS edge ───────────────────────────────────
   traefik:
-    image: traefik:${TRAEFIK_VERSION:-v3.3}
+    image: traefik:${TRAEFIK_VERSION:-v3.7.7}
     depends_on:
       certd:
         condition: service_healthy
     command:
+      - "--api.dashboard=true"
       - "--entrypoints.websecure.address=:8443"
       - "--entrypoints.ping.address=:8082"
       - "--ping=true"
@@ -362,7 +363,7 @@ services:
 volumes:
   shared_data:
     external: true
-    name: ${COMPOSE_PROJECT_NAME:-ca}_shared_data
+    name: ${COMPOSE_PROJECT_NAME:-tokyo3_ca}_shared_data
   tokyo3_shared_data:
     external: true
     name: ${TOKYO3_SHARED_VOLUME:-tokyo3_shared_data}

@@ -508,7 +508,9 @@ internal/
   unmounted (404). Per-page template sets keep page-specific
   `{{define "title"}}`/`{{define "body"}}` blocks from clobbering each
   other. In the docker rig it's reachable through the traefik edge at
-  **`https://certd.localhost:8443/portal/`** and gated by the HTTP Basic
+  **`https://certd.localhost:8443/portal/`**. The same edge also exposes
+  Traefik's dashboard at **`https://traefik.localhost:8443/`** for local
+  diagnostics. The certd portal is gated by the HTTP Basic
   credentials (`CERTD_PORTAL_USERNAME`/`CERTD_PORTAL_PASSWORD`, default
   `admin` / `certd-dev` — override via the host env). OIDC needs a real
   IdP, so the rig uses the Basic gate; setting only one of the two creds

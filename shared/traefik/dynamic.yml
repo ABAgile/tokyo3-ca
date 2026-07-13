@@ -17,7 +17,8 @@
 # simply gets certd's normal 401 (no principal), same as a missing cert.
 #
 # Static config is passed as CLI flags in docker-compose.yml; this file is the
-# dynamic half (providers.file, watched for hot-reload).
+# dynamic half (providers.file, watched for hot-reload). The dashboard is
+# exposed through the same HTTPS edge at traefik.localhost.
 
 tls:
   # defaultCertificate covers the no-SNI / IP-SNI case (e.g. curl 127.0.0.1);
@@ -40,10 +41,16 @@ http:
       # the `curl https://localhost:8443/healthz` UX working. All three resolve
       # to the loopback edge and route to the one certd backend.
       rule: "Host(`certd.localhost`) || Host(`localhost`) || Host(`127.0.0.1`)"
-      entryPoints:
-        - websecure
+      entryPoints: [websecure]
       service: certd
       tls: {}
+
+    traefik-dashboard:
+      rule: "Host(`traefik.localhost`)"
+      entryPoints: [websecure]
+      service: api@internal
+      tls: {}
+
   services:
     certd:
       loadBalancer:
