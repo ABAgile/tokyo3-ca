@@ -120,8 +120,9 @@ func respSerial(t *testing.T, rec *httptest.ResponseRecorder) string {
 // TestSignX509Workload_AntiTheftGuard walks the rotation/anti-theft state
 // machine: first issuance records state; presenting the current serial
 // rotates; the one-step-previous serial is still accepted (crash grace); a
-// stale/unknown serial — and an empty serial once state exists — is rejected
-// as a possible clone with a rollback audit event.
+// stale/unknown serial is rejected as a possible clone with a rollback
+// audit event (an empty serial while state exists is denied WITHOUT the
+// lock escalation — see TestSignX509Workload_EmptySerialWhileValid).
 func TestSignX509Workload_AntiTheftGuard(t *testing.T) {
 	guard := &fakeActiveCerts{m: map[string]store.ActiveCert{}}
 	srv, cap := newGuardedServer(t, guard)
@@ -189,6 +190,50 @@ func TestSignX509Workload_AntiTheftGuard(t *testing.T) {
 	}
 	if r6 := sign(""); r6.Code != http.StatusOK {
 		t.Fatalf("re-enroll after clearing lock: %d %s", r6.Code, r6.Body.String())
+	}
+}
+
+// TestSignX509Workload_EmptySerialWhileValid: an empty current_serial while
+// the recorded cert is still valid — data loss or a bootstrap re-seed, not
+// clone evidence — is denied but NOT locked, so once the recorded cert
+// expires the identity self-heals through the re-enroll amnesty instead of
+// requiring an operator to clear the record.
+func TestSignX509Workload_EmptySerialWhileValid(t *testing.T) {
+	const uri = "spiffe://corp/svc/billing"
+	guard := &fakeActiveCerts{m: map[string]store.ActiveCert{
+		uri: {
+			Identity: uri, CurrentSerial: "111",
+			CurrentNotAfter: time.Now().Add(time.Minute), // still valid
+		},
+	}}
+	srv, cap := newGuardedServer(t, guard)
+	pub := makeSubjectPubKeyPEM(t)
+	sign := func() *httptest.ResponseRecorder {
+		return postJSON(srv, "/api/v1/x509/sign-workload", "Bearer x", map[string]any{
+			"public_key": pub, "spiffe_uri": uri, // no current_serial
+		})
+	}
+
+	// While the recorded cert is valid: denied, but NOT locked.
+	if rec := sign(); rec.Code != http.StatusForbidden {
+		t.Fatalf("empty serial while valid: %d, want 403", rec.Code)
+	}
+	if ac := guard.current(uri); !ac.LockedAt.IsZero() {
+		t.Fatalf("empty serial must not lock: locked_at=%v locked_serial=%q", ac.LockedAt, ac.LockedSerial)
+	}
+	if last := cap.entries(t); last[len(last)-1].Action != audit.ActionX509WorkloadCertDenied {
+		t.Errorf("last audit = %q, want denied", last[len(last)-1].Action)
+	}
+
+	// Once the recorded cert expires, the same request re-enrolls (amnesty).
+	if err := guard.Upsert(store.ActiveCert{
+		Identity: uri, CurrentSerial: "111",
+		CurrentNotAfter: time.Now().Add(-time.Minute), // expired
+	}); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+	if rec := sign(); rec.Code != http.StatusOK {
+		t.Fatalf("re-enroll after expiry: %d %s", rec.Code, rec.Body.String())
 	}
 }
 

@@ -197,6 +197,22 @@ func (s *Server) handleSignX509WorkloadCert(w http.ResponseWriter, r *http.Reque
 					"expired_serial":    existing.CurrentSerial,
 					"expired_not_after": existing.CurrentNotAfter,
 				})
+			} else if presented == "" {
+				// No serial claimed while the recorded cert is still valid —
+				// data loss or a fresh bootstrap re-seed, not clone evidence
+				// (a clone presents a real superseded serial; empty never
+				// matched anything anyway). Deny WITHOUT locking so the
+				// identity self-heals via the expiry re-enroll path above
+				// once the recorded cert dies, instead of requiring an
+				// operator to clear the record.
+				s.emitAudit(r.Context(), audit.ActionX509WorkloadCertDenied, "workload:"+spiffeURI, caller.Caller, 0, r, map[string]any{
+					"spiffe_uri":        spiffeURI,
+					"reason":            "empty current_serial while recorded cert still valid",
+					"current_serial":    existing.CurrentSerial,
+					"current_not_after": existing.CurrentNotAfter,
+				})
+				writeError(w, http.StatusForbidden, "no current serial presented while a valid certificate is recorded for this identity; retry after it expires (re-enroll) or have an operator clear its active-cert record")
+				return
 			} else {
 				// Stale/unknown serial while the recorded cert is still
 				// valid — a superseded or fabricated cert reappearing, i.e. a
