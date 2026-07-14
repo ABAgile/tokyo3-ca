@@ -238,7 +238,7 @@ func (r *Renewer) SignOnce(ctx context.Context) (validAfter, validBefore time.Ti
 		// survives restarts without extra state. Empty on first issuance
 		// (or after a fresh bootstrap). certd's anti-theft guard, when
 		// active, accepts only the current or one-step-previous serial.
-		CurrentSerial: readCurrentSerial(r.cfg.CertOutputPath),
+		CurrentSerial: readCurrentSerial(r.cfg.CertOutputPath, r.cfg.Now()),
 	}
 	if r.cfg.RequestedTTL > 0 {
 		req.TTLSeconds = int64(r.cfg.RequestedTTL.Seconds())
@@ -446,10 +446,17 @@ func certWithChain(resp *client.SignWorkloadResponse) []byte {
 }
 
 // readCurrentSerial returns the decimal serial of the cert currently at
-// path, or "" when it's absent or unparseable (first issuance / fresh
-// bootstrap). Reading from disk keeps the renewer stateless across
-// restarts — the cert it holds IS its current serial.
-func readCurrentSerial(path string) string {
+// path, or "" when it's absent, unparseable, or EXPIRED (first issuance /
+// fresh bootstrap / stale material). Reading from disk keeps the renewer
+// stateless across restarts — the cert it holds IS its current serial.
+//
+// An expired cert's serial is deliberately not claimed: certd's anti-theft
+// guard treats a stale serial presented while the identity's recorded cert
+// is still valid as clone evidence and LOCKS the identity. Presenting
+// empty instead keeps recovery after data loss or a bootstrap re-seed on
+// the deny-then-amnesty path (denied until the recorded cert expires, then
+// re-enrolled) rather than the operator-only lock path.
+func readCurrentSerial(path string, now time.Time) string {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return ""
@@ -460,6 +467,9 @@ func readCurrentSerial(path string) string {
 	}
 	cert, err := x509.ParseCertificate(block.Bytes)
 	if err != nil {
+		return ""
+	}
+	if now.After(cert.NotAfter) {
 		return ""
 	}
 	return cert.SerialNumber.String()

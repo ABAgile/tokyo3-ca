@@ -3,9 +3,12 @@ package renew_test
 import (
 	"context"
 	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/x509"
 	"encoding/pem"
 	"errors"
+	"math/big"
 	"os"
 	"path/filepath"
 	"strings"
@@ -328,6 +331,72 @@ func TestRenewer_SignOnce_LoadsExistingKeyFromDisk(t *testing.T) {
 	keyAfter, _ := os.ReadFile(keyPath)
 	if string(keyBefore) != string(keyAfter) {
 		t.Error("key file changed when a second Renewer instance picked it up")
+	}
+}
+
+// writeSelfSignedCert writes a real self-signed cert with the given
+// validity window to path and returns its decimal serial.
+func writeSelfSignedCert(t *testing.T, path string, notBefore, notAfter time.Time) string {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(4242),
+		NotBefore:    notBefore,
+		NotAfter:     notAfter,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pemBytes := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	if err := os.WriteFile(path, pemBytes, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return tmpl.SerialNumber.String()
+}
+
+// TestRenewer_SignOnce_CurrentSerialFromDisk: a still-valid on-disk cert's
+// serial is presented as current_serial; an EXPIRED one is not — certd's
+// anti-theft guard treats a stale serial presented while the identity's
+// recorded cert is valid as clone evidence (LOCK), so the renewer claims
+// nothing and stays on the deny-then-amnesty recovery path.
+func TestRenewer_SignOnce_CurrentSerialFromDisk(t *testing.T) {
+	now := time.Now()
+	cases := []struct {
+		name       string
+		notAfter   time.Time
+		wantSerial string
+	}{
+		{"valid cert presents its serial", now.Add(time.Hour), "4242"},
+		{"expired cert presents empty", now.Add(-time.Minute), ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			certPath := filepath.Join(dir, "c.crt")
+			writeSelfSignedCert(t, certPath, now.Add(-2*time.Hour), tc.notAfter)
+			signer := &stubSigner{}
+			r, err := renew.New(renew.Config{
+				Signer: signer, SPIFFEURI: "spiffe://td/x",
+				CertOutputPath: certPath,
+				KeyOutputPath:  filepath.Join(dir, "k"),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, _, err := r.SignOnce(context.Background()); err != nil {
+				t.Fatalf("SignOnce: %v", err)
+			}
+			signer.mu.Lock()
+			got := signer.gotReq.CurrentSerial
+			signer.mu.Unlock()
+			if got != tc.wantSerial {
+				t.Errorf("CurrentSerial = %q, want %q", got, tc.wantSerial)
+			}
+		})
 	}
 }
 
