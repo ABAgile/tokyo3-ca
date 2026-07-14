@@ -442,6 +442,65 @@ func TestRenewer_Run_AppendsSignErrorAttrs(t *testing.T) {
 	}
 }
 
+func TestRenewer_Run_AbortOnSignError_ReturnsFatal(t *testing.T) {
+	dir := t.TempDir()
+	signer := &stubSigner{
+		respFn: func(_ client.SignWorkloadRequest) (*client.SignWorkloadResponse, error) {
+			return nil, errors.New("tls: bad certificate")
+		},
+	}
+	fatal := errors.New("own mTLS identity expired; exiting")
+	r, _ := renew.New(renew.Config{
+		Signer: signer, SPIFFEURI: "spiffe://td/x",
+		CertOutputPath:   filepath.Join(dir, "c.crt"),
+		KeyOutputPath:    filepath.Join(dir, "k"),
+		RetryBackoff:     time.Hour, // must not matter — abort skips the retry sleep
+		AbortOnSignError: func(error) error { return fatal },
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := r.Run(ctx); !errors.Is(err, fatal) {
+		t.Fatalf("Run() = %v, want %v", err, fatal)
+	}
+	if got := signer.calls.Load(); got != 1 {
+		t.Errorf("sign calls = %d, want 1 (no retry after abort)", got)
+	}
+}
+
+func TestRenewer_Run_AbortOnSignError_NilKeepsRetrying(t *testing.T) {
+	dir := t.TempDir()
+	signer := &stubSigner{
+		respFn: func(_ client.SignWorkloadRequest) (*client.SignWorkloadResponse, error) {
+			return nil, errors.New("certd unreachable")
+		},
+	}
+	var hookCalls atomic.Int32
+	r, _ := renew.New(renew.Config{
+		Signer: signer, SPIFFEURI: "spiffe://td/x",
+		CertOutputPath:   filepath.Join(dir, "c.crt"),
+		KeyOutputPath:    filepath.Join(dir, "k"),
+		MinRenewInterval: 10 * time.Millisecond,
+		RetryBackoff:     10 * time.Millisecond,
+		AbortOnSignError: func(error) error {
+			hookCalls.Add(1)
+			return nil // identity still valid — stay in the retry loop
+		},
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
+	defer cancel()
+	if err := r.Run(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Run() = %v, want context.DeadlineExceeded", err)
+	}
+	if got := signer.calls.Load(); got < 2 {
+		t.Errorf("sign calls = %d, want ≥ 2 (retries continue)", got)
+	}
+	if got := hookCalls.Load(); got != signer.calls.Load() {
+		t.Errorf("AbortOnSignError invocations = %d, want %d (once per failure)", got, signer.calls.Load())
+	}
+}
+
 func TestRenewer_Run_RetryOnFailureThenSucceed(t *testing.T) {
 	dir := t.TempDir()
 	var calls atomic.Int32

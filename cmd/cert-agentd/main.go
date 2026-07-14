@@ -256,6 +256,23 @@ func runAgent(ctx context.Context) error {
 			log.Info("workload cert installed for mTLS",
 				"valid_after", validAfter, "valid_before", validBefore)
 		},
+		// Dead-end detector: once the agent's OWN mTLS identity (the very
+		// cert it presents to certd) has expired, every retry is guaranteed
+		// to fail the TLS handshake — an in-process retry loop can never
+		// recover. Exit fatally instead so the supervisor's restart policy
+		// plus the entrypoint's bootstrap re-seed (which replaces an expired
+		// svid.pem) can heal. While the identity is still valid, sign
+		// failures stay retryable — a certd outage must not kill the agent
+		// and the still-valid credentials it serves.
+		AbortOnSignError: func(signErr error) error {
+			exp := r.LeafExpiry()
+			if exp.IsZero() || time.Now().Before(exp) {
+				return nil // identity usable (or unknown) — keep retrying
+			}
+			return fmt.Errorf("own mTLS identity expired %s ago (not_after %s); "+
+				"renewal cannot succeed — exiting so a restart can re-seed bootstrap credentials: %w",
+				time.Since(exp).Round(time.Second), exp.Format(time.RFC3339), signErr)
+		},
 		SignErrorAttrs: r.ExpiryAttrs("mtls_cert_remaining"),
 		Log:            log,
 	})

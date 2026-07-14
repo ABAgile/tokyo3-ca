@@ -121,6 +121,18 @@ type Config struct {
 	// by the TLS stack, etc.). Nil ⇒ no-op.
 	OnRenewed func(validAfter, validBefore time.Time)
 
+	// AbortOnSignError, if set, is consulted after each failed
+	// SignOnce inside Run with the sign error. Returning a non-nil
+	// error makes Run return it immediately instead of scheduling a
+	// retry. Wire this to a dead-end detector — e.g., "the mTLS
+	// identity this agent presents to certd is already expired, so
+	// every retry is guaranteed to fail the handshake" — so the
+	// process exits and the supervisor's restart (+ bootstrap re-seed)
+	// path can heal what an in-process retry loop never will. Nil ⇒
+	// always retry (default; a certd outage must not kill consumers
+	// whose credentials are still valid).
+	AbortOnSignError func(signErr error) error
+
 	// SignErrorAttrs, if set, returns extra structured fields the
 	// renewer appends to its per-failure retry-log warn line. Use
 	// this to thread caller-specific context (e.g., remaining
@@ -284,12 +296,21 @@ func (r *Renewer) SignOnce(ctx context.Context) (validAfter, validBefore time.Ti
 // fraction of validity elapsed. Returns when ctx is cancelled.
 // Signing failures schedule a retry after [Config.RetryBackoff]
 // rather than crashing — the consumer keeps using the existing
-// credentials until they expire.
+// credentials until they expire — unless [Config.AbortOnSignError]
+// declares the failure a dead-end, in which case Run returns its
+// error immediately.
 func (r *Renewer) Run(ctx context.Context) error {
 	for {
 		validAfter, validBefore, err := r.SignOnce(ctx)
 		var wait time.Duration
 		if err != nil {
+			if r.cfg.AbortOnSignError != nil {
+				if abortErr := r.cfg.AbortOnSignError(err); abortErr != nil {
+					r.cfg.Log.Error("workload cert sign failed; aborting renewal loop",
+						"err", err, "abort", abortErr)
+					return abortErr
+				}
+			}
 			args := []any{"err", err, "backoff", r.cfg.RetryBackoff}
 			if r.cfg.SignErrorAttrs != nil {
 				args = append(args, r.cfg.SignErrorAttrs()...)
