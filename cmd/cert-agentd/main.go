@@ -156,7 +156,7 @@ func rootCmd() *cobra.Command {
 		Use:   appName,
 		Short: "tokyo3-ca workload credential agent",
 	}
-	root.AddCommand(runCmd(), versionCmd())
+	root.AddCommand(runCmd(), checkCertCmd(), versionCmd())
 	return root
 }
 

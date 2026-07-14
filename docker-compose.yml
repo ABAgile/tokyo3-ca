@@ -257,7 +257,16 @@ services:
     command:
       - |
         mkdir -p /tokyo3/agent/authd /tokyo3/workloads
-        if [ ! -s /tokyo3/agent/authd/svid.pem ] || [ ! -s /tokyo3/agent/authd/svid.key ]; then
+        # Re-seed when the on-disk SVID is missing OR expired (e.g. host
+        # slept past the 120s TTL and the agent lost its mTLS identity to
+        # certd). --within 0s on purpose: certd's anti-theft guard only
+        # grants re-enroll amnesty once the recorded cert has EXPIRED —
+        # re-seeding a still-valid SVID would present the bootstrap serial
+        # while the recorded serial is live and risk a clone-suspect LOCK.
+        if [ ! -s /tokyo3/agent/authd/svid.pem ] || [ ! -s /tokyo3/agent/authd/svid.key ] \
+           || ! cert-agentd check-cert /tokyo3/agent/authd/svid.pem --within 0s; then
+          cert-agentd check-cert /shared/certs/cert-agentd-authd.crt --within 30s || \
+            echo "cert-agentd-authd: WARNING bootstrap cert unusable — re-run ca init-env" >&2
           cp /shared/certs/cert-agentd-authd.crt /tokyo3/agent/authd/svid.pem
           cp /shared/certs/cert-agentd-authd.key /tokyo3/agent/authd/svid.key
           chmod 644 /tokyo3/agent/authd/svid.pem
@@ -315,7 +324,16 @@ services:
     command:
       - |
         mkdir -p /tokyo3/agent/vaultd /tokyo3/workloads
-        if [ ! -s /tokyo3/agent/vaultd/svid.pem ] || [ ! -s /tokyo3/agent/vaultd/svid.key ]; then
+        # Re-seed when the on-disk SVID is missing OR expired (e.g. host
+        # slept past the 120s TTL and the agent lost its mTLS identity to
+        # certd). --within 0s on purpose: certd's anti-theft guard only
+        # grants re-enroll amnesty once the recorded cert has EXPIRED —
+        # re-seeding a still-valid SVID would present the bootstrap serial
+        # while the recorded serial is live and risk a clone-suspect LOCK.
+        if [ ! -s /tokyo3/agent/vaultd/svid.pem ] || [ ! -s /tokyo3/agent/vaultd/svid.key ] \
+           || ! cert-agentd check-cert /tokyo3/agent/vaultd/svid.pem --within 0s; then
+          cert-agentd check-cert /shared/certs/cert-agentd-vaultd.crt --within 30s || \
+            echo "cert-agentd-vaultd: WARNING bootstrap cert unusable — re-run ca init-env" >&2
           cp /shared/certs/cert-agentd-vaultd.crt /tokyo3/agent/vaultd/svid.pem
           cp /shared/certs/cert-agentd-vaultd.key /tokyo3/agent/vaultd/svid.key
           chmod 644 /tokyo3/agent/vaultd/svid.pem
