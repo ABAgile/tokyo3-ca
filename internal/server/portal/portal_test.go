@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -37,11 +38,18 @@ func newClient() *http.Client {
 	}
 }
 
+// csrfFieldRE extracts the hidden csrf_token field's value from a
+// rendered form page — the masked wire value, distinct from the sealed
+// certd_csrf_session cookie (see base/csrf: forms carry a per-render
+// masked token; the CSRF secret sealed into the anonymous session cookie
+// is the stable value tokens derive from).
+var csrfFieldRE = regexp.MustCompile(`name="csrf_token" value="([^"]+)"`)
+
 // postForm runs a GET against the form's typical entry page to
-// acquire a CSRF cookie + token, then submits the POST with the
-// matching csrf_token field + cookie. Tests calling postForm don't
-// need to know about the CSRF wiring — adding a new POST route's
-// happy path keeps working.
+// acquire a CSRF cookie + the rendered (masked) token, then submits the
+// POST with the matching csrf_token field + cookie. Tests calling
+// postForm don't need to know about the CSRF wiring — adding a new
+// POST route's happy path keeps working.
 func postForm(t *testing.T, postURL string, form url.Values) *http.Response {
 	t.Helper()
 	client := newClient()
@@ -64,24 +72,32 @@ func postForm(t *testing.T, postURL string, form url.Values) *http.Response {
 		t.Fatalf("CSRF prefetch GET %s: %v", getURL, err)
 	}
 	defer getResp.Body.Close()
-	_, _ = io.Copy(io.Discard, getResp.Body)
+	body, err := io.ReadAll(getResp.Body)
+	if err != nil {
+		t.Fatalf("read prefetch body: %v", err)
+	}
 
-	var token string
+	var cookieVal string
 	for _, c := range getResp.Cookies() {
-		if c.Name == "certd_csrf" {
-			token = c.Value
+		if c.Name == "certd_csrf_session" {
+			cookieVal = c.Value
 		}
 	}
-	if token == "" {
+	if cookieVal == "" {
 		t.Fatalf("CSRF prefetch returned no cookie for %s", getURL)
 	}
-	// Insert the token into the form. Caller-supplied values win
+	m := csrfFieldRE.FindSubmatch(body)
+	if m == nil {
+		t.Fatalf("CSRF prefetch page %s has no csrf_token field", getURL)
+	}
+	fieldVal := string(m[1])
+	// Insert the (masked) token into the form. Caller-supplied values win
 	// (for tests that want to deliberately submit a bad token).
 	if _, present := form["csrf_token"]; !present {
 		if form == nil {
 			form = url.Values{}
 		}
-		form.Set("csrf_token", token)
+		form.Set("csrf_token", fieldVal)
 	}
 
 	req, err := http.NewRequest(http.MethodPost, postURL, strings.NewReader(form.Encode()))
@@ -89,7 +105,7 @@ func postForm(t *testing.T, postURL string, form url.Values) *http.Response {
 		t.Fatalf("build request: %v", err)
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.AddCookie(&http.Cookie{Name: "certd_csrf", Value: token})
+	req.AddCookie(&http.Cookie{Name: "certd_csrf_session", Value: cookieVal})
 	resp, err := client.Do(req)
 	if err != nil {
 		t.Fatalf("POST %s: %v", postURL, err)

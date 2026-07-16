@@ -1,96 +1,59 @@
 package portal
 
 import (
-	"crypto/rand"
-	"crypto/subtle"
-	"encoding/base64"
 	"net/http"
+
+	"github.com/abagile/tokyo3-base/csrf"
 )
 
-// csrfCookieName is the cookie that holds the per-browser CSRF
-// token. SameSite=Lax keeps third-party POSTs from carrying it; the
-// double-submit pattern then confirms the page that submitted the
-// form was loaded from this same origin (and is not a cross-site
-// forgery from a different tab).
-const csrfCookieName = "certd_csrf"
+// csrfScope partitions the session-bound CSRF tokens minted for this
+// portal. One scope for all forms: pages mix multiple form actions (e.g.
+// the role detail page carries the delete button), so per-action scoping
+// would need per-form token plumbing for marginal gain.
+const csrfScope = "certd-portal"
 
-// csrfTokenLength is the entropy bound for the token. 32 random
-// bytes (256 bits) → 44-char base64 string. More than enough to
-// resist online-guessing against a stateless verifier.
-const csrfTokenLength = 32
-
-// ensureCSRFToken reads the CSRF cookie from r, generating + setting
-// a new one when absent or malformed. Returns the canonical token
-// value the caller embeds in form templates. Setting Set-Cookie on
-// every GET keeps the rotation cadence operator-tunable later
-// without a schema change here.
-func ensureCSRFToken(w http.ResponseWriter, r *http.Request) string {
-	if c, err := r.Cookie(csrfCookieName); err == nil && validCSRFShape(c.Value) {
-		return c.Value
-	}
-	buf := make([]byte, csrfTokenLength)
-	_, _ = rand.Read(buf)
-	token := base64.RawURLEncoding.EncodeToString(buf)
-	http.SetCookie(w, &http.Cookie{
-		Name:     csrfCookieName,
-		Value:    token,
-		Path:     "/",
-		HttpOnly: false, // template reads the value via the renderer; no JS access needed but no risk either
-		Secure:   isHTTPS(r),
-		SameSite: http.SameSiteLaxMode,
-	})
-	return token
-}
-
-// validateCSRF returns true when r.PostForm["csrf_token"] matches
-// the cookie value. Both sides are checked under
-// [subtle.ConstantTimeCompare] to avoid leaking timing info on the
-// comparison itself.
+// csrfToken returns the anti-CSRF token handlers embed in form templates —
+// session-bound in both auth modes (an HMAC over the sealed session's
+// CSRF secret; see base/csrf), differing only in who establishes the
+// session:
 //
-// The caller is expected to have already called r.ParseForm() —
-// every POST handler in the portal does. validateCSRF returns false
-// rather than erroring on missing cookie / missing form field so
-// the handler can render a uniform "session expired or forged
-// request" message.
-func validateCSRF(r *http.Request) bool {
-	c, err := r.Cookie(csrfCookieName)
-	if err != nil || !validCSRFShape(c.Value) {
-		return false
+//   - OIDC mode: the login callback issued the session; the Gate
+//     guarantees it exists by the time a form renders, so a missing
+//     session here just yields "" — the eventual POST is bounced by the
+//     Gate anyway, and an empty embedded token fails validation uniformly.
+//   - Basic-auth mode: there is no login event (Basic auth
+//     re-authenticates every request), so nothing naturally issues a
+//     session. The first form render mints an ANONYMOUS one lazily —
+//     identity fields empty, only the CSRF secret populated — purely as
+//     the secret's transport; Basic auth remains the actual gate on every
+//     request. Stable until expiry (no rotation), so long-running /
+//     multi-tab submissions keep working.
+func (s *Server) csrfToken(w http.ResponseWriter, r *http.Request) string {
+	if tok, err := s.sess.CSRFToken(r, csrfScope); err == nil {
+		return tok
 	}
-	got := r.PostForm.Get("csrf_token")
-	if !validCSRFShape(got) {
-		return false
+	if s.auth != nil {
+		return "" // OIDC mode: never mint sessions outside the login flow
 	}
-	return subtle.ConstantTimeCompare([]byte(c.Value), []byte(got)) == 1
+	anon, err := s.sess.NewSession()
+	if err != nil {
+		return "" // out of entropy — fails closed; validation rejects ""
+	}
+	if err := s.sess.IssueSession(w, r, anon); err != nil {
+		return ""
+	}
+	// The fresh session cookie is on w, not r, so CSRFToken(r) can't see
+	// it yet — mint the first token straight from the new secret.
+	tok, err := csrf.Token(anon.CSRFSecret, csrfScope)
+	if err != nil {
+		return ""
+	}
+	return tok
 }
 
-// validCSRFShape is a cheap structural check — the value must
-// look like a base64url string of the right length. Catches
-// truncated cookies and outright junk without involving the
-// constant-time compare.
-func validCSRFShape(v string) bool {
-	if len(v) == 0 {
-		return false
-	}
-	// RawURLEncoding length = ceil(csrfTokenLength * 4 / 3); for
-	// 32 bytes that's 43 chars. Reject anything longer than ~80
-	// to bound the work; shorter than 32 is also rejected.
-	if len(v) < 32 || len(v) > 80 {
-		return false
-	}
-	_, err := base64.RawURLEncoding.DecodeString(v)
-	return err == nil
-}
-
-// isHTTPS returns true when the request arrived over TLS. Drives
-// the cookie's Secure flag — set on TLS, clear over plaintext so
-// dev / curl-test setups keep working.
-func isHTTPS(r *http.Request) bool {
-	if r.TLS != nil {
-		return true
-	}
-	if r.Header.Get("X-Forwarded-Proto") == "https" {
-		return true
-	}
-	return false
+// checkCSRF verifies the csrf_token form field on a POST against the
+// request's session — the same scheme csrfToken used at render time,
+// regardless of auth mode. The caller has already run r.ParseForm().
+func (s *Server) checkCSRF(r *http.Request) bool {
+	return s.sess.ValidateCSRF(r, r.PostForm.Get("csrf_token"), csrfScope)
 }

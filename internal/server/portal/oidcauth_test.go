@@ -8,12 +8,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/abagile/tokyo3-base/oidc"
 
+	"github.com/abagile/tokyo3-ca/internal/server/policy"
 	"github.com/abagile/tokyo3-ca/internal/server/portal"
 )
 
@@ -67,11 +69,14 @@ func TestRequirePortalAuthGate(t *testing.T) {
 	s := newOIDCPortal(t, &fakeVerifier{}, "https://idp.example", "ca-portal-admin")
 	h := s.Routes()
 
-	// No session: GET redirects to login, non-GET is 401.
+	// No session: GET redirects to login, non-GET is 401. The Location is
+	// browser-space — the api server mounts this tree under
+	// StripPrefix("/portal"), so an unprefixed /auth/login would 404
+	// outside the mount.
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/roles", nil))
-	if rec.Code != http.StatusSeeOther || !strings.HasPrefix(rec.Header().Get("Location"), "/auth/login") {
-		t.Errorf("GET no session = %d loc=%q, want 303 → /auth/login", rec.Code, rec.Header().Get("Location"))
+	if rec.Code != http.StatusSeeOther || rec.Header().Get("Location") != "/portal/auth/login?return_to=%2Fportal%2Froles" {
+		t.Errorf("GET no session = %d loc=%q, want 303 → /portal/auth/login?return_to=%%2Fportal%%2Froles", rec.Code, rec.Header().Get("Location"))
 	}
 	rec = httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/roles/new", nil))
@@ -186,6 +191,100 @@ func TestFullLoginFlow(t *testing.T) {
 	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Errorf("authenticated GET / = %d, want 200", rec.Code)
+	}
+}
+
+// TestOIDCMode_SessionBoundCSRF: with OIDC login active the portal's forms
+// carry session-bound tokens (HMAC over the sealed session's secret) — the
+// Basic-mode CSRF-carrier cookie is never issued nor honoured, so a planted
+// cookie pair can't forge a POST, while the token rendered into the form
+// round-trips.
+func TestOIDCMode_SessionBoundCSRF(t *testing.T) {
+	tokenSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"access_token": "at", "id_token": "it"})
+	}))
+	defer tokenSrv.Close()
+
+	fv := &fakeVerifier{claims: &oidc.Claims{Subject: "u1", Email: "admin@example.com", Groups: []string{"ca-portal-admin"}}}
+	store := policy.NewInMemoryStore()
+	s, err := portal.New(portal.Config{
+		Log:       slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Now:       func() time.Time { return oidcFixedNow },
+		RoleStore: store,
+		OIDC: portal.OIDCConfig{
+			Issuer: tokenSrv.URL, ClientID: "portal", ClientSecret: "secret",
+			RedirectURL: "https://certd.example/portal/auth/callback",
+			AdminGroup:  "ca-portal-admin", Verifier: fv, SessionKey: testKey(),
+		},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	h := s.Routes()
+
+	// Login dance → session cookie.
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/auth/login", nil))
+	fc := findCookie(rec.Result().Cookies(), "certd_portal_flow")
+	loc, _ := url.Parse(rec.Header().Get("Location"))
+	fv.claims.Nonce = loc.Query().Get("nonce")
+	rec = httptest.NewRecorder()
+	cb := httptest.NewRequest(http.MethodGet, "/auth/callback?code=xyz&state="+url.QueryEscape(loc.Query().Get("state")), nil)
+	cb.AddCookie(fc)
+	h.ServeHTTP(rec, cb)
+	sc := findCookie(rec.Result().Cookies(), "certd_portal_session")
+	if sc == nil {
+		t.Fatalf("no session cookie (callback = %d)", rec.Code)
+	}
+
+	// The rendered form embeds a session-bound token; no certd_csrf_session cookie is set.
+	rec = httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/roles/new", nil)
+	req.AddCookie(sc)
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /roles/new = %d", rec.Code)
+	}
+	if findCookie(rec.Result().Cookies(), "certd_csrf_session") != nil {
+		t.Error("Basic-mode CSRF-carrier cookie set despite OIDC mode")
+	}
+	if cc := rec.Header().Get("Cache-Control"); cc != "no-store" {
+		t.Errorf("Cache-Control = %q, want no-store (token-bearing page must not be cached)", cc)
+	}
+	m := regexp.MustCompile(`name="csrf_token" value="([^"]+)"`).FindStringSubmatch(rec.Body.String())
+	if m == nil {
+		t.Fatal("no csrf_token embedded in form")
+	}
+	token := m[1]
+
+	post := func(csrfField string, extra ...*http.Cookie) *httptest.ResponseRecorder {
+		form := url.Values{"name": {"eng"}, "group_claim": {"eng"}, "csrf_token": {csrfField}}
+		r := httptest.NewRequest(http.MethodPost, "/roles/new", strings.NewReader(form.Encode()))
+		r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		r.AddCookie(sc)
+		for _, c := range extra {
+			r.AddCookie(c)
+		}
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, r)
+		return rec
+	}
+
+	// A planted Basic-mode cookie + matching field must NOT pass in OIDC mode.
+	planted := "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+	if rec := post(planted, &http.Cookie{Name: "certd_csrf_session", Value: planted}); rec.Code != http.StatusForbidden {
+		t.Errorf("planted cookie+field POST = %d, want 403", rec.Code)
+	}
+	if len(store.All()) != 0 {
+		t.Fatal("store mutated by forged POST")
+	}
+
+	// The session-bound token from the form succeeds.
+	if rec := post(token); rec.Code != http.StatusSeeOther {
+		t.Errorf("session-bound POST = %d, want 303 (body: %s)", rec.Code, rec.Body.String())
+	}
+	if len(store.All()) != 1 {
+		t.Errorf("role not created: store has %d roles", len(store.All()))
 	}
 }
 

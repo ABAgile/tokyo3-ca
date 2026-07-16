@@ -20,8 +20,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/abagile/tokyo3-base/crypto"
 	"github.com/abagile/tokyo3-base/httpauth"
 	"github.com/abagile/tokyo3-base/oidc"
+	"github.com/abagile/tokyo3-base/session"
 
 	"github.com/abagile/tokyo3-ca/internal/server/krl"
 	"github.com/abagile/tokyo3-ca/internal/server/mtls"
@@ -33,8 +35,10 @@ import (
 // and (optionally) an admin-group gate. When enabled it supersedes the HTTP
 // Basic gate; mutations are then attributed to the signed-in user's email.
 //
-// The flow, cookies, and gate are implemented by base/oidc.Authenticator —
-// this struct is the wiring certd reads from env and passes through.
+// The Authorization-Code + PKCE flow is implemented by base/oidc.Authenticator;
+// the session cookie, gate, and CSRF tokens by the base/session.Manager it's
+// constructed with. This struct is the wiring certd reads from env and passes
+// through to both.
 type OIDCConfig struct {
 	Issuer       string             // IdP issuer URL (e.g. https://id.example.com)
 	ClientID     string             // portal's registered OIDC client_id (= ID-token audience)
@@ -42,8 +46,15 @@ type OIDCConfig struct {
 	RedirectURL  string             // absolute https://<certd>/portal/auth/callback
 	AdminGroup   string             // required group claim for access; "" ⇒ any authenticated user
 	Verifier     oidc.TokenVerifier // validates the returned ID token (audience = ClientID)
-	SessionKey   []byte             // 32-byte KEK sealing the session + flow cookies
-	SessionTTL   time.Duration      // session lifetime; 0 ⇒ base default
+	// SessionKey is a 32-byte KEK sealing the session + flow cookies when
+	// OIDC login is active. Independent of the rest of this struct: also
+	// read by New even when OIDC isn't configured, to seal the Basic-auth
+	// path's anonymous CSRF-carrier session cookie with a key stable
+	// across restarts. Empty there ⇒ New generates an ephemeral
+	// per-process key instead (restarting then invalidates in-flight CSRF
+	// tokens — an affected tab needs a reload).
+	SessionKey []byte
+	SessionTTL time.Duration // session lifetime; 0 ⇒ base default
 }
 
 func (c OIDCConfig) enabled() bool {
@@ -98,7 +109,13 @@ type MutableRoleStore interface {
 type Server struct {
 	cfg   Config
 	pages map[string]*template.Template
-	auth  *oidc.Authenticator // native-OIDC login + gate; nil when OIDC is not configured (Basic-auth path)
+	auth  *oidc.Authenticator // native-OIDC login flow; nil when OIDC is not configured (Basic-auth path)
+	// sess is always non-nil: in OIDC mode it is the login session + gate;
+	// in Basic-auth mode it only transports the anonymous CSRF secret (see
+	// csrfToken) — Basic auth stays the actual gate, and a different cookie
+	// prefix keeps the two modes' cookies mutually unreadable even across a
+	// mode switch under the same key.
+	sess *session.Manager
 }
 
 // Config wires a [Server]. Optional fields default sensibly.
@@ -172,26 +189,68 @@ func New(cfg Config) (*Server, error) {
 	}
 	s := &Server{cfg: cfg, pages: pages}
 	if cfg.OIDC.enabled() {
+		sess, err := session.New(session.Config{
+			RequiredGroup: cfg.OIDC.AdminGroup,
+			SessionKey:    cfg.OIDC.SessionKey,
+			SessionTTL:    cfg.OIDC.SessionTTL,
+			CookiePrefix:  "certd_portal",
+			// The api server mounts this tree under StripPrefix(basePath), so
+			// the Manager matches routes in stripped space but must emit
+			// browser-space redirects and cookie scopes — without this the
+			// login redirect points outside the mount and 404s.
+			BasePath: basePath,
+			// /auth/callback must be exempt here (not just /healthz) or the
+			// OIDC callback itself gets redirected to login before it can
+			// complete — oidc.NewAuthenticator verifies this and refuses to
+			// construct otherwise.
+			ExemptPaths: []string{"/healthz", "/auth/callback"},
+			Now:         cfg.Now,
+			Log:         cfg.Log,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("portal session: %w", err)
+		}
 		auth, err := oidc.NewAuthenticator(oidc.AuthenticatorConfig{
 			Issuer:       cfg.OIDC.Issuer,
 			ClientID:     cfg.OIDC.ClientID,
 			ClientSecret: cfg.OIDC.ClientSecret,
 			RedirectURL:  cfg.OIDC.RedirectURL,
-			AdminGroup:   cfg.OIDC.AdminGroup,
 			Verifier:     cfg.OIDC.Verifier,
-			SessionKey:   cfg.OIDC.SessionKey,
-			SessionTTL:   cfg.OIDC.SessionTTL,
-			CookiePrefix: "certd_portal",
-			CookiePath:   basePath + "/",
-			ExemptPaths:  []string{"/healthz"},
-			Now:          cfg.Now,
-			Log:          cfg.Log,
-		})
+			// SessionKey/CookiePrefix/Now/Log are NOT repeated here — the flow
+			// cookie and all logging derive from sess (session.Manager.SiblingCookie
+			// / .Log), so there's nothing left to keep in sync between the two configs.
+		}, sess)
 		if err != nil {
 			return nil, fmt.Errorf("portal oidc: %w", err)
 		}
+		s.sess = sess
 		s.auth = auth
+		return s, nil
 	}
+	// Basic-auth mode: no login flow, but CSRF tokens still need a sealed
+	// session to bind to — csrfToken lazily issues an anonymous one. The
+	// key is the configured SessionKey when set (stable across restarts),
+	// else an ephemeral per-process one. The distinct cookie prefix keeps
+	// this cookie from ever being readable as an OIDC login session.
+	key := cfg.OIDC.SessionKey
+	if len(key) == 0 {
+		var err error
+		key, err = crypto.RandomBytes(32)
+		if err != nil {
+			return nil, fmt.Errorf("portal csrf session key: %w", err)
+		}
+	}
+	sess, err := session.New(session.Config{
+		SessionKey:   key,
+		CookiePrefix: "certd_csrf",
+		BasePath:     basePath,
+		Now:          cfg.Now,
+		Log:          cfg.Log,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("portal csrf session: %w", err)
+	}
+	s.sess = sess
 	return s, nil
 }
 
@@ -199,6 +258,10 @@ func New(cfg Config) (*Server, error) {
 // executes its "page" entry — the in-set wrapper that pulls the
 // page-specific title/body into the shared base layout.
 func (s *Server) render(w http.ResponseWriter, page string, data any) {
+	// Every portal page is authenticated, dynamic HTML; form pages embed
+	// anti-CSRF tokens. no-store keeps them out of browser/shared caches —
+	// the cached-HTML token-leak channel — and off the back-forward cache.
+	w.Header().Set("Cache-Control", "no-store")
 	tmpl, ok := s.pages[page]
 	if !ok {
 		s.cfg.Log.Error("portal render: unknown page", "page", page)
@@ -234,8 +297,8 @@ func (s *Server) Routes() http.Handler {
 	if s.auth != nil {
 		mux.HandleFunc("GET /auth/login", s.auth.LoginHandler())
 		mux.HandleFunc("GET /auth/callback", s.auth.CallbackHandler())
-		mux.HandleFunc("POST /auth/logout", s.auth.LogoutHandler())
-		return s.auth.Gate(mux)
+		mux.HandleFunc("POST /auth/logout", s.sess.LogoutHandler())
+		return s.sess.Gate(mux)
 	}
 	return httpauth.BasicAuth(s.cfg.BasicAuth, mux, "/healthz")
 }
@@ -320,7 +383,7 @@ func (s *Server) handleRoleDetail(w http.ResponseWriter, r *http.Request) {
 		Version:    s.cfg.Version,
 		RenderedAt: s.cfg.Now(),
 		Name:       name,
-		CSRFToken:  ensureCSRFToken(w, r),
+		CSRFToken:  s.csrfToken(w, r),
 	}
 	for _, role := range s.cfg.RoleStore.All() {
 		if role.Name == name {
@@ -346,7 +409,7 @@ type roleFormData struct {
 	FormAction string
 	Submit     string // submit-button label
 	Error      string // validation error to surface above the form
-	CSRFToken  string // double-submit-cookie value embedded as a hidden input
+	CSRFToken  string // session-bound anti-CSRF token embedded as a hidden input
 
 	// Editing an existing role: OriginalName is the lookup key; Form
 	// is the values to render in inputs.
@@ -380,7 +443,7 @@ func (s *Server) handleRoleNewForm(w http.ResponseWriter, r *http.Request) {
 		Mode:       "create",
 		FormAction: "/roles/new",
 		Submit:     "Create role",
-		CSRFToken:  ensureCSRFToken(w, r),
+		CSRFToken:  s.csrfToken(w, r),
 	})
 }
 
@@ -394,7 +457,7 @@ func (s *Server) handleRoleCreate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "parse form: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	if !validateCSRF(r) {
+	if !s.checkCSRF(r) {
 		http.Error(w, "session expired or forged request — reload the page and try again", http.StatusForbidden)
 		return
 	}
@@ -431,7 +494,7 @@ func (s *Server) handleRoleEditForm(w http.ResponseWriter, r *http.Request) {
 		Submit:       "Save changes",
 		OriginalName: name,
 		Form:         roleToForm(role),
-		CSRFToken:    ensureCSRFToken(w, r),
+		CSRFToken:    s.csrfToken(w, r),
 	})
 }
 
@@ -445,7 +508,7 @@ func (s *Server) handleRoleUpdate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "parse form: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	if !validateCSRF(r) {
+	if !s.checkCSRF(r) {
 		http.Error(w, "session expired or forged request — reload the page and try again", http.StatusForbidden)
 		return
 	}
@@ -473,7 +536,7 @@ func (s *Server) handleRoleDelete(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "parse form: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	if !validateCSRF(r) {
+	if !s.checkCSRF(r) {
 		http.Error(w, "session expired or forged request — reload the page and try again", http.StatusForbidden)
 		return
 	}
@@ -543,7 +606,7 @@ func (s *Server) handleRevocationsIndex(w http.ResponseWriter, r *http.Request) 
 		Version:    s.cfg.Version,
 		RenderedAt: s.cfg.Now(),
 		Entries:    s.cfg.RevocationStore.Snapshot().Entries,
-		CSRFToken:  ensureCSRFToken(w, r),
+		CSRFToken:  s.csrfToken(w, r),
 	})
 }
 
@@ -556,7 +619,7 @@ func (s *Server) handleRevocationsCreate(w http.ResponseWriter, r *http.Request)
 		http.Error(w, "parse form: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	if !validateCSRF(r) {
+	if !s.checkCSRF(r) {
 		http.Error(w, "session expired or forged request — reload the page and try again", http.StatusForbidden)
 		return
 	}
@@ -599,7 +662,7 @@ func (s *Server) renderRevocationError(w http.ResponseWriter, r *http.Request, m
 		RenderedAt: s.cfg.Now(),
 		Entries:    s.cfg.RevocationStore.Snapshot().Entries,
 		Error:      msg,
-		CSRFToken:  ensureCSRFToken(w, r),
+		CSRFToken:  s.csrfToken(w, r),
 		FormSerial: serial,
 		FormKeyID:  keyID,
 		FormReason: reason,
@@ -659,7 +722,7 @@ func (s *Server) renderFormError(w http.ResponseWriter, r *http.Request, mode, a
 		Error:        err.Error(),
 		OriginalName: originalName,
 		Form:         fields,
-		CSRFToken:    ensureCSRFToken(w, r),
+		CSRFToken:    s.csrfToken(w, r),
 	})
 }
 

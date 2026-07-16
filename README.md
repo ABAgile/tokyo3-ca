@@ -514,7 +514,13 @@ internal/
   credentials (`CERTD_PORTAL_USERNAME`/`CERTD_PORTAL_PASSWORD`, default
   `admin` / `certd-dev` — override via the host env). OIDC needs a real
   IdP, so the rig uses the Basic gate; setting only one of the two creds
-  leaves the portal unguarded.
+  leaves the portal unguarded. Its anonymous CSRF-carrier session cookie
+  is sealed (AES-256-GCM) under `CERTD_PORTAL_SESSION_KEY` when set —
+  independent of the rest of OIDC, so it may be set alone — for a key
+  stable across restarts; left unset, certd generates one ephemeral
+  per-process key instead (fine for a single instance; a restart then
+  invalidates in-flight Basic-auth CSRF tokens, and the key isn't shared
+  across replicas).
 - **Native OIDC portal login.** When the `CERTD_PORTAL_OIDC_*` env is
   set, the portal runs a browser Authorization-Code + PKCE flow against
   the IdP (`/portal/auth/login` → `/authorize` → `/portal/auth/callback`),
@@ -618,11 +624,15 @@ internal/
   renewal" to "until the ack" (best-effort; a missed ack just leaves the
   one-step grace). Off entirely without a store. Refresh-token-rotation
   + reuse-detection, applied to certs — see `certd-store-design.md`.
-  CSRF protection on every POST: each GET sets a `certd_csrf`
-  cookie (256 bits of entropy, `SameSite=Lax`, `Secure` over HTTPS)
-  and the rendered form embeds the matching value as a hidden
-  input. POST handlers reject any submission whose cookie + field
-  don't match (constant-time compare). An HTTP Basic auth gate
+  CSRF protection on every POST: tokens are session-bound in both auth
+  modes (HMAC over a per-session secret sealed into the session cookie;
+  per-render masked, constant-time compared — see `base/csrf`). Under
+  OIDC the secret rides the login session; under Basic auth the first
+  form render lazily issues an anonymous `certd_csrf_session` cookie
+  (`SameSite=Lax`, `Secure` over HTTPS, `HttpOnly`) that only carries
+  the secret — Basic auth remains the gate on every request. POST
+  handlers reject any submission whose token doesn't validate against
+  the session's secret. An HTTP Basic auth gate
   (constant-time compared) activates when `CERTD_PORTAL_USERNAME`
   + `CERTD_PORTAL_PASSWORD` are both set; `/healthz` stays open so
   watchdogs don't need the credential. When the basic-auth pair is

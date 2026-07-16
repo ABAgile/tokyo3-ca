@@ -156,6 +156,14 @@
 //	CERTD_PORTAL_SESSION_KEY         64-hex-char (32-byte) key sealing the portal session + flow
 //	                                 cookies (AES-256-GCM). Required to enable OIDC login; generate
 //	                                 with crypto.GenerateKEK. Rotating it invalidates live sessions.
+//	                                 Independent of the OIDC fields above — may be set alone, with
+//	                                 no OIDC configured at all, in which case the Basic-auth path
+//	                                 also uses it to seal its anonymous CSRF-carrier session cookie
+//	                                 with a key stable across restarts. Left unset there, certd
+//	                                 generates an ephemeral per-process key instead: fine for a
+//	                                 single instance, but it invalidates in-flight Basic-auth CSRF
+//	                                 tokens on every restart, and isn't shared across multiple
+//	                                 certd replicas.
 //
 //	CERTD_ROLES_FILE  Path to a JSON file holding the role table — top-level array of role
 //	                  objects matching the [policy.Role] shape (Name, GroupClaim,
@@ -765,8 +773,22 @@ func loadPortalOIDC(log *slog.Logger) (portal.OIDCConfig, error) {
 	keyHex := os.Getenv("CERTD_PORTAL_SESSION_KEY")
 	adminGroup := envutil.Or("CERTD_PORTAL_ADMIN_GROUP", "ca-portal-admin")
 
-	if issuer == "" && clientID == "" && secret == "" && redirect == "" && keyHex == "" {
-		return portal.OIDCConfig{}, nil // not configured — Basic-auth path
+	// CERTD_PORTAL_SESSION_KEY is independent of the OIDC quartet below: it
+	// seals the session+flow cookies when OIDC login is active, but is ALSO
+	// read (optionally) by the Basic-auth path to seal its anonymous
+	// CSRF-carrier session cookie with a key stable across restarts, instead
+	// of the ephemeral per-process one certd generates when it's left unset.
+	// So an operator may set it alone, with no OIDC fields at all.
+	oidcRequested := issuer != "" || clientID != "" || secret != "" || redirect != ""
+	if !oidcRequested {
+		if keyHex == "" {
+			return portal.OIDCConfig{}, nil // Basic-auth path, ephemeral CSRF key
+		}
+		key, err := crypto.ParseKEK(keyHex)
+		if err != nil {
+			return portal.OIDCConfig{}, fmt.Errorf("CERTD_PORTAL_SESSION_KEY: %w (want 64 hex chars / 32 bytes — generate with crypto.GenerateKEK)", err)
+		}
+		return portal.OIDCConfig{SessionKey: key}, nil // Basic-auth path, stable CSRF key
 	}
 	if issuer == "" || clientID == "" || secret == "" || redirect == "" || keyHex == "" {
 		return portal.OIDCConfig{}, fmt.Errorf("portal OIDC is partially configured: CERTD_PORTAL_OIDC_ISSUER, _CLIENT_ID, _CLIENT_SECRET, _REDIRECT_URL and CERTD_PORTAL_SESSION_KEY must all be set together")

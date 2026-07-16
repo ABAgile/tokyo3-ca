@@ -3,7 +3,7 @@ package portal
 import (
 	"net/http"
 
-	"github.com/abagile/tokyo3-base/oidc"
+	"github.com/abagile/tokyo3-base/session"
 
 	"github.com/abagile/tokyo3-ca/internal/audit"
 	"github.com/abagile/tokyo3-ca/internal/server/policy"
@@ -85,7 +85,7 @@ func (rw *roleWriter) Delete(name string) error {
 // per-user identity beyond the configured username, so it attributes to
 // "portal:<user>" (or "portal:portal" when the gate is open).
 func (s *Server) portalCaller(r *http.Request) string {
-	if sess, ok := oidc.SessionFromContext(r.Context()); ok && sess.Email != "" {
+	if sess, ok := session.SessionFromContext(r.Context()); ok && sess.Email != "" {
 		return audit.CallerPrefixOIDC + sess.Email
 	}
 	if u, _, ok := r.BasicAuth(); ok && u != "" {
