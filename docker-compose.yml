@@ -161,7 +161,7 @@ services:
       tokyo3_idp:
         aliases:
           - certd
-          - certd.localhost
+          - ca.localhost
     environment:
       <<: *default-environment
       CERTD_ADDR: ":8443"

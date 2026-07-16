@@ -40,7 +40,7 @@ ok
 # re-encrypts to certd over the internal certd-issued mesh CA.
 step "traefik (server cert)"
 mkcert -cert-file "$OUT/traefik.crt" -key-file "$OUT/traefik.key" \
-  certd.localhost traefik.localhost localhost 127.0.0.1 >/dev/null 2>&1
+  ca.localhost traefik.localhost localhost 127.0.0.1 >/dev/null 2>&1
 ok
 
 TMP="$(mktemp -d)"

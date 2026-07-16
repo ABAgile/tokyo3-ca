@@ -37,10 +37,10 @@ http:
     certd:
       # Host-based (not PathPrefix): traefik needs a domain in the rule to match
       # TLS SNI to a certificate — a bare PathPrefix logs "no domain found in
-      # rule". certd.localhost is the portal vhost; localhost + 127.0.0.1 keep
+      # rule". ca.localhost is the portal vhost; localhost + 127.0.0.1 keep
       # the `curl https://localhost:8443/healthz` UX working. All three resolve
       # to the loopback edge and route to the one certd backend.
-      rule: "Host(`certd.localhost`) || Host(`localhost`) || Host(`127.0.0.1`)"
+      rule: "Host(`ca.localhost`) || Host(`localhost`) || Host(`127.0.0.1`)"
       entryPoints: [websecure]
       service: certd
       tls: {}
