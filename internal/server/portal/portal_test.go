@@ -147,8 +147,6 @@ func TestPortal_Index_RendersLandingPage(t *testing.T) {
 		"<!DOCTYPE html>",
 		"certd admin portal",
 		"<title>home · certd</title>",
-		"v0.0.1-test",
-		"2026-05-26T12:00:00Z", // RFC3339 from the fixed clock
 		"Roles",
 		"Audit",
 		"Hosts",

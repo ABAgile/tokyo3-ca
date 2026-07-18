@@ -11,6 +11,7 @@
 package portal
 
 import (
+	_ "embed"
 	"errors"
 	"fmt"
 	"html/template"
@@ -29,6 +30,12 @@ import (
 	"github.com/abagile/tokyo3-ca/internal/server/mtls"
 	"github.com/abagile/tokyo3-ca/internal/server/policy"
 )
+
+// appCSS is the portal stylesheet implementing ca/DESIGN.md. Embedded so
+// the portal stays a single self-contained binary.
+//
+//go:embed static/app.css
+var appCSS []byte
 
 // OIDCConfig wires native browser-based OIDC login for the portal: an
 // Authorization-Code + PKCE flow against the IdP, an encrypted session cookie,
@@ -120,16 +127,16 @@ type Server struct {
 
 // Config wires a [Server]. Optional fields default sensibly.
 type Config struct {
-	// Version is the build-time semver / commit identifier surfaced
-	// in the page footer. Empty acceptable but discouraged in
-	// deployed builds.
+	// Version is the build-time semver / commit identifier. Not
+	// currently rendered in the portal chrome; accepted so callers
+	// keep wiring it.
 	Version string
 
 	// Log is the structured logger used for request-time events.
 	// nil ⇒ slog.Default.
 	Log *slog.Logger
 
-	// Now is the clock used for the "rendered at" footer. nil ⇒
+	// Now is the clock used for session/CSRF lifetimes. nil ⇒
 	// time.Now. Tests inject a fixed clock for stable assertions.
 	Now func() time.Time
 
@@ -283,6 +290,7 @@ func (s *Server) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{$}", s.handleIndex)
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
+	mux.HandleFunc("GET /static/app.css", s.handleStaticCSS)
 	mux.HandleFunc("GET /roles", s.handleRolesIndex)
 	mux.HandleFunc("GET /roles/new", s.handleRoleNewForm)
 	mux.HandleFunc("POST /roles/new", s.handleRoleCreate)
@@ -303,16 +311,53 @@ func (s *Server) Routes() http.Handler {
 	return httpauth.BasicAuth(s.cfg.BasicAuth, mux, "/healthz")
 }
 
+// baseData carries the fields the shared base layout renders on every
+// page: footer chrome (version/clock), the sidebar's navigation state,
+// and the signed-in identity for the sidebar footer.
+type baseData struct {
+	ActivePage string       // sidebar active-link key: home/roles/hosts/audit/revocations
+	UserEmail  string       // signed-in identity; empty when neither OIDC nor Basic supplies one
+	SignOut    bool         // OIDC mode only: render the POST sign-out form
+	Nav        []navSection // sidebar sections; planned entries render non-interactive
+}
+
+// navSection is one labeled group of sidebar destinations.
+type navSection struct {
+	Label string
+	Items []pageEntry
+}
+
+// baseData assembles the per-request template chrome. The active page
+// highlights the sidebar link; the identity comes from the OIDC session
+// when present, else the Basic-auth username.
+func (s *Server) baseData(r *http.Request, active string) baseData {
+	b := baseData{
+		ActivePage: active,
+		SignOut:    s.auth != nil,
+	}
+	if sess, ok := session.SessionFromContext(r.Context()); ok && sess.Email != "" {
+		b.UserEmail = sess.Email
+	} else if u, _, ok := r.BasicAuth(); ok && u != "" {
+		b.UserEmail = u
+	}
+	pages := s.landingPages()
+	b.Nav = []navSection{
+		{Label: "Access", Items: pages[0:2]},
+		{Label: "Operations", Items: pages[2:4]},
+	}
+	return b
+}
+
 // indexData is the model passed to the landing page template.
 type indexData struct {
-	Version    string
-	RenderedAt time.Time
-	Pages      []pageEntry
+	baseData
+	Pages []pageEntry
 }
 
 type pageEntry struct {
 	Name        string
 	Path        string
+	Key         string // sidebar active-link key (matches baseData.ActivePage)
 	Description string
 	Status      string // "ready" or "planned"
 }
@@ -327,37 +372,34 @@ func (s *Server) landingPages() []pageEntry {
 		return "planned"
 	}
 	return []pageEntry{
-		{Name: "Roles", Path: "/roles", Description: "Role-table viewer: group → principals + host patterns", Status: status(s.cfg.RoleStore != nil)},
-		{Name: "Hosts", Path: "/hosts", Description: "Registered workload mTLS principals (SPIFFE / email SANs → group claims)", Status: status(s.cfg.HostStore != nil)},
-		{Name: "Audit", Path: "/audit", Description: "Live audit-event viewer (NATS JetStream tail)", Status: status(s.cfg.AuditStore != nil)},
-		{Name: "Revocations", Path: "/revocations", Description: "Revoked SSH certs (ssh-proxyd polls this set to refuse handshakes)", Status: status(s.cfg.RevocationStore != nil)},
+		{Name: "Roles", Path: "/roles", Key: "roles", Description: "Role-table viewer: group → principals + host patterns", Status: status(s.cfg.RoleStore != nil)},
+		{Name: "Hosts", Path: "/hosts", Key: "hosts", Description: "Registered workload mTLS principals (SPIFFE / email SANs → group claims)", Status: status(s.cfg.HostStore != nil)},
+		{Name: "Revocations", Path: "/revocations", Key: "revocations", Description: "Revoked SSH certs (ssh-proxyd polls this set to refuse handshakes)", Status: status(s.cfg.RevocationStore != nil)},
+		{Name: "Audit log", Path: "/audit", Key: "audit", Description: "Live audit-event viewer (NATS JetStream tail)", Status: status(s.cfg.AuditStore != nil)},
 	}
 }
 
-func (s *Server) handleIndex(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	s.render(w, "index", indexData{
-		Version:    s.cfg.Version,
-		RenderedAt: s.cfg.Now(),
-		Pages:      s.landingPages(),
+		baseData: s.baseData(r, "home"),
+		Pages:    s.landingPages(),
 	})
 }
 
 // rolesIndexData is the model passed to the roles list template.
 type rolesIndexData struct {
-	Version    string
-	RenderedAt time.Time
-	Roles      []policy.Role
+	baseData
+	Roles []policy.Role
 }
 
-func (s *Server) handleRolesIndex(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) handleRolesIndex(w http.ResponseWriter, r *http.Request) {
 	if s.cfg.RoleStore == nil {
 		http.Error(w, "role store not configured", http.StatusServiceUnavailable)
 		return
 	}
 	s.render(w, "roles", rolesIndexData{
-		Version:    s.cfg.Version,
-		RenderedAt: s.cfg.Now(),
-		Roles:      s.cfg.RoleStore.All(),
+		baseData: s.baseData(r, "roles"),
+		Roles:    s.cfg.RoleStore.All(),
 	})
 }
 
@@ -365,12 +407,11 @@ func (s *Server) handleRolesIndex(w http.ResponseWriter, _ *http.Request) {
 // whether the requested role exists; templates render a 404-style
 // message when false.
 type roleDetailData struct {
-	Version    string
-	RenderedAt time.Time
-	Name       string
-	Role       policy.Role
-	Found      bool
-	CSRFToken  string // for the inline delete form
+	baseData
+	Name      string
+	Role      policy.Role
+	Found     bool
+	CSRFToken string // for the inline delete form
 }
 
 func (s *Server) handleRoleDetail(w http.ResponseWriter, r *http.Request) {
@@ -380,10 +421,9 @@ func (s *Server) handleRoleDetail(w http.ResponseWriter, r *http.Request) {
 	}
 	name := r.PathValue("name")
 	data := roleDetailData{
-		Version:    s.cfg.Version,
-		RenderedAt: s.cfg.Now(),
-		Name:       name,
-		CSRFToken:  s.csrfToken(w, r),
+		baseData:  s.baseData(r, "roles"),
+		Name:      name,
+		CSRFToken: s.csrfToken(w, r),
 	}
 	for _, role := range s.cfg.RoleStore.All() {
 		if role.Name == name {
@@ -402,8 +442,7 @@ func (s *Server) handleRoleDetail(w http.ResponseWriter, r *http.Request) {
 // either from an existing role (edit) or from the request body
 // (re-render on validation error so the user keeps their input).
 type roleFormData struct {
-	Version    string
-	RenderedAt time.Time
+	baseData
 
 	Mode       string // "create" or "edit"
 	FormAction string
@@ -438,8 +477,7 @@ func (s *Server) handleRoleNewForm(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.render(w, "role_form", roleFormData{
-		Version:    s.cfg.Version,
-		RenderedAt: s.cfg.Now(),
+		baseData:   s.baseData(r, "roles"),
 		Mode:       "create",
 		FormAction: "/roles/new",
 		Submit:     "Create role",
@@ -487,8 +525,7 @@ func (s *Server) handleRoleEditForm(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.render(w, "role_form", roleFormData{
-		Version:      s.cfg.Version,
-		RenderedAt:   s.cfg.Now(),
+		baseData:     s.baseData(r, "roles"),
 		Mode:         "edit",
 		FormAction:   "/roles/" + name + "/edit",
 		Submit:       "Save changes",
@@ -556,12 +593,11 @@ func (s *Server) handleRoleDelete(w http.ResponseWriter, r *http.Request) {
 
 // hostsIndexData is the model for the hosts page.
 type hostsIndexData struct {
-	Version    string
-	RenderedAt time.Time
-	Hosts      []mtls.Principal
+	baseData
+	Hosts []mtls.Principal
 }
 
-func (s *Server) handleHostsIndex(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) handleHostsIndex(w http.ResponseWriter, r *http.Request) {
 	if s.cfg.HostStore == nil {
 		http.Error(w, "host store not configured", http.StatusServiceUnavailable)
 		return
@@ -576,9 +612,8 @@ func (s *Server) handleHostsIndex(w http.ResponseWriter, _ *http.Request) {
 		}
 	}
 	s.render(w, "hosts", hostsIndexData{
-		Version:    s.cfg.Version,
-		RenderedAt: s.cfg.Now(),
-		Hosts:      hosts,
+		baseData: s.baseData(r, "hosts"),
+		Hosts:    hosts,
 	})
 }
 
@@ -587,8 +622,7 @@ func (s *Server) handleHostsIndex(w http.ResponseWriter, _ *http.Request) {
 // FormSerial / FormKeyID / FormReason preserve the user's typed
 // input on validation failure (just like the role form does).
 type revocationsIndexData struct {
-	Version    string
-	RenderedAt time.Time
+	baseData
 	Entries    []krl.Revocation
 	Error      string
 	CSRFToken  string
@@ -603,10 +637,9 @@ func (s *Server) handleRevocationsIndex(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	s.render(w, "revocations", revocationsIndexData{
-		Version:    s.cfg.Version,
-		RenderedAt: s.cfg.Now(),
-		Entries:    s.cfg.RevocationStore.Snapshot().Entries,
-		CSRFToken:  s.csrfToken(w, r),
+		baseData:  s.baseData(r, "revocations"),
+		Entries:   s.cfg.RevocationStore.Snapshot().Entries,
+		CSRFToken: s.csrfToken(w, r),
 	})
 }
 
@@ -658,8 +691,7 @@ func (s *Server) handleRevocationsCreate(w http.ResponseWriter, r *http.Request)
 func (s *Server) renderRevocationError(w http.ResponseWriter, r *http.Request, msg, serial, keyID, reason string) {
 	w.WriteHeader(http.StatusBadRequest)
 	s.render(w, "revocations", revocationsIndexData{
-		Version:    s.cfg.Version,
-		RenderedAt: s.cfg.Now(),
+		baseData:   s.baseData(r, "revocations"),
 		Entries:    s.cfg.RevocationStore.Snapshot().Entries,
 		Error:      msg,
 		CSRFToken:  s.csrfToken(w, r),
@@ -689,20 +721,18 @@ func parseUint64(s string) (uint64, error) {
 
 // auditIndexData is the model for the audit list page.
 type auditIndexData struct {
-	Version    string
-	RenderedAt time.Time
-	Events     []AuditEvent
+	baseData
+	Events []AuditEvent
 }
 
-func (s *Server) handleAuditIndex(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) handleAuditIndex(w http.ResponseWriter, r *http.Request) {
 	if s.cfg.AuditStore == nil {
 		http.Error(w, "audit store not configured", http.StatusServiceUnavailable)
 		return
 	}
 	s.render(w, "audit", auditIndexData{
-		Version:    s.cfg.Version,
-		RenderedAt: s.cfg.Now(),
-		Events:     s.cfg.AuditStore.Events(),
+		baseData: s.baseData(r, "audit"),
+		Events:   s.cfg.AuditStore.Events(),
 	})
 }
 
@@ -714,8 +744,7 @@ func (s *Server) handleAuditIndex(w http.ResponseWriter, _ *http.Request) {
 func (s *Server) renderFormError(w http.ResponseWriter, r *http.Request, mode, action, submit, originalName string, fields roleFormFields, err error) {
 	w.WriteHeader(http.StatusBadRequest)
 	s.render(w, "role_form", roleFormData{
-		Version:      s.cfg.Version,
-		RenderedAt:   s.cfg.Now(),
+		baseData:     s.baseData(r, "roles"),
 		Mode:         mode,
 		FormAction:   action,
 		Submit:       submit,
@@ -731,6 +760,12 @@ func (s *Server) renderFormError(w http.ResponseWriter, r *http.Request, mode, a
 func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	fmt.Fprintln(w, "ok")
+}
+
+// handleStaticCSS serves the embedded portal stylesheet (ca/DESIGN.md).
+func (s *Server) handleStaticCSS(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "text/css; charset=utf-8")
+	_, _ = w.Write(appCSS)
 }
 
 // parseRoleForm reads the form values from r and returns a
@@ -955,8 +990,8 @@ func parsePages() (map[string]*template.Template, error) {
 		if _, err := t.Parse(body); err != nil {
 			return nil, fmt.Errorf("%s page: %w", name, err)
 		}
-		if t.Lookup("page") == nil || t.Lookup("title") == nil || t.Lookup("body") == nil {
-			return nil, fmt.Errorf("%s missing required define{}: page/title/body", name)
+		if t.Lookup("page") == nil || t.Lookup("title") == nil || t.Lookup("pagetitle") == nil || t.Lookup("body") == nil {
+			return nil, fmt.Errorf("%s missing required define{}: page/title/pagetitle/body", name)
 		}
 		out[name] = t
 	}
@@ -967,62 +1002,114 @@ const baseTemplate = `{{define "base"}}<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{{template "title" .}} · certd</title>
-<style>
-body { font-family: system-ui, sans-serif; max-width: 60em; margin: 2em auto; padding: 0 1em; color: #1a1a1a; }
-header, footer { padding: 0.5em 0; border-bottom: 1px solid #ddd; }
-footer { border-bottom: none; border-top: 1px solid #ddd; margin-top: 2em; padding-top: 0.5em; font-size: 0.85em; color: #666; }
-h1 { margin-top: 0.5em; }
-table { border-collapse: collapse; width: 100%; margin-top: 1em; }
-th, td { text-align: left; padding: 0.4em 0.6em; border-bottom: 1px solid #eee; }
-.status-planned { color: #888; }
-.status-ready { color: #1a7f37; font-weight: 600; }
-form label { display: block; margin-top: 0.8em; font-weight: 600; }
-form input[type=text], form textarea { width: 100%; max-width: 40em; box-sizing: border-box; font: inherit; padding: 0.3em 0.5em; }
-form textarea { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; min-height: 5em; }
-form button, .link-button { font: inherit; padding: 0.4em 0.9em; cursor: pointer; }
-.link-button { background: none; border: none; color: #b21f1f; padding: 0; text-decoration: underline; }
-.error { padding: 0.6em 0.8em; margin: 0.5em 0 1em; background: #fff3f3; border: 1px solid #f3b8b8; color: #b21f1f; border-radius: 4px; }
-</style>
+<script>try{const t=localStorage.getItem("tokyo3-theme");document.documentElement.dataset.theme=t==="light"||t==="dark"?t:"dark"}catch(_){document.documentElement.dataset.theme="dark"}</script>
+<link rel="stylesheet" href="{{url "/static/app.css"}}">
 </head>
 <body>
-<header><strong>certd admin portal</strong></header>
-<main>{{template "body" .}}</main>
-<footer>certd {{.Version}} · rendered {{fmtTime .RenderedAt}}</footer>
+<div class="portal-layout">
+<aside class="sidebar" aria-label="Portal navigation">
+  <a class="sidebar-brand" href="{{url "/"}}">
+    <svg viewBox="0 0 24 24" aria-hidden="true" xmlns="http://www.w3.org/2000/svg"><path d="M12 2 4 5v6c0 5.1 3.4 9.4 8 11 4.6-1.6 8-5.9 8-11V5l-8-3zm-1.2 13.6-3-3 1.4-1.4 1.6 1.6 4-4 1.4 1.4-5.4 5.4z"/></svg>
+    <span>certd admin portal</span>
+  </a>
+  <nav aria-label="Primary">
+    <div class="nav-section">
+      {{if eq .ActivePage "home"}}<a href="{{url "/"}}" class="active" aria-current="page">Overview</a>{{else}}<a href="{{url "/"}}">Overview</a>{{end}}
+    </div>
+    {{range .Nav}}
+    <div class="nav-section">
+      <div class="nav-section-label">{{.Label}}</div>
+      {{range .Items}}
+      {{if ne .Status "ready"}}<span class="nav-planned">{{.Name}} <span class="badge badge-neutral">planned</span></span>{{else if eq $.ActivePage .Key}}<a href="{{url .Path}}" class="active" aria-current="page">{{.Name}}</a>{{else}}<a href="{{url .Path}}">{{.Name}}</a>{{end}}
+      {{end}}
+    </div>
+    {{end}}
+  </nav>
+  <div class="sidebar-footer">
+    <div class="sidebar-user-row">
+      {{if .UserEmail}}<div class="sidebar-user" title="{{.UserEmail}}">{{.UserEmail}}</div>{{end}}
+      <button type="button" class="theme-toggle" data-theme-toggle aria-pressed="false" aria-label="Switch to light mode" title="Switch to light mode">
+        <svg class="theme-icon-sun" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32 1.41 1.41M2 12h2m16 0h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+        <svg class="theme-icon-moon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20.5 15.5A8.5 8.5 0 0 1 8.5 3.5 8.5 8.5 0 1 0 20.5 15.5Z"/></svg>
+      </button>
+    </div>
+    {{if .SignOut}}
+    <div class="sidebar-footer-actions">
+      <form method="POST" action="{{url "/auth/logout"}}">
+        <button type="submit" class="btn-link">Sign out</button>
+      </form>
+    </div>
+    {{end}}
+  </div>
+</aside>
+<div class="portal-main">
+  <header class="portal-topbar">
+    <div class="portal-heading">
+      <h1>{{template "pagetitle" .}}</h1>
+    </div>
+  </header>
+  <main class="portal-content">{{template "body" .}}</main>
+</div>
+</div>
+<script>
+(() => {
+  const root = document.documentElement;
+  const button = document.querySelector("[data-theme-toggle]");
+  if (!button) return;
+  const update = () => {
+    const dark = (root.dataset.theme || "dark") === "dark";
+    button.setAttribute("aria-pressed", String(dark));
+    const label = dark ? "Switch to light mode" : "Switch to dark mode";
+    button.setAttribute("aria-label", label);
+    button.title = label;
+  };
+  button.addEventListener("click", () => {
+    const next = (root.dataset.theme || "dark") === "dark" ? "light" : "dark";
+    root.dataset.theme = next;
+    try { localStorage.setItem("tokyo3-theme", next); } catch (_) {}
+    update();
+  });
+  update();
+})();
+</script>
 </body>
 </html>{{end}}`
 
 const indexTemplate = `{{define "page"}}{{template "base" .}}{{end}}
 {{define "title"}}home{{end}}
+{{define "pagetitle"}}Overview{{end}}
 {{define "body"}}
-<h1>Welcome</h1>
-<p>The certd admin portal exposes the platform's identity-and-access state.
-Pages below are mounted as later slices land them — this scaffold proves the
-chrome works end-to-end.</p>
+<p class="section-description">The certd admin portal exposes the platform's
+identity-and-access state. Pages flip to ready as their data sources are
+wired; planned pages stay non-interactive.</p>
+<div class="resource-panel table-wrap">
 <table>
 <thead><tr><th>Page</th><th>Description</th><th>Status</th></tr></thead>
 <tbody>
 {{range .Pages}}
 <tr>
-  <td>{{if eq .Status "ready"}}<a href="{{url .Path}}">{{.Name}}</a>{{else}}{{.Name}}{{end}}</td>
-  <td>{{.Description}}</td>
-  <td class="status-{{.Status}}">{{.Status}}</td>
+  <td class="resource-name">{{if eq .Status "ready"}}<a href="{{url .Path}}">{{.Name}}</a>{{else}}{{.Name}}{{end}}</td>
+  <td class="text-muted">{{.Description}}</td>
+  <td>{{if eq .Status "ready"}}<span class="badge badge-success">ready</span>{{else}}<span class="badge badge-neutral">planned</span>{{end}}</td>
 </tr>
 {{end}}
 </tbody>
 </table>
+</div>
 {{end}}`
 
 const rolesTemplate = `{{define "page"}}{{template "base" .}}{{end}}
 {{define "title"}}roles{{end}}
+{{define "pagetitle"}}Roles{{end}}
 {{define "body"}}
-<p><a href="{{url "/"}}">&larr; home</a></p>
-<h1>Roles</h1>
-<p>Every configured role. Click a name for principals, host patterns,
+<p class="section-description">Every configured role. Click a name for principals, host patterns,
 and TTL caps. The role table is in-memory — restarting certd resets
 it unless backed by a JSON file via <code>CERTD_ROLES_FILE</code>.</p>
-<p><a href="{{url "/roles/new"}}">+ New role</a></p>
+<div class="quick-actions"><a class="btn btn-primary" href="{{url "/roles/new"}}">Create role</a></div>
 {{if .Roles}}
+<div class="resource-panel table-wrap">
 <table>
 <thead>
 <tr>
@@ -1035,7 +1122,7 @@ it unless backed by a JSON file via <code>CERTD_ROLES_FILE</code>.</p>
 <tbody>
 {{range .Roles}}
 <tr>
-  <td><a href="{{url "/roles"}}/{{.Name}}">{{.Name}}</a></td>
+  <td class="resource-name"><a href="{{url "/roles"}}/{{.Name}}">{{.Name}}</a></td>
   <td><code>{{.GroupClaim}}</code></td>
   <td>{{if .AllowedPrincipals}}{{range $i, $p := .AllowedPrincipals}}{{if $i}}, {{end}}<code>{{$p}}</code>{{end}}{{else}}<em>none</em>{{end}}</td>
   <td>{{if .HostPatterns}}{{range $i, $p := .HostPatterns}}{{if $i}}, {{end}}<code>{{$p}}</code>{{end}}{{else}}<em>none</em>{{end}}</td>
@@ -1043,28 +1130,25 @@ it unless backed by a JSON file via <code>CERTD_ROLES_FILE</code>.</p>
 {{end}}
 </tbody>
 </table>
+</div>
 {{else}}
-<p><em>No roles configured.</em></p>
+<div class="resource-panel empty-state"><em>No roles configured.</em></div>
 {{end}}
 {{end}}`
 
 const roleDetailTemplate = `{{define "page"}}{{template "base" .}}{{end}}
 {{define "title"}}role · {{.Name}}{{end}}
+{{define "pagetitle"}}{{if .Found}}Role: {{.Role.Name}}{{else}}Not found{{end}}{{end}}
 {{define "body"}}
-<p><a href="{{url "/roles"}}">&larr; roles</a></p>
+<p class="text-muted"><a href="{{url "/roles"}}">&larr; All roles</a></p>
 {{if not .Found}}
-<h1>Not found</h1>
 <p>No role named <code>{{.Name}}</code> is configured.</p>
 {{else}}
-<h1>Role: {{.Role.Name}}</h1>
-<p>
-  <a href="{{url "/roles"}}/{{.Role.Name}}/edit">Edit</a> ·
-  <form method="post" action="{{url "/roles"}}/{{.Role.Name}}/delete" style="display:inline" onsubmit="return confirm('Delete role {{.Role.Name}}?');">
-    <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
-    <button type="submit" class="link-button">Delete</button>
-  </form>
-</p>
-<table>
+<div class="page-stack">
+<div class="quick-actions"><a class="btn btn-secondary" href="{{url "/roles"}}/{{.Role.Name}}/edit">Edit role</a></div>
+<div class="card">
+<div class="card-body">
+<table class="summary-list">
 <tbody>
 <tr><th>Group claim</th><td><code>{{.Role.GroupClaim}}</code></td></tr>
 <tr><th>Allowed principals</th><td>
@@ -1084,58 +1168,91 @@ const roleDetailTemplate = `{{define "page"}}{{template "base" .}}{{end}}
 </td></tr>
 </tbody>
 </table>
+</div>
+</div>
+<div class="card danger-zone">
+  <div class="card-header"><h2>Danger zone</h2></div>
+  <div class="card-body">
+    <p class="text-muted">Deleting role <code>{{.Role.Name}}</code> immediately removes the signing
+    permissions it grants. This cannot be undone.</p>
+    <form class="form-actions" method="post" action="{{url "/roles"}}/{{.Role.Name}}/delete" onsubmit="return confirm('Delete role {{.Role.Name}}?');">
+      <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+      <button type="submit" class="btn btn-danger">Delete role {{.Role.Name}}</button>
+    </form>
+  </div>
+</div>
+</div>
 {{end}}
 {{end}}`
 
 const roleFormTemplate = `{{define "page"}}{{template "base" .}}{{end}}
 {{define "title"}}{{if eq .Mode "create"}}new role{{else}}edit · {{.OriginalName}}{{end}}{{end}}
+{{define "pagetitle"}}{{if eq .Mode "create"}}New role{{else}}Edit role: {{.OriginalName}}{{end}}{{end}}
 {{define "body"}}
-<p><a href="{{url "/roles"}}">&larr; roles</a></p>
-<h1>{{if eq .Mode "create"}}New role{{else}}Edit role: {{.OriginalName}}{{end}}</h1>
-{{if .Error}}<div class="error">{{.Error}}</div>{{end}}
-<form method="post" action="{{url .FormAction}}">
+<p class="text-muted"><a href="{{url "/roles"}}">&larr; All roles</a></p>
+{{if .Error}}<div class="alert alert-error">{{.Error}}</div>{{end}}
+<form class="form-width" method="post" action="{{url .FormAction}}">
   <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
-  <label>Name
-    <input type="text" name="name" value="{{.Form.Name}}" required autocomplete="off">
-  </label>
-  <label>Group claim
-    <input type="text" name="group_claim" value="{{.Form.GroupClaim}}" required autocomplete="off">
-  </label>
-  <label>Allowed principals (one per line)
-    <textarea name="allowed_principals" rows="4">{{.Form.AllowedPrincipals}}</textarea>
-  </label>
-  <label>Host patterns (one per line)
-    <textarea name="host_patterns" rows="4">{{.Form.HostPatterns}}</textarea>
-  </label>
-  <label>SPIFFE patterns (one per line)
-    <textarea name="spiffe_patterns" rows="4">{{.Form.SPIFFEPatterns}}</textarea>
-  </label>
-  <label>Max user-cert TTL (seconds, e.g., <code>14400</code>; blank = role default)
-    <input type="text" name="max_user_cert_ttl_seconds" value="{{.Form.MaxUserCertTTLSeconds}}" autocomplete="off">
-  </label>
-  <label>Max host-cert TTL (seconds; blank = role default)
-    <input type="text" name="max_host_cert_ttl_seconds" value="{{.Form.MaxHostCertTTLSeconds}}" autocomplete="off">
-  </label>
-  <label>Max X.509-cert TTL (seconds, e.g., <code>86400</code>; blank = role default)
-    <input type="text" name="max_x509_cert_ttl_seconds" value="{{.Form.MaxX509CertTTLSeconds}}" autocomplete="off">
-  </label>
-  <label>Default extensions (one <code>key=value</code> per line; bare keys allowed)
-    <textarea name="default_extensions" rows="4">{{.Form.DefaultExtensions}}</textarea>
-  </label>
-  <p><button type="submit">{{.Submit}}</button></p>
+  <div class="form-group">
+    <label for="role-name">Name</label>
+    <input type="text" id="role-name" name="name" value="{{.Form.Name}}" required autocomplete="off">
+  </div>
+  <div class="form-group">
+    <label for="role-group-claim">Group claim</label>
+    <input type="text" id="role-group-claim" name="group_claim" value="{{.Form.GroupClaim}}" required autocomplete="off">
+  </div>
+  <div class="form-group">
+    <label for="role-principals">Allowed principals</label>
+    <textarea id="role-principals" name="allowed_principals" rows="4">{{.Form.AllowedPrincipals}}</textarea>
+    <p class="field-help">One principal per line.</p>
+  </div>
+  <div class="form-group">
+    <label for="role-host-patterns">Host patterns</label>
+    <textarea id="role-host-patterns" name="host_patterns" rows="4">{{.Form.HostPatterns}}</textarea>
+    <p class="field-help">One pattern per line.</p>
+  </div>
+  <div class="form-group">
+    <label for="role-spiffe-patterns">SPIFFE patterns</label>
+    <textarea id="role-spiffe-patterns" name="spiffe_patterns" rows="4">{{.Form.SPIFFEPatterns}}</textarea>
+    <p class="field-help">One pattern per line.</p>
+  </div>
+  <div class="form-group">
+    <label for="role-user-ttl">Max user-cert TTL</label>
+    <input type="text" id="role-user-ttl" name="max_user_cert_ttl_seconds" value="{{.Form.MaxUserCertTTLSeconds}}" autocomplete="off">
+    <p class="field-help">Seconds, e.g. <code>14400</code>; blank = role default.</p>
+  </div>
+  <div class="form-group">
+    <label for="role-host-ttl">Max host-cert TTL</label>
+    <input type="text" id="role-host-ttl" name="max_host_cert_ttl_seconds" value="{{.Form.MaxHostCertTTLSeconds}}" autocomplete="off">
+    <p class="field-help">Seconds; blank = role default.</p>
+  </div>
+  <div class="form-group">
+    <label for="role-x509-ttl">Max X.509-cert TTL</label>
+    <input type="text" id="role-x509-ttl" name="max_x509_cert_ttl_seconds" value="{{.Form.MaxX509CertTTLSeconds}}" autocomplete="off">
+    <p class="field-help">Seconds, e.g. <code>86400</code>; blank = role default.</p>
+  </div>
+  <div class="form-group">
+    <label for="role-extensions">Default extensions</label>
+    <textarea id="role-extensions" name="default_extensions" rows="4">{{.Form.DefaultExtensions}}</textarea>
+    <p class="field-help">One <code>key=value</code> per line; bare keys allowed.</p>
+  </div>
+  <div class="form-actions">
+    <button type="submit" class="btn btn-primary">{{.Submit}}</button>
+    <a class="btn btn-secondary" href="{{url "/roles"}}">Cancel</a>
+  </div>
 </form>
 {{end}}`
 
 const hostsTemplate = `{{define "page"}}{{template "base" .}}{{end}}
 {{define "title"}}hosts{{end}}
+{{define "pagetitle"}}Hosts{{end}}
 {{define "body"}}
-<p><a href="{{url "/"}}">&larr; home</a></p>
-<h1>Hosts</h1>
-<p>Workload mTLS principals registered with certd. Each entry maps a
+<p class="section-description">Workload mTLS principals registered with certd. Each entry maps a
 TLS SAN (SPIFFE URI or email) to a workload identity + the group
 claims it inherits. Authentication-time lookups consult this set on
 every signing request that traverses the mTLS path.</p>
 {{if .Hosts}}
+<div class="resource-panel table-wrap">
 <table>
 <thead>
 <tr>
@@ -1148,27 +1265,28 @@ every signing request that traverses the mTLS path.</p>
 {{range .Hosts}}
 <tr>
   <td><code>{{.MatchedSAN}}</code></td>
-  <td>{{.Name}}</td>
+  <td class="resource-name">{{.Name}}</td>
   <td>{{if .Groups}}{{range $i, $g := .Groups}}{{if $i}}, {{end}}<code>{{$g}}</code>{{end}}{{else}}<em>none</em>{{end}}</td>
 </tr>
 {{end}}
 </tbody>
 </table>
+</div>
 {{else}}
-<p><em>No hosts registered.</em></p>
+<div class="resource-panel empty-state"><em>No hosts registered.</em></div>
 {{end}}
 {{end}}`
 
 const auditTemplate = `{{define "page"}}{{template "base" .}}{{end}}
 {{define "title"}}audit{{end}}
+{{define "pagetitle"}}Audit{{end}}
 {{define "body"}}
-<p><a href="{{url "/"}}">&larr; home</a></p>
-<h1>Audit</h1>
-<p>Live tail of certd's own audit stream — cert issuance, denial, and
+<p class="section-description">Live tail of certd's own audit stream — cert issuance, denial, and
 revocation events. Newest first. The buffer caps at the tracker's
 MaxEvents (default 500); to dig deeper, query JetStream directly.
 (SSH session/access events live in ssh-proxyd's own portal.)</p>
 {{if .Events}}
+<div class="resource-panel table-wrap">
 <table>
 <thead>
 <tr>
@@ -1183,50 +1301,60 @@ MaxEvents (default 500); to dig deeper, query JetStream directly.
 <tbody>
 {{range .Events}}
 <tr>
-  <td>{{fmtTime .OccurredAt}}</td>
+  <td class="nowrap">{{fmtTime .OccurredAt}}</td>
   <td><code>{{.Action}}</code></td>
   <td>{{if .Actor}}<code>{{.Actor}}</code>{{else}}<em>-</em>{{end}}</td>
   <td>{{if .Subject}}<code>{{.Subject}}</code>{{else}}<em>-</em>{{end}}</td>
   <td>{{if .IP}}<code>{{.IP}}</code>{{else}}<em>-</em>{{end}}</td>
-  <td>{{if .Detail}}<details><summary>view</summary><pre>{{.Detail}}</pre></details>{{else}}<em>-</em>{{end}}</td>
+  <td>{{if .Detail}}<pre class="audit-detail">{{.Detail}}</pre>{{else}}<em>-</em>{{end}}</td>
 </tr>
 {{end}}
 </tbody>
 </table>
+</div>
 {{else}}
-<p><em>No audit events yet. Events appear here once certd starts emitting.</em></p>
+<div class="resource-panel empty-state"><em>No audit events yet. Events appear here once certd starts emitting.</em></div>
 {{end}}
 {{end}}`
 
 const revocationsTemplate = `{{define "page"}}{{template "base" .}}{{end}}
 {{define "title"}}revocations{{end}}
+{{define "pagetitle"}}Revocations{{end}}
 {{define "body"}}
-<p><a href="{{url "/"}}">&larr; home</a></p>
-<h1>Revocations</h1>
-<p>Revoked SSH certs. ssh-proxyd polls this set every
+<p class="section-description">Revoked SSH certs. ssh-proxyd polls this set every
 <code>CERTD_REVOCATIONS_POLL_SECONDS</code> (default 30s) and refuses
 any matching cert at handshake. Either Serial or Key ID is enough;
 provide both when you have them so the revocation matches regardless
 of which field a consumer keys on.</p>
 
-<h2>Revoke a cert</h2>
-{{if .Error}}<div class="error">{{.Error}}</div>{{end}}
+<h2 class="section-heading">Revoke a cert</h2>
+<p class="section-description">Revocation takes effect at the next ssh-proxyd poll and cannot be undone from this portal.</p>
+{{if .Error}}<div class="alert alert-error">{{.Error}}</div>{{end}}
 <form method="post" action="{{url "/revocations"}}">
+<div class="form-width">
   <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
-  <label>Serial (decimal; leave blank if revoking by Key ID only)
-    <input type="text" name="serial" value="{{.FormSerial}}" autocomplete="off">
-  </label>
-  <label>Key ID (e.g., <code>user:alice@example.com</code>; blank if revoking by serial)
-    <input type="text" name="key_id" value="{{.FormKeyID}}" autocomplete="off">
-  </label>
-  <label>Reason (audit annotation)
-    <input type="text" name="reason" value="{{.FormReason}}" autocomplete="off">
-  </label>
-  <p><button type="submit">Revoke</button></p>
+  <div class="form-group">
+    <label for="revoke-serial">Serial</label>
+    <input type="text" id="revoke-serial" name="serial" value="{{.FormSerial}}" autocomplete="off">
+    <p class="field-help">Decimal; leave blank if revoking by Key ID only.</p>
+  </div>
+  <div class="form-group">
+    <label for="revoke-key-id">Key ID</label>
+    <input type="text" id="revoke-key-id" name="key_id" value="{{.FormKeyID}}" autocomplete="off">
+    <p class="field-help">E.g. <code>user:alice@example.com</code>; blank if revoking by serial.</p>
+  </div>
+  <div class="form-group">
+    <label for="revoke-reason">Reason</label>
+    <input type="text" id="revoke-reason" name="reason" value="{{.FormReason}}" autocomplete="off">
+    <p class="field-help">Audit annotation.</p>
+  </div>
+  <div class="form-actions"><button type="submit" class="btn btn-danger">Revoke certificate</button></div>
+</div>
 </form>
 
-<h2>Current revocations ({{len .Entries}})</h2>
+<h2 class="section-heading">Current revocations ({{len .Entries}})</h2>
 {{if .Entries}}
+<div class="resource-panel table-wrap">
 <table>
 <thead>
 <tr>
@@ -1249,7 +1377,8 @@ of which field a consumer keys on.</p>
 {{end}}
 </tbody>
 </table>
+</div>
 {{else}}
-<p><em>No revocations recorded.</em></p>
+<div class="resource-panel empty-state"><em>No revocations recorded.</em></div>
 {{end}}
 {{end}}`

@@ -507,7 +507,13 @@ internal/
   is optional: omitting `api.Config.Portal` leaves `/portal/*` routes
   unmounted (404). Per-page template sets keep page-specific
   `{{define "title"}}`/`{{define "body"}}` blocks from clobbering each
-  other. In the docker rig it's reachable through the traefik edge at
+  other. The UI implements the Tokyo3 design system (see `DESIGN.md`)
+  with a plum theme color:
+  a fixed sidebar nav (planned pages render non-interactive), a
+  dark-default theme toggle persisted in localStorage, the signed-in
+  identity in the sidebar footer, and — in OIDC mode — a POST-based
+  Sign out action. The stylesheet is embedded and served at
+  `/portal/static/app.css`. In the docker rig it's reachable through the traefik edge at
   **`https://ca.localhost:8443/portal/`**. The same edge also exposes
   Traefik's dashboard at **`https://traefik.localhost:8443/`** for local
   diagnostics. The certd portal is gated by the HTTP Basic
