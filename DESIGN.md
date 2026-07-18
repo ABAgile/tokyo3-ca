@@ -339,6 +339,12 @@ signed-in identity. The POST-based Sign out action sits on the row below and
 appears only when native OIDC login is active (HTTP Basic auth has no logout
 semantics). The chrome carries no version line and no page-level footer.
 
+Signing out lands on a focused, chrome-free confirmation card (no sidebar —
+there is no session to navigate with) that states the portal session has
+ended, notes the identity provider may still hold its own session, and
+offers one explicit primary action to sign in again. It must never bounce
+straight back into the login flow, which would make sign-out unobservable.
+
 ## Elevation, Shapes, and Components
 
 - Flat, tonal depth: cards sit one step above the canvas with a 1px outline

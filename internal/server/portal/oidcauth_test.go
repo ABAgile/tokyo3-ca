@@ -296,3 +296,41 @@ func findCookie(cs []*http.Cookie, name string) *http.Cookie {
 	}
 	return nil
 }
+
+// TestLogoutLandsOnSignedOutPage asserts sign-out is observable: the POST
+// clears the session cookie and redirects to the exempt signed-out page
+// rather than the login route (which would silently re-authenticate against
+// the IdP's live SSO session and make logout look like a no-op).
+func TestLogoutLandsOnSignedOutPage(t *testing.T) {
+	s := newOIDCPortal(t, &fakeVerifier{}, "https://idp.example", "")
+	h := s.Routes()
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/auth/logout", nil))
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("logout = %d, want 303", rec.Code)
+	}
+	if loc := rec.Header().Get("Location"); loc != "/portal/auth/signed-out" {
+		t.Errorf("Location = %q, want /portal/auth/signed-out", loc)
+	}
+	c := findCookie(rec.Result().Cookies(), "certd_portal_session")
+	if c == nil || c.MaxAge >= 0 && c.Value != "" {
+		t.Errorf("logout did not clear the session cookie: %+v", c)
+	}
+
+	// The signed-out page and the stylesheet it links are reachable
+	// without a session (they must not bounce back through login).
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/auth/signed-out", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("signed-out page = %d, want 200 (exempt)", rec.Code)
+	}
+	if body := rec.Body.String(); !strings.Contains(body, "Signed out") {
+		t.Errorf("signed-out page missing confirmation text:\n%s", body)
+	}
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/static/app.css", nil))
+	if rec.Code != http.StatusOK {
+		t.Errorf("stylesheet = %d, want 200 (exempt)", rec.Code)
+	}
+}

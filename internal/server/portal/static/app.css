@@ -433,6 +433,22 @@ a:hover { color: var(--color-link-hover); }
   padding: var(--space-8);
 }
 
+/* Focused post-logout confirmation page (no portal chrome). */
+.signed-out {
+  min-height: 100vh;
+  min-height: 100dvh;
+  display: grid;
+  place-items: center;
+  padding: var(--space-6);
+}
+.signed-out .card { width: min(100%, 420px); }
+.signed-out-title {
+  margin-bottom: var(--space-2);
+  font-size: var(--text-xl);
+  font-weight: 650;
+  letter-spacing: -.02em;
+}
+.signed-out .text-muted { margin-bottom: var(--space-5); }
 
 /* Forms. */
 .form-group { margin-bottom: var(--space-5); }

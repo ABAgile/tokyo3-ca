@@ -512,7 +512,10 @@ internal/
   a fixed sidebar nav (planned pages render non-interactive), a
   dark-default theme toggle persisted in localStorage, the signed-in
   identity in the sidebar footer, and — in OIDC mode — a POST-based
-  Sign out action. The stylesheet is embedded and served at
+  Sign out action that lands on a session-exempt confirmation page at
+  `/portal/auth/signed-out` (redirecting to the login route would
+  silently re-authenticate against the IdP's live SSO session and make
+  logout look like a no-op). The stylesheet is embedded and served at
   `/portal/static/app.css`. In the docker rig it's reachable through the traefik edge at
   **`https://ca.localhost:8443/portal/`**. The same edge also exposes
   Traefik's dashboard at **`https://traefik.localhost:8443/`** for local

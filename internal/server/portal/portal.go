@@ -209,8 +209,10 @@ func New(cfg Config) (*Server, error) {
 			// /auth/callback must be exempt here (not just /healthz) or the
 			// OIDC callback itself gets redirected to login before it can
 			// complete — oidc.NewAuthenticator verifies this and refuses to
-			// construct otherwise.
-			ExemptPaths: []string{"/healthz", "/auth/callback"},
+			// construct otherwise. The signed-out page is exempt because it
+			// renders after the session is cleared, and the stylesheet is
+			// exempt so that page isn't served unstyled.
+			ExemptPaths: []string{"/healthz", "/auth/callback", "/auth/signed-out", "/static/app.css"},
 			Now:         cfg.Now,
 			Log:         cfg.Log,
 		})
@@ -305,7 +307,8 @@ func (s *Server) Routes() http.Handler {
 	if s.auth != nil {
 		mux.HandleFunc("GET /auth/login", s.auth.LoginHandler())
 		mux.HandleFunc("GET /auth/callback", s.auth.CallbackHandler())
-		mux.HandleFunc("POST /auth/logout", s.sess.LogoutHandler())
+		mux.HandleFunc("POST /auth/logout", s.handleLogout)
+		mux.HandleFunc("GET /auth/signed-out", s.handleSignedOut)
 		return s.sess.Gate(mux)
 	}
 	return httpauth.BasicAuth(s.cfg.BasicAuth, mux, "/healthz")
@@ -768,6 +771,37 @@ func (s *Server) handleStaticCSS(w http.ResponseWriter, _ *http.Request) {
 	_, _ = w.Write(appCSS)
 }
 
+// logoutRedirect rewrites the session LogoutHandler's post-clear redirect.
+// The base handler bounces to the login route, which immediately restarts
+// the OIDC flow — and because the IdP typically still holds its own live
+// SSO session, the user is silently signed straight back in, making logout
+// look like a no-op. Landing on the neutral signed-out page instead keeps
+// the local logout observable and leaves re-login an explicit action.
+type logoutRedirect struct {
+	http.ResponseWriter
+}
+
+func (w *logoutRedirect) WriteHeader(code int) {
+	if code == http.StatusSeeOther {
+		w.Header().Set("Location", basePath+"/auth/signed-out")
+	}
+	w.ResponseWriter.WriteHeader(code)
+}
+
+// handleLogout clears the portal session (delegating the cookie-clearing
+// to the base session manager) and lands on the signed-out page. OIDC
+// mode only — the Basic-auth path has no logout semantics.
+func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
+	s.sess.LogoutHandler()(&logoutRedirect{w}, r)
+}
+
+// handleSignedOut renders the post-logout confirmation page. Exempt from
+// the session gate (after logout there is no session) and deliberately
+// not auto-starting a new login — see logoutRedirect.
+func (s *Server) handleSignedOut(w http.ResponseWriter, r *http.Request) {
+	s.render(w, "signed_out", s.baseData(r, ""))
+}
+
 // parseRoleForm reads the form values from r and returns a
 // [policy.Role] plus the form-field representation that should be
 // re-rendered on validation failure (so the user keeps their typed
@@ -980,6 +1014,7 @@ func parsePages() (map[string]*template.Template, error) {
 		"hosts":       hostsTemplate,
 		"audit":       auditTemplate,
 		"revocations": revocationsTemplate,
+		"signed_out":  signedOutTemplate,
 	}
 	out := make(map[string]*template.Template, len(pages))
 	for name, body := range pages {
@@ -1076,6 +1111,36 @@ const baseTemplate = `{{define "base"}}<!DOCTYPE html>
 </script>
 </body>
 </html>{{end}}`
+
+// signedOutTemplate is a self-contained focused page — it deliberately
+// does not pull in the base chrome: after logout there is no session, so
+// sidebar links would only bounce through the login flow.
+const signedOutTemplate = `{{define "page"}}<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{template "title" .}} · certd</title>
+<script>try{const t=localStorage.getItem("tokyo3-theme");document.documentElement.dataset.theme=t==="light"||t==="dark"?t:"dark"}catch(_){document.documentElement.dataset.theme="dark"}</script>
+<link rel="stylesheet" href="{{url "/static/app.css"}}">
+</head>
+<body>
+<main class="signed-out">
+  <div class="card">
+    <div class="card-body">
+      <h1 class="signed-out-title">Signed out</h1>
+      <p class="text-muted">Your certd portal session has ended. Your identity
+      provider may still hold its own session, so signing in again might not
+      prompt for credentials.</p>
+      <a class="btn btn-primary" href="{{url "/"}}">Sign in to certd</a>
+    </div>
+  </div>
+</main>
+</body>
+</html>{{end}}
+{{define "title"}}signed out{{end}}
+{{define "pagetitle"}}Signed out{{end}}
+{{define "body"}}{{end}}`
 
 const indexTemplate = `{{define "page"}}{{template "base" .}}{{end}}
 {{define "title"}}home{{end}}
