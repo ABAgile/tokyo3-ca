@@ -1,5 +1,5 @@
-github.com/abagile/tokyo3-base v0.7.6 h1:t7x27A4T/DoZPzP/wTjKAGD6urvUi7PrRFwxBCZKkq8=
-github.com/abagile/tokyo3-base v0.7.6/go.mod h1:s93PDF0sskQIRGhIkAyol55Sdq+Xs+3TJQk1uSCRt/Q=
+github.com/abagile/tokyo3-base v0.7.7 h1:l3sVlQnJx+EpsRmcvJdVX1tuIihRPA3BVwMExeyPL6g=
+github.com/abagile/tokyo3-base v0.7.7/go.mod h1:s93PDF0sskQIRGhIkAyol55Sdq+Xs+3TJQk1uSCRt/Q=
 github.com/aws/aws-sdk-go-v2 v1.41.11 h1:9PRf7jyTMEUM6fuNRAJa2mO/skJfrF50rENJwf2LXqw=
 github.com/aws/aws-sdk-go-v2 v1.41.11/go.mod h1:iiUX27gOXRuYaoeUVXhUpPwjJHzISfPAjjcuhUbLSVs=
 github.com/aws/aws-sdk-go-v2/config v1.32.22 h1:Vfvp7+fYKsVCADcWOEllqEV47aIBXhNchvyDFu1B5fY=

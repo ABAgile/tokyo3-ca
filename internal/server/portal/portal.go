@@ -225,9 +225,12 @@ func New(cfg Config) (*Server, error) {
 			ClientSecret: cfg.OIDC.ClientSecret,
 			RedirectURL:  cfg.OIDC.RedirectURL,
 			Verifier:     cfg.OIDC.Verifier,
-			// SessionKey/CookiePrefix/Now/Log are NOT repeated here — the flow
-			// cookie and all logging derive from sess (session.Manager.SiblingCookie
-			// / .Log), so there's nothing left to keep in sync between the two configs.
+			// The flow cookie shares sess's key, path scope, and clock under its
+			// own name, so there's nothing left to keep in sync between the two
+			// configs beyond this one line.
+			FlowCookie: sess.SiblingCookie("flow"),
+			// CookiePrefix/Now/Log are NOT repeated here — all logging derives
+			// from sess (session.Manager.Log).
 		}, sess)
 		if err != nil {
 			return nil, fmt.Errorf("portal oidc: %w", err)

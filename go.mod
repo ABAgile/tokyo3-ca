@@ -3,7 +3,7 @@ module github.com/abagile/tokyo3-ca
 go 1.26.5
 
 require (
-	github.com/abagile/tokyo3-base v0.7.6
+	github.com/abagile/tokyo3-base v0.7.7
 	github.com/aws/aws-sdk-go-v2/config v1.32.22
 	github.com/aws/aws-sdk-go-v2/service/kms v1.53.2
 	github.com/google/uuid v1.6.0
