@@ -152,10 +152,10 @@ func TestBasicAuth_HealthzExempt(t *testing.T) {
 	}
 }
 
-func TestBasicAuth_PartialConfigDoesNotGate(t *testing.T) {
-	// Operator misconfigures: only Username set. The gate must NOT
-	// activate — better to fail open with a discoverable 200 than
-	// silently lock everyone out with a credential nobody has.
+func TestBasicAuth_PartialConfigFailsClosed(t *testing.T) {
+	// Operator misconfigures: only Username set. base fails closed (503 on
+	// every non-exempt path) rather than serving the portal unauthenticated.
+	// cmd/certd rejects this at startup; this guards the portal itself.
 	p, _ := portal.New(portal.Config{
 		Version: "v",
 		Now:     time.Now,
@@ -172,8 +172,8 @@ func TestBasicAuth_PartialConfigDoesNotGate(t *testing.T) {
 		t.Fatalf("GET: %v", err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Errorf("status = %d, want 200 (partial config = gate disabled)", resp.StatusCode)
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503 (partial config fails closed)", resp.StatusCode)
 	}
 }
 
