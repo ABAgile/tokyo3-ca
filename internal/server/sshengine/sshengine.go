@@ -134,10 +134,8 @@ func signCert(
 		ValidPrincipals: principals,
 		ValidAfter:      uint64(validAfter.Unix()),
 		ValidBefore:     uint64(validBefore.Unix()),
-		Permissions: ssh.Permissions{
-			CriticalOptions: criticalOpts,
-			Extensions:      extensions,
-		},
+		CriticalOptions: criticalOpts,
+		Extensions:      extensions,
 	}
 
 	sshSigner, err := ssh.NewSignerFromSigner(s)
