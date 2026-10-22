@@ -287,6 +287,10 @@ func runServe(ctx context.Context) error {
 	if rlRPS > 0 {
 		log.Info("rate limiting enabled", "rps", rlRPS, "burst", rlBurst, "trusted_proxies", len(trustedProxies))
 	}
+	basicAuth, err := loadPortalBasicAuth()
+	if err != nil {
+		return err
+	}
 
 	caSigner, err := loadCASigner(ctx, log)
 	if err != nil {
@@ -399,12 +403,8 @@ func runServe(ctx context.Context) error {
 		HostStore:       hostStore,
 		AuditStore:      auditStore,
 		RevocationStore: krlStore,
-		BasicAuth: httpauth.BasicAuthConfig{
-			Username: os.Getenv("CERTD_PORTAL_USERNAME"),
-			Password: os.Getenv("CERTD_PORTAL_PASSWORD"),
-			Realm:    envutil.Or("CERTD_PORTAL_REALM", "certd portal"),
-		},
-		OIDC: portalOIDC,
+		BasicAuth:       basicAuth,
+		OIDC:            portalOIDC,
 	})
 	if err != nil {
 		return fmt.Errorf("portal: %w", err)
@@ -757,6 +757,22 @@ func loadOIDCVerifier(_ context.Context, log *slog.Logger) (oidc.TokenVerifier, 
 	}
 	log.Info("oidc verifier configured (lazy)", "issuer", issuer, "audience", audience)
 	return v, nil
+}
+
+// loadPortalBasicAuth reads the portal's HTTP Basic gate from
+// CERTD_PORTAL_USERNAME, CERTD_PORTAL_PASSWORD and CERTD_PORTAL_REALM. Setting
+// only one of the pair is rejected at startup: base would otherwise answer
+// every request 503, and a missing variable is easy to overlook.
+func loadPortalBasicAuth() (httpauth.BasicAuthConfig, error) {
+	cfg := httpauth.BasicAuthConfig{
+		Username: os.Getenv("CERTD_PORTAL_USERNAME"),
+		Password: os.Getenv("CERTD_PORTAL_PASSWORD"),
+		Realm:    envutil.Or("CERTD_PORTAL_REALM", "certd portal"),
+	}
+	if err := cfg.Validate(); err != nil {
+		return httpauth.BasicAuthConfig{}, fmt.Errorf("CERTD_PORTAL_USERNAME and CERTD_PORTAL_PASSWORD: %w", err)
+	}
+	return cfg, nil
 }
 
 // loadPortalOIDC builds the portal's native-OIDC login config from

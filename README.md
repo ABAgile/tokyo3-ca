@@ -523,7 +523,7 @@ internal/
   credentials (`CERTD_PORTAL_USERNAME`/`CERTD_PORTAL_PASSWORD`, default
   `admin` / `certd-dev` — override via the host env). OIDC needs a real
   IdP, so the rig uses the Basic gate; setting only one of the two creds
-  leaves the portal unguarded. Its anonymous CSRF-carrier session cookie
+  makes certd refuse to start. Its anonymous CSRF-carrier session cookie
   is sealed (AES-256-GCM) under `CERTD_PORTAL_SESSION_KEY` when set —
   independent of the rest of OIDC, so it may be set alone — for a key
   stable across restarts; left unset, certd generates one ephemeral
@@ -644,9 +644,9 @@ internal/
   the session's secret. An HTTP Basic auth gate
   (constant-time compared) activates when `CERTD_PORTAL_USERNAME`
   + `CERTD_PORTAL_PASSWORD` are both set; `/healthz` stays open so
-  watchdogs don't need the credential. When the basic-auth pair is
-  unset the portal is open and operators front it with oauth2-proxy
-  or similar.
+  watchdogs don't need the credential. Setting only one of the pair is
+  a startup error. When the basic-auth pair is unset the portal is open
+  and operators front it with oauth2-proxy or similar.
 
 ## CLI access via `auth-ssh-creds`
 
