@@ -43,7 +43,7 @@ no per-org rate limiting at the API edge.
 
 ## Requirements
 
-- Go 1.26.3+
+- Go 1.27+ (toolchain go1.27.3)
 - PostgreSQL 16+ (runtime + admin DSN)
 - NATS JetStream (audit pipeline) — optional, gracefully degrades when absent
 - AWS or GCP KMS (production CA key custody) — optional, in-memory signer for dev

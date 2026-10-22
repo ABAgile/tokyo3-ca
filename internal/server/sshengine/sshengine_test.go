@@ -97,6 +97,7 @@ func TestSignUserCert_RoundTrip(t *testing.T) {
 	// A CertChecker configured to trust this CA should accept the cert
 	// for one of the listed principals.
 	checker := ssh.CertChecker{
+		SupportedCriticalOptions: []string{"source-address"},
 		IsUserAuthority: func(auth ssh.PublicKey) bool {
 			return sshKeysEqual(auth, caPub)
 		},
