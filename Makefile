@@ -24,6 +24,12 @@ LDFLAGS := -s -w -X main.Version=$(VERSION)
 GO      := go
 GOFLAGS :=
 
+# Developer tools (staticcheck, gopls, govulncheck, deadcode) are pinned in
+# _tools/go.mod and run via `go tool`, so local runs and CI use identical
+# versions with nothing to install. See the header of _tools/go.mod before
+# bumping them.
+TOOL := $(GO) tool -modfile=_tools/go.mod
+
 IMAGE_NAME ?= abagile/tokyo3-ca
 IMAGE_TAG  ?= $(VERSION)
 
@@ -84,12 +90,14 @@ build-darwin: $(BIN_DIR)
 check:
 	gofmt -s -w .
 	$(GO) mod tidy
+	$(GO) -C _tools mod tidy
+	$(GO) -C _tools build tool
 	$(GO) test ./... -count=1
 	$(GO) vet ./...
-	staticcheck ./...
-	find . -type f -name "*.go" -print0 | xargs -0 -n 100 gopls check -severity=hint
-	govulncheck ./...
-	@out=$$(deadcode -test ./...); if [ -n "$$out" ]; then echo "$$out"; echo "deadcode: unreachable functions found (above)"; exit 1; fi
+	$(TOOL) staticcheck ./...
+	find . -type f -name "*.go" -print0 | xargs -0 -n 100 $(TOOL) gopls check -severity=hint
+	$(TOOL) govulncheck ./...
+	@out=$$($(TOOL) deadcode -test ./...); if [ -n "$$out" ]; then echo "$$out"; echo "deadcode: unreachable functions found (above)"; exit 1; fi
 
 # ── Docker ────────────────────────────────────────────────────────────────────
 

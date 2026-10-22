@@ -11,28 +11,33 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # Caches the module cache and the build cache. Dev tools are pinned in
+      # _tools/go.mod and run with `go tool`; their binaries live in the build
+      # cache, keyed by both go.sum files and the Go version.
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
           cache: true
+          cache-dependency-path: |
+            go.sum
+            _tools/go.sum
 
-      - uses: actions/cache@v5
-        with:
-          path: ~/go/bin
-          key: go-tools-${{ hashFiles('go.mod') }}
-
-      - run: |
-          which staticcheck || go install honnef.co/go/tools/cmd/staticcheck@latest
-          which gopls       || go install golang.org/x/tools/gopls@latest
-          which govulncheck || go install golang.org/x/vuln/cmd/govulncheck@latest
-          which deadcode    || go install golang.org/x/tools/cmd/deadcode@latest
+      # Each step below mirrors the Makefile `check` target. The tool commands
+      # use `go tool -modfile=_tools/go.mod` so local runs and CI use identical
+      # versions (see _tools/go.mod before bumping them).
+      - name: Check go.mod and go.sum are tidy
+        run: |
+          go mod tidy
+          go -C _tools mod tidy
+          go -C _tools build tool
+          git diff --exit-code -- go.mod go.sum _tools/go.mod _tools/go.sum || { echo "go mod tidy changed module files; commit the result"; exit 1; }
 
       - run: go vet ./...
-      - run: staticcheck ./...
-      - run: find . -type f -name "*.go" -print0 | xargs -0 -n 100 gopls check -severity=hint
+      - run: go tool -modfile=_tools/go.mod staticcheck ./...
+      - run: find . -type f -name "*.go" -print0 | xargs -0 -n 100 go tool -modfile=_tools/go.mod gopls check -severity=hint
       - run: go test ./... -count=1
-      - run: govulncheck ./...
+      - run: go tool -modfile=_tools/go.mod govulncheck ./...
       - name: deadcode
         run: |
-          out=$(deadcode -test ./...)
+          out=$(go tool -modfile=_tools/go.mod deadcode -test ./...)
           if [ -n "$out" ]; then echo "$out"; echo "deadcode: unreachable functions found (above)"; exit 1; fi
